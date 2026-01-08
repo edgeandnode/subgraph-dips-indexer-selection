@@ -1,0 +1,20 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: iisa-allow-dipper-only
+  labels:
+    app: iisa
+spec:
+  podSelector:
+    matchLabels:
+      app: iisa
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: dipper
+      ports:
+        - protocol: TCP
+          port: 8080

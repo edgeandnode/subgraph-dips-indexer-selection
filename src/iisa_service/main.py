@@ -38,12 +38,14 @@ class IISAState:
     Holds the IISA service state including initialized providers and cached data.
     """
 
+
     def __init__(self) -> None:
         self.settings: Optional[Settings] = None
         self.geoip: Optional[GeoipResolver] = None
         self.data_manager: Optional[DataManager] = None
         self._history: Optional[pd.DataFrame] = None
         self._initialized: bool = False
+
 
     def initialize(self, settings: Settings) -> bool:
         """
@@ -86,6 +88,7 @@ class IISAState:
             self._initialized = False
             return False
 
+
     def refresh_data(self) -> bool:
         """
         Fetch fresh data from BigQuery.
@@ -112,10 +115,12 @@ class IISAState:
             logger.error(f"Failed to fetch data: {e}")
             return False
 
+
     @property
     def history(self) -> Optional[pd.DataFrame]:
         """Get the cached history DataFrame."""
         return self._history
+
 
     @property
     def is_ready(self) -> bool:
