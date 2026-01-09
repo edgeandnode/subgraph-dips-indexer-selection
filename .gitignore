@@ -61,3 +61,5 @@ Thumbs.db
 # GCP credentials
 *.json
 !tests/__fixtures__/*.json
+!release-please-config.json
+!.release-please-manifest.json
