@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: iisa-config
+  labels:
+    app: iisa
+data:
+  gcp_project: "your-gcp-project-id"
+  gcp_location: "US"
