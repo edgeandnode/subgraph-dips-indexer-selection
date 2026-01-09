@@ -14,8 +14,14 @@ spec:
       labels:
         app: iisa
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
       containers:
         - name: iisa
+          # TODO: Pin to specific version tag for production
           image: ghcr.io/edgeandnode/subgraph-dips-indexer-selection:latest
           ports:
             - name: http
@@ -47,6 +53,12 @@ spec:
                   key: ipinfo_api_key
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /app/credentials/service-account.json
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           livenessProbe:
             httpGet:
               path: /health
