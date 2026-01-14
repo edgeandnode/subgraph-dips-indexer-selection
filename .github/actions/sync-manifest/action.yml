@@ -63,10 +63,22 @@ runs:
       id: update
       if: steps.check.outputs.drift == 'true' && inputs.auto-commit == 'true'
       shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
       run: |
         VERSION="${{ steps.check.outputs.latest_version }}"
+        OLD_VERSION="${{ steps.check.outputs.manifest_version }}"
+        BRANCH="chore/sync-manifest-to-${VERSION}"
 
-        # Update manifest (with error handling for missing/invalid file)
+        # Check if PR already exists for this sync
+        EXISTING_PR=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number' 2>/dev/null || echo "")
+        if [ -n "$EXISTING_PR" ]; then
+          echo "PR #$EXISTING_PR already exists for this manifest sync"
+          echo "synced=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Update manifest
         if ! jq --arg version "$VERSION" '.["."] = $version' .release-please-manifest.json > manifest.tmp 2>/dev/null; then
           echo "Warning: Could not update manifest, creating new one"
           echo "{\".\": \"$VERSION\"}" > manifest.tmp
@@ -77,10 +89,23 @@ runs:
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
 
-        # Commit and push
+        # Create branch and commit
+        git checkout -b "$BRANCH"
         git add .release-please-manifest.json
-        git commit -m "chore: auto-sync manifest to $VERSION (was ${{ steps.check.outputs.manifest_version }}) [skip ci]"
-        git push origin main
+        git commit -m "chore: sync manifest to $VERSION (was $OLD_VERSION)"
+        git push -u origin "$BRANCH"
+
+        # Create PR
+        gh pr create \
+          --title "chore: sync release-please manifest to $VERSION" \
+          --body "Auto-generated PR to sync release-please manifest with git tags.
+
+- **Previous version:** $OLD_VERSION
+- **Target version:** $VERSION
+
+This PR was created because the manifest version fell behind the latest git tag, likely due to a manual release." \
+          --base main \
+          --head "$BRANCH"
 
         echo "synced=true" >> $GITHUB_OUTPUT
-        echo "Manifest synced: ${{ steps.check.outputs.manifest_version }} -> $VERSION"
+        echo "Created PR to sync manifest: $OLD_VERSION -> $VERSION"
