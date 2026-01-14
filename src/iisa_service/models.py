@@ -33,6 +33,8 @@ class SelectionRequest(BaseModel):
     existing_indexers: Optional[list[str]] = None
     pending_agreements: Optional[dict[str, list[str]]] = None
     num_candidates: Optional[int] = None
+    blocklist: Optional[list[str]] = None
+    declined_indexers: Optional[dict[str, list[str]]] = None
 
 
 class SingleSelectionResponse(BaseModel):
