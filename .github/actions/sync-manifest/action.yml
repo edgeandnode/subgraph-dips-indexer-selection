@@ -28,6 +28,11 @@ runs:
       id: check
       shell: bash
       run: |
+        # Compare semver versions: returns 0 if $1 > $2
+        version_gt() {
+          test "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" != "$1"
+        }
+
         # Get latest tag (with fallback if no tags exist)
         LATEST_TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || echo "v0.0.0")
         LATEST_VERSION="${LATEST_TAG#v}"
@@ -38,16 +43,19 @@ runs:
         echo "Latest tag: $LATEST_TAG ($LATEST_VERSION)"
         echo "Manifest version: $MANIFEST_VERSION"
 
-        # Check if they match
-        if [ "$LATEST_VERSION" != "$MANIFEST_VERSION" ]; then
+        echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+        echo "manifest_version=$MANIFEST_VERSION" >> $GITHUB_OUTPUT
+
+        # Only sync if tag is AHEAD of manifest (never downgrade)
+        # This prevents reverting manifest during release PR merges
+        if [ "$LATEST_VERSION" != "$MANIFEST_VERSION" ] && version_gt "$LATEST_VERSION" "$MANIFEST_VERSION"; then
           echo "drift=true" >> $GITHUB_OUTPUT
-          echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
-          echo "manifest_version=$MANIFEST_VERSION" >> $GITHUB_OUTPUT
-          echo "Drift detected - manifest needs update"
+          echo "Drift detected - manifest ($MANIFEST_VERSION) is behind tag ($LATEST_VERSION)"
+        elif [ "$LATEST_VERSION" != "$MANIFEST_VERSION" ]; then
+          echo "drift=false" >> $GITHUB_OUTPUT
+          echo "Manifest ($MANIFEST_VERSION) is ahead of tag ($LATEST_VERSION) - release in progress, skipping"
         else
           echo "drift=false" >> $GITHUB_OUTPUT
-          echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
-          echo "manifest_version=$MANIFEST_VERSION" >> $GITHUB_OUTPUT
           echo "Manifest is in sync with tags"
         fi
 
