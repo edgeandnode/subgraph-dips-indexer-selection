@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.1.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v1.0.0...v1.1.0) (2026-01-14)
+
+
+### Added
+
+* **api:** add blocklist and declined_indexers to selection request ([#8](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/8)) ([0092520](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/0092520f45dd745477b39f6c2a20fb8c5e7c7688))
+
+
+### Fixed
+
+* **dev:** add missing test dependencies ([#7](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/7)) ([885d70b](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/885d70bfce216de3f0f01b0a2927cd5e94893a11))
+
+
+### Changed
+
+* auto-sync manifest to 0.0.0 (was 1.0.0) [skip ci] ([ce65387](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/ce65387bbe94338b5bf3f05d67ac8894f443c8a6))
+* auto-sync manifest to 1.0.0 (was 0.0.0) [skip ci] ([ed63176](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/ed6317609cf61f586f61bacd8f1ba9aa9292b572))
+
 ## 1.0.0 (2026-01-13)
 
 
