@@ -68,12 +68,12 @@ class DataProcessor:
         existing_agreements: Optional[dict[DeploymentId, list[IndexerId]]] = None,
         pending_agreements: Optional[dict[DeploymentId, list[IndexerId]]] = None,
         declined_indexers: Optional[dict[DeploymentId, IndexerId]] = None,
-        blocklist: Optional[list[IndexerId]] = None,
+        indexer_denylist: Optional[list[IndexerId]] = None,
         weights: Optional[WeightsDict] = None,
     ):
         """
         Initialize the DataProcessor class with data, deployment ID, existing agreements,
-        and an indexer blocklist.
+        and an indexer denylist.
         """
         # Initialize class variables with provided parameters
         self.data = pd.DataFrame(history)
@@ -81,41 +81,41 @@ class DataProcessor:
         self.existing_agreements = existing_agreements or {}
         self.pending_agreements = pending_agreements or {}
         self.declined_indexers = declined_indexers or {}
-        self.blocklist = blocklist or []
+        self.indexer_denylist = indexer_denylist or []
         self.weights = {**DEFAULT_WEIGHTS, **(weights or {})}
 
-        # Process the data, we can then call update_blacklist_cancel_indexing_agreements,
+        # Process the data, we can then call update_indexer_denylist_cancel_indexing_agreements,
         # or get_indexer_selections later after this constructor has finished running.
         self._process_data()
 
-    def update_blocklist_cancel_indexing_agreements(self, blocklist):
+    def update_indexer_denylist_cancel_indexing_agreements(self, indexer_denylist):
         """
-        Cancels all outstanding indexing agreements for indexers on the blacklist.
+        Cancels all outstanding indexing agreements for indexers on the denylist.
 
         Note:
         - This method does not currently attempt to reassign indexers to the subgraph after
-          cancellation of the indexing agreement from the blocked indexers. Instead we can loop through
+          cancellation of the indexing agreement from the denied indexers. Instead we can loop through
           all of the subgraphs while calling the process_subgraph function. Which will detect when a subgraph
           has less than the threshold number of indexers assigned to it and reassign an appropriate indexer.
           We would do this loop at frequent intervals anyway, because it will be important to reassign indexing
           agreements to high quality indexers after an indexers quality has slipped based on their updated
           weighted_score. # TODO we could address the above note, as if all indexers on a subgraph got
-          blocked simultaneously, there could be a longer than necessary latency while we reassign new indexers.
+          denied simultaneously, there could be a longer than necessary latency while we reassign new indexers.
         - Although it would likely take some time for new indexers to accept the agreements and finish syncing, so this
           additional latency while we wait for the for loop to get to the subgraph, might not be a huge issue.
 
-        :param blocklist: A list of indexers that have been blocked.
-        :return: A dictionary where keys are blocked indexers and values are lists of subgraphs
+        :param indexer_denylist: A list of indexers that have been denied.
+        :return: A dictionary where keys are denied indexers and values are lists of subgraphs
                  from which they were removed.
         """
         #
-        self.blocklist = blocklist
+        self.indexer_denylist = indexer_denylist
 
         cancelled_agreements = {}
 
         for subgraph, indexers in self.existing_agreements.items():
             for indexer in indexers:
-                if indexer in blocklist:
+                if indexer in indexer_denylist:
                     # If indexer not already in cancelled_agreements, create new key-value
                     if indexer not in cancelled_agreements:
                         cancelled_agreements[indexer] = []
@@ -459,7 +459,7 @@ class DataProcessor:
 
         unpickable_indexers = set(
             self.current_group
-            + self.blocklist
+            + self.indexer_denylist
             + flatten_list_of_lists(self.pending_agreements.values())
             + self.declined_indexers.get(self.deployment_id, [])
         )
