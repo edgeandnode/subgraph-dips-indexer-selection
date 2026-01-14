@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v1.1.0...v1.1.1) (2026-01-14)
+
+
+### Fixed
+
+* **ci:** prevent sync-manifest from downgrading manifest version ([ac8954c](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/ac8954c5b3b17147996819bceca301cb22261031))
+
+
+### Changed
+
+* auto-sync manifest to 1.0.0 (was 1.1.0) [skip ci] ([2cd2c2d](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/2cd2c2da0e66c801b835c4eb6592959ff8232b78))
+* auto-sync manifest to 1.1.0 (was 1.0.0) [skip ci] ([7a7b182](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/7a7b1828fef3e41d82ac6f4c0e6d24d1a76a895b))
+
 ## [1.1.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v1.0.0...v1.1.0) (2026-01-14)
 
 
