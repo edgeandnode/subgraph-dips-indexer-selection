@@ -19,13 +19,13 @@ def process_subgraph(
     history,
     deployment_id,
     existing_agreements,
-    blocklist=None,
+    indexer_denylist=None,
 ):
     processor = DataProcessor(
         history,
         deployment_id,
         existing_agreements=existing_agreements,
-        blocklist=blocklist,
+        indexer_denylist=indexer_denylist,
     )
     return processor.get_indexer_selections()
 
@@ -126,7 +126,7 @@ class TestProcessSubgraph:
             "indexer2": ["subgraph2"],
             "indexer3": ["test_subgraph"],
         }
-        blocklist = ["blocklisted_indexer"]
+        indexer_denylist = ["indexer_denylisted_indexer"]
 
         # Process the subgraph
         added, cancelled = process_subgraph(
@@ -140,7 +140,7 @@ class TestProcessSubgraph:
             history=sample_data,
             deployment_id=deployment_id,
             existing_agreements=existing_agreements,
-            blocklist=blocklist,
+            indexer_denylist=indexer_denylist,
             weights=None,
         )
 
@@ -191,9 +191,9 @@ class TestDataProcessor:
         2. Default values are applied when optional parameters are not provided.
         3. The BigQueryProvider is properly instantiated.
         4. The _process_data method is called once.
-        5. The blocklist is properly applied.
+        5. The indexer_denylist is properly applied.
         6. The 'data' DataFrame maintains its original content, while adding the new columns.
-        7. Optional parameters (existing_agreements, blocklist) default empty if not set.
+        7. Optional parameters (existing_agreements, indexer_denylist) default empty if not set.
 
         The test uses mock objects for BigQueryProvider and patch decorators for _process_data
         and derive_timestamps to avoid actual data fetching and ensure consistent test behavior.
@@ -204,20 +204,20 @@ class TestDataProcessor:
             DeploymentId("subgraph1"): [IndexerId("A")],
             DeploymentId("subgraph2"): [IndexerId("B")],
         }
-        blocklist = [IndexerId("D")]
+        indexer_denylist = [IndexerId("D")]
 
         # Create a DataProcessor instance
         processor = DataProcessor(
             history=sample_data,
             deployment_id=deployment_id,
             existing_agreements=existing_agreements,
-            blocklist=blocklist,
+            indexer_denylist=indexer_denylist,
         )
 
         # Verify that all instance variables are set correctly
         assert processor.deployment_id == deployment_id
         assert processor.existing_agreements == existing_agreements
-        assert processor.blocklist == blocklist
+        assert processor.indexer_denylist == indexer_denylist
 
         # Verify default values for optional parameters
         processor_default = DataProcessor(
@@ -225,7 +225,7 @@ class TestDataProcessor:
             deployment_id=deployment_id,
         )
         assert processor_default.existing_agreements == {}
-        assert processor_default.blocklist == []
+        assert processor_default.indexer_denylist == []
 
     @pytest.mark.parametrize(
         "initial_group, current_group, expected_added, expected_cancelled",
@@ -805,7 +805,7 @@ class TestDataProcessor:
         This test verifies:
         1. The method returns the best replacement that meets decentralization requirements.
         2. The method returns None when no suitable replacement is found.
-        3. The method will not try to replace an indexer with one that is already blocklisted.
+        3. The method will not try to replace an indexer with one that is already indexer_denylisted.
         """
         processor = DataProcessor(
             history=pd.DataFrame(
@@ -820,7 +820,7 @@ class TestDataProcessor:
         )
 
         processor.current_group = ["A", "B", "C"]
-        processor.blocklist = ["E"]
+        processor.indexer_denylist = ["E"]
 
         with patch(
             "iisa.select.processor.DataProcessor._meets_decentralization_requirements"
@@ -829,7 +829,7 @@ class TestDataProcessor:
 
             result = processor._find_best_replacement_or_select_best_indexer()
 
-            # Verify the best replacement is D, not E, due to blocklisting.
+            # Verify the best replacement is D, not E, due to indexer_denylisting.
             assert result == "D"
 
             # Verify the number of decentralization requirement checks
@@ -896,16 +896,16 @@ class TestDataProcessor:
         # Verify that the original data was not modified
         pd.testing.assert_frame_equal(processor.data, original_data)
 
-    def test_update_blocklist_cancel_indexing_agreements(
+    def test_update_indexer_denylist_cancel_indexing_agreements(
         self, sample_data, mock__bigquery_provider
     ):
         """
-        Test the update_blocklist_cancel_indexing_agreements method of DataProcessor.
+        Test the update_indexer_denylist_cancel_indexing_agreements method of DataProcessor.
 
         This test verifies:
-        1. The method correctly identifies agreements to be cancelled based on the new blocklist.
+        1. The method correctly identifies agreements to be cancelled based on the new indexer_denylist.
         2. The method returns the correct dictionary of cancelled agreements.
-        3. The method updates the internal blocklist of the DataProcessor.
+        3. The method updates the internal indexer_denylist of the DataProcessor.
         """
         # Initialize DataProcessor
         processor = DataProcessor(
@@ -934,20 +934,20 @@ class TestDataProcessor:
                 "subgraph70": ["C"],
                 "subgraph100": ["C"],
             },
-            blocklist=[IndexerId("H")],
+            indexer_denylist=[IndexerId("H")],
         )
 
-        # update the blocklist to cancel agreements
-        new_blocklist = [
+        # update the indexer_denylist to cancel agreements
+        new_indexer_denylist = [
             IndexerId("H"),
             IndexerId("B"),
             IndexerId("E"),
             IndexerId("NOT_IN_LIST"),
         ]
 
-        # Call update_blocklist_cancel_indexing_agreements with new new_blocklist
+        # Call update_indexer_denylist_cancel_indexing_agreements with new new_indexer_denylist
         newly_cancelled_agreements = (
-            processor.update_blocklist_cancel_indexing_agreements(new_blocklist)
+            processor.update_indexer_denylist_cancel_indexing_agreements(new_indexer_denylist)
         )
         expected_newly_cancelled_agreements = {
             "B": ["subgraph2", "subgraph3", "subgraph5", "subgraph9", "subgraph12"],
@@ -958,8 +958,8 @@ class TestDataProcessor:
         print("Newly cancelled indexing agreements: ", newly_cancelled_agreements)
         assert newly_cancelled_agreements == expected_newly_cancelled_agreements
 
-        # Verify that the blocklist has been updated
-        assert processor.blocklist == new_blocklist
+        # Verify that the indexer_denylist has been updated
+        assert processor.indexer_denylist == new_indexer_denylist
 
         # Verify that 'H' and 'NOT_IN_LIST' don't appear in cancelled agreements
         assert "H" not in newly_cancelled_agreements

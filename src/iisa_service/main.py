@@ -308,14 +308,14 @@ def _select_with_processor(request: SelectionRequest, num_to_select: int) -> lis
 
     # Create DataProcessor instance
     # Note: DataProcessor does its own filtering of candidates based on
-    # blocklist, pending agreements, etc.
+    # indexer_denylist, pending agreements, etc.
     processor = DataProcessor(
         history=_state.history,
         deployment_id=request.deployment_id,
         existing_agreements=existing_agreements,
         pending_agreements=pending_agreements,
         declined_indexers=request.declined_indexers or {},
-        blocklist=request.blocklist or [],
+        indexer_denylist=request.indexer_denylist or [],
     )
 
     # Get selections
