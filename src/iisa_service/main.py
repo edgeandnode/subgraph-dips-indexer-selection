@@ -314,8 +314,8 @@ def _select_with_processor(request: SelectionRequest, num_to_select: int) -> lis
         deployment_id=request.deployment_id,
         existing_agreements=existing_agreements,
         pending_agreements=pending_agreements,
-        declined_indexers={},  # Not provided in current API
-        blocklist=[],  # Not provided in current API
+        declined_indexers=request.declined_indexers or {},
+        blocklist=request.blocklist or [],
     )
 
     # Get selections
