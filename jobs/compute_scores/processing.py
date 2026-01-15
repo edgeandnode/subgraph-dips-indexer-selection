@@ -54,6 +54,11 @@ GEOIP_DST_COLUMN_MAPPING = _geoip_column_mapping("dst")
 GEOIP_SRC_COLUMN_MAPPING = _geoip_column_mapping("src")
 
 
+def _empty_geoip_result(ip_addr: str = None) -> dict:
+    """Return a GeoIP result dict with optional ip_addr and None for other fields."""
+    return {"ip_addr": ip_addr, "org": None, "country": None, "latitude": None, "longitude": None}
+
+
 def compute_all_scores(
     bq_client,
     start_date: date,
@@ -309,42 +314,34 @@ def resolve_indexer_geoip(combined_queries: pd.DataFrame, ipinfo_auth: str) -> p
 
 def resolve_url_geoip(url: str, auth: str) -> dict:
     """Resolve GeoIP information for a URL."""
-    empty_result = {
-        "ip_addr": None,
-        "org": None,
-        "country": None,
-        "latitude": None,
-        "longitude": None,
-    }
-
     try:
         parsed = urlparse(url)
         host = parsed.hostname
         if not host:
-            return empty_result
+            return _empty_geoip_result()
 
         # Resolve hostname to IP
         try:
             _, _, ip_addrs = socket.gethostbyname_ex(host)
             if not ip_addrs:
-                return empty_result
+                return _empty_geoip_result()
             ip_addr = sorted(ip_addrs)[0]
         except socket.gaierror:
-            return empty_result
+            return _empty_geoip_result()
 
         # Check for private IP
         if is_private_ip(ip_addr):
-            return {"ip_addr": ip_addr, **{k: None for k in ["org", "country", "latitude", "longitude"]}}
+            return _empty_geoip_result(ip_addr)
 
         # Fetch from ipinfo.io
         if not auth:
-            return {"ip_addr": ip_addr, **{k: None for k in ["org", "country", "latitude", "longitude"]}}
+            return _empty_geoip_result(ip_addr)
 
         return fetch_ipinfo(ip_addr, auth)
 
     except Exception as e:
         logger.warning(f"GeoIP resolution failed for {url}: {e}")
-        return empty_result
+        return _empty_geoip_result()
 
 
 def is_private_ip(ip_addr: str) -> bool:
@@ -398,13 +395,7 @@ def fetch_ipinfo(ip_addr: str, auth: str) -> dict:
         }
     except Exception as e:
         logger.warning(f"ipinfo.io request failed: {e}")
-        return {
-            "ip_addr": ip_addr,
-            "org": None,
-            "country": None,
-            "latitude": None,
-            "longitude": None,
-        }
+        return _empty_geoip_result(ip_addr)
 
 
 # --- Adapted from IISA processing.py ---
