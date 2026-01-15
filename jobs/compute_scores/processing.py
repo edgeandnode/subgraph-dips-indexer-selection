@@ -46,6 +46,18 @@ ITERATIVE_FILTER_MIN_DEPLOYMENTS_PER_INDEXER = 1
 ITERATIVE_FILTER_MIN_QUERIES_PER_INDEXER = 250
 ITERATIVE_FILTER_MIN_QUERIES_PER_DEPLOYMENT = 250
 
+# Column rename mappings for geolocation data
+GEOIP_DST_COLUMN_MAPPING = {
+    "country": "dst_country",
+    "latitude": "dst_lat",
+    "longitude": "dst_lon",
+}
+GEOIP_SRC_COLUMN_MAPPING = {
+    "country": "src_country",
+    "latitude": "src_lat",
+    "longitude": "src_lon",
+}
+
 
 def compute_all_scores(
     bq_client,
@@ -295,13 +307,7 @@ def resolve_indexer_geoip(combined_queries: pd.DataFrame, ipinfo_auth: str) -> p
     indexers_df["indexer_network"] = "arbitrum"
 
     # Rename columns to match expected schema
-    indexers_df = indexers_df.rename(
-        columns={
-            "country": "dst_country",
-            "latitude": "dst_lat",
-            "longitude": "dst_lon",
-        }
-    )
+    indexers_df = indexers_df.rename(columns=GEOIP_DST_COLUMN_MAPPING)
 
     return indexers_df
 
@@ -437,13 +443,7 @@ def adjust_rows(initial_query_results: pd.DataFrame, target_rows: int) -> int:
 
 def merge_in_indexers_info(combined_queries: pd.DataFrame, indexers: pd.DataFrame) -> pd.DataFrame:
     """Merge indexer GeoIP info into combined queries."""
-    right_df = indexers.rename(
-        columns={
-            "country": "dst_country",
-            "latitude": "dst_lat",
-            "longitude": "dst_lon",
-        }
-    )
+    right_df = indexers.rename(columns=GEOIP_DST_COLUMN_MAPPING)
     return pd.merge(combined_queries, right_df, on=["indexer", "url"], how="left")
 
 
@@ -452,13 +452,7 @@ def merge_in_query_geolocation_info(combined_queries: pd.DataFrame) -> pd.DataFr
     combined_queries["IATA_code"] = combined_queries["query_id"].str[-3:]
 
     iata_info = load_iata_data()
-    right_df = iata_info.rename(
-        columns={
-            "country": "src_country",
-            "latitude": "src_lat",
-            "longitude": "src_lon",
-        }
-    )
+    right_df = iata_info.rename(columns=GEOIP_SRC_COLUMN_MAPPING)
 
     return pd.merge(combined_queries, right_df, on="IATA_code", how="left")
 
