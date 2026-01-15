@@ -251,6 +251,20 @@ def normalize_iqr_to_0_1(series: pd.Series) -> pd.Series:
     return normalize_to_0_1(series)
 
 
+def calculate_iqr_deviation(series: pd.Series) -> pd.Series:
+    """
+    Calculate IQR-based deviation from median.
+
+    Returns (value - median) / IQR for each value in the series.
+    Used for robust normalization that's less sensitive to outliers.
+    """
+    median_val = series.median()
+    q1 = series.quantile(0.25)
+    q3 = series.quantile(0.75)
+    iqr = q3 - q1
+    return (series - median_val) / iqr
+
+
 def resolve_indexer_geoip(combined_queries: pd.DataFrame, ipinfo_auth: str) -> pd.DataFrame:
     """
     Extract unique indexers from query data and resolve their GeoIP information.
@@ -628,14 +642,9 @@ def perform_latency_linear_regression(
         + LATENCY_COEFFICIENT_STANDARD_ERROR_MULTIPLIER * indexer_rankings["Standard Error"]
     )
 
-    median_val = indexer_rankings["Latency Coefficient + Error Confidence Interval"].median()
-    q1 = indexer_rankings["Latency Coefficient + Error Confidence Interval"].quantile(0.25)
-    q3 = indexer_rankings["Latency Coefficient + Error Confidence Interval"].quantile(0.75)
-    iqr_val = q3 - q1
-
     indexer_rankings["Robust Normalized Latency Coefficient + Error Confidence Interval"] = (
-        indexer_rankings["Latency Coefficient + Error Confidence Interval"] - median_val
-    ) / iqr_val
+        calculate_iqr_deviation(indexer_rankings["Latency Coefficient + Error Confidence Interval"])
+    )
 
     return indexer_rankings, results_df
 
@@ -707,13 +716,7 @@ def calculate_indexer_uptime(df: pd.DataFrame, threshold_seconds: int = 120) -> 
 def calculate_indexer_stake_to_fees(stake_query_pandas: pd.DataFrame) -> pd.DataFrame:
     """Calculate stake-to-fees ratio and IQR deviation."""
     stake_to_fees = stake_query_pandas[["stake_to_fees"]].copy()
-
-    median_val = stake_to_fees["stake_to_fees"].median()
-    q1 = stake_to_fees["stake_to_fees"].quantile(0.25)
-    q3 = stake_to_fees["stake_to_fees"].quantile(0.75)
-    iqr = q3 - q1
-
-    stake_to_fees["stake_to_fees_iqr_deviation"] = (stake_to_fees["stake_to_fees"] - median_val) / iqr
+    stake_to_fees["stake_to_fees_iqr_deviation"] = calculate_iqr_deviation(stake_to_fees["stake_to_fees"])
     stake_to_fees.index.name = "indexer"
     return stake_to_fees.reset_index()
 
