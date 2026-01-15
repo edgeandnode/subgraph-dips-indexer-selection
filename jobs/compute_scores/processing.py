@@ -9,7 +9,7 @@ import gzip
 import json
 import logging
 import socket
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from struct import unpack
 from typing import Dict, Optional, Tuple
@@ -224,7 +224,7 @@ def transform_to_scores_schema(merged: pd.DataFrame, num_days: int) -> pd.DataFr
     scores["indexing_agreement_acceptance_latency"] = merged.get("indexing_agreement_acceptance_latency")
 
     # Metadata
-    scores["computed_at"] = datetime.utcnow()
+    scores["computed_at"] = datetime.now(timezone.utc)
     scores["query_count"] = len(merged)
     scores["num_days"] = num_days
 

@@ -8,7 +8,7 @@ Tests the new functions introduced for the CronJob, particularly:
 - Idempotency check
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -237,7 +237,7 @@ class TestTransformToScoresSchema:
         result = transform_to_scores_schema(sample_merged_df, num_days=28)
 
         # Assert - computed_at should be recent
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         computed_at = result["computed_at"].iloc[0]
         delta = (now - computed_at).total_seconds()
         assert delta < 60  # Within 60 seconds
