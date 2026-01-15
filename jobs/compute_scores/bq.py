@@ -1,0 +1,343 @@
+"""
+BigQuery client for the score computation job.
+
+Handles reading raw data and writing computed scores.
+"""
+
+import logging
+import socket
+from datetime import date
+from textwrap import dedent
+
+import pandas as pd
+from bigframes import pandas as bpd
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class BigQueryClient:
+    """BigQuery client for reading raw data and writing computed scores."""
+
+    def __init__(self, project: str, dataset: str, location: str) -> None:
+        self.project = project
+        self.dataset = dataset
+        self.location = location
+        self.scores_table = f"{project}.{dataset}.indexer_scores"
+
+        # Configure bigframes
+        bpd.options.bigquery.project = project
+        bpd.options.bigquery.location = location
+        bpd.options.display.progress_bar = None
+
+    @retry(
+        retry=retry_if_exception_type((ConnectionError, socket.timeout)),
+        stop=stop_after_attempt(10),
+        wait=wait_exponential(multiplier=1, max=60),
+        reraise=True,
+    )
+    def _read_gbq(self, query: str) -> pd.DataFrame:
+        """Execute a query and return results as pandas DataFrame."""
+        return bpd.read_gbq(query).to_pandas()
+
+    def scores_exist_for_today(self) -> bool:
+        """Check if scores have already been computed today."""
+        query = f"""
+        SELECT COUNT(*) as cnt
+        FROM `{self.scores_table}`
+        WHERE DATE(computed_at) = CURRENT_DATE()
+        """
+        try:
+            result = self._read_gbq(query)
+            return result["cnt"].iloc[0] > 0
+        except Exception as e:
+            # Table might not exist yet
+            logger.warning(f"Could not check for existing scores: {e}")
+            return False
+
+    def fetch_initial_query_results(self, start_date: date, num_days: int) -> pd.DataFrame:
+        """
+        Fetch initial query results showing row counts per deployment/indexer.
+
+        Returns DataFrame with columns: deployment_hash, indexer, num_rows
+        """
+        start = start_date.strftime("%Y-%m-%d")
+
+        query = dedent(f"""\
+        WITH BasicFilter AS (
+            SELECT
+                deployment AS deployment_hash,
+                indexer,
+                COUNT(*) AS num_rows
+            FROM internal_metrics.metrics_indexer_attempts
+            WHERE day_partition BETWEEN '{start}' AND DATE_ADD('{start}', INTERVAL {num_days} DAY)
+            GROUP BY deployment_hash, indexer
+        )
+        SELECT deployment_hash, indexer, num_rows
+        FROM BasicFilter;
+        """)
+
+        logger.debug("Fetching initial query results")
+        df = self._read_gbq(query)
+
+        if not df.empty:
+            df.sort_values(by="num_rows", ascending=False, inplace=True)
+
+        logger.info(f"Fetched initial query results: {len(df)} rows")
+        return df
+
+    def fetch_combined_query_results(
+        self, start_date: date, num_days: int, rows_to_use: int
+    ) -> pd.DataFrame:
+        """
+        Fetch combined query results with detailed query data.
+
+        This fetches ~20M rows with query details including response times,
+        status, fees, etc.
+        """
+        start = start_date.strftime("%Y-%m-%d")
+        destination_table = f"{self.project}.{self.dataset}.get_combined_query_data"
+
+        query = self._get_combined_query(start, num_days, rows_to_use)
+
+        logger.info("Running combined query and writing to intermediate table")
+
+        # Run query and write to intermediate table
+        intermediate_df = bpd.read_gbq(query)
+        intermediate_df.to_gbq(destination_table, if_exists="replace")
+
+        logger.info("Reading from intermediate table in batches")
+
+        # Read back in batches
+        batch_sizes = [10_000_000, 5_000_000, 2_500_000, 1_000_000]
+        df = pd.DataFrame()
+
+        for batch_size in batch_sizes:
+            try:
+                logger.info(f"Attempting batch size: {batch_size}")
+                offset = 0
+                df = pd.DataFrame()
+
+                while True:
+                    paginated_query = f"""
+                    SELECT * FROM `{destination_table}`
+                    LIMIT {batch_size} OFFSET {offset}
+                    """
+                    batch_df = self._read_gbq(paginated_query)
+
+                    if batch_df.empty:
+                        break
+
+                    logger.debug(f"Fetched {len(batch_df)} rows from offset {offset}")
+                    df = pd.concat([df, batch_df], ignore_index=True)
+                    offset += batch_size
+
+                # Success
+                break
+
+            except Exception as e:
+                logger.warning(f"Batch size {batch_size} failed: {e}")
+                continue
+
+        if df.empty:
+            raise RuntimeError("Failed to fetch combined query data")
+
+        # Post-processing
+        if not df.empty:
+            df.dropna(subset=["url"], inplace=True)
+            df["url"] = df["url"].apply(lambda url: url if url.endswith("/") else url + "/")
+
+        logger.info(f"Fetched combined query results: {len(df)} rows")
+        return df
+
+    def fetch_stake_to_fees(self, start_ts: str) -> pd.DataFrame:
+        """Fetch stake-to-fees data for indexers."""
+        query = dedent(f"""\
+        SELECT indexer,
+            recent_slashable_stake,
+            SUM(query_fees_sum) AS total_query_fees_sum,
+            recent_slashable_stake / SUM(query_fees_sum) as stake_to_fees
+        FROM (
+            SELECT  id.indexer_wallet AS indexer,
+                    id.staked_tokens - id.locked_tokens as recent_slashable_stake,
+                    SUM(mia.query_fee) AS query_fees_sum
+            FROM internal_metrics.indexer_dimensions_arbitrum id
+            INNER JOIN internal_metrics.metrics_indexer_attempts mia ON id.indexer_wallet = mia.indexer
+            WHERE TIMESTAMP(mia.day_partition) > '{start_ts}'
+            GROUP BY id.indexer_wallet, id.staked_tokens - id.locked_tokens, mia.day_partition
+        ) as aggregated_data
+        GROUP BY indexer, recent_slashable_stake;
+        """)
+
+        logger.debug("Fetching stake-to-fees data")
+        df = self._read_gbq(query)
+        df.set_index("indexer", inplace=True)
+
+        logger.info(f"Fetched stake-to-fees: {len(df)} indexers")
+        return df
+
+    def write_scores(self, scores_df: pd.DataFrame) -> None:
+        """Write computed scores to the indexer_scores table."""
+        logger.info(f"Writing {len(scores_df)} scores to {self.scores_table}")
+
+        # Convert to bigframes and write
+        bf_df = bpd.DataFrame(scores_df)
+        bf_df.to_gbq(self.scores_table, if_exists="append")
+
+        logger.info("Successfully wrote scores to BigQuery")
+
+    def _get_combined_query(self, start_date: str, num_days: int, rows_to_use: int) -> str:
+        """Generate the combined query SQL."""
+        return dedent(f"""\
+        WITH production_metrics_gateway_subgraph_queries AS (
+            WITH initial_data AS (
+                SELECT
+                    day_timestamp AS day_partition,
+                    subgraph_deployment_ipfs_hash AS deployment_hash,
+                    subgraph_chain_indexed AS subgraph_network,
+                    subgraph_deployment_chain AS indexer_network
+                FROM production_metrics.prod_metrics_gateway_subgraph_queries
+                WHERE subgraph_deployment_ipfs_hash IS NOT NULL
+                AND subgraph_chain_indexed IS NOT NULL
+                AND subgraph_deployment_chain IS NOT NULL
+            ),
+            non_dupe_data AS (
+                SELECT DISTINCT * FROM initial_data
+            ),
+            mode_subgraph_networks AS (
+                SELECT
+                    deployment_hash,
+                    subgraph_network,
+                    COUNT(subgraph_network) AS freq
+                FROM non_dupe_data
+                GROUP BY deployment_hash, subgraph_network
+            ),
+            aggregated_data AS (
+                SELECT
+                    n.deployment_hash,
+                    ARRAY_AGG(n.indexer_network) AS indexer_network_list,
+                    ARRAY_AGG(DISTINCT n.subgraph_network) AS subgraph_network_list,
+                    COUNT(DISTINCT n.indexer_network) AS number_of_unique_indexer_networks,
+                    COUNT(n.indexer_network) AS number_of_indexer_networks,
+                    ARRAY_AGG(s.subgraph_network ORDER BY s.freq DESC LIMIT 1)[OFFSET(0)] AS mode_subgraph_network
+                FROM non_dupe_data n
+                LEFT JOIN mode_subgraph_networks s
+                ON n.deployment_hash = s.deployment_hash
+                GROUP BY n.deployment_hash
+            )
+            SELECT
+                deployment_hash,
+                CASE
+                    WHEN ARRAY_LENGTH(indexer_network_list) = 1 THEN indexer_network_list[OFFSET(0)]
+                    ELSE 'arbitrum'
+                END AS indexer_network,
+                CASE
+                    WHEN ARRAY_LENGTH(subgraph_network_list) = 1 THEN subgraph_network_list[OFFSET(0)]
+                    ELSE mode_subgraph_network
+                END AS subgraph_network
+            FROM aggregated_data
+            WHERE deployment_hash IS NOT NULL
+            AND deployment_hash <> ''
+            ORDER BY number_of_unique_indexer_networks DESC
+        ),
+
+        combined_indexer_dimensions AS (
+            WITH indexer_dimensions AS (
+                SELECT
+                    day AS day_partition,
+                    indexer_wallet AS indexer,
+                    indexer_url AS url,
+                    'mainnet-gateway' AS indexer_network
+                FROM internal_metrics.indexer_dimensions_daily
+                WHERE day BETWEEN '{start_date}' AND DATE_ADD('{start_date}', INTERVAL {num_days} DAY)
+            ),
+            indexer_dimensions_arbitrum AS (
+                SELECT
+                    day AS day_partition,
+                    indexer_wallet AS indexer,
+                    indexer_url AS url,
+                    'mainnet-thegraph-arbitrum' AS indexer_network
+                FROM internal_metrics.indexer_dimensions_arbitrum_daily
+                WHERE day BETWEEN '{start_date}' AND DATE_ADD('{start_date}', INTERVAL {num_days} DAY)
+            ),
+            combined_data AS (
+                SELECT * FROM indexer_dimensions
+                UNION ALL
+                SELECT * FROM indexer_dimensions_arbitrum
+            )
+            SELECT
+                day_partition,
+                indexer,
+                url,
+                CASE
+                    WHEN indexer_network = 'mainnet-thegraph-arbitrum' THEN 'arbitrum'
+                    WHEN indexer_network = 'mainnet-gateway' THEN 'mainnet'
+                END AS indexer_network
+            FROM combined_data
+            WHERE indexer IS NOT NULL AND url IS NOT NULL
+            GROUP BY day_partition, indexer, url, indexer_network
+            ORDER BY day_partition
+        ),
+
+        metrics_indexer_attempts AS (
+            WITH BasicFilter AS (
+                SELECT
+                    query_id,
+                    deployment AS deployment_hash,
+                    query_fee AS fee,
+                    query_ts AS timestamp,
+                    CAST(blocks_behind AS INT64) AS blocks_behind,
+                    SAFE_CAST(response_time_ms AS INT64) AS response_time_ms,
+                    indexer,
+                    status,
+                    day_partition,
+                    RAND() as rnd
+                FROM internal_metrics.metrics_indexer_attempts
+                WHERE day_partition BETWEEN '{start_date}' AND DATE_ADD('{start_date}', INTERVAL {num_days} DAY)
+                AND deployment IN (SELECT deployment_hash FROM production_metrics_gateway_subgraph_queries)
+            ),
+            FilteredRows AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (PARTITION BY deployment_hash, indexer ORDER BY rnd) as row_num
+                FROM BasicFilter
+            )
+            SELECT
+                query_id,
+                deployment_hash,
+                fee,
+                timestamp,
+                blocks_behind,
+                response_time_ms,
+                indexer,
+                status,
+                day_partition
+            FROM FilteredRows
+            WHERE row_num <= {rows_to_use}
+        )
+
+        SELECT
+            m.query_id,
+            m.deployment_hash,
+            m.fee,
+            m.timestamp,
+            m.blocks_behind,
+            m.response_time_ms,
+            m.indexer,
+            m.status,
+            m.day_partition,
+            pm.subgraph_network,
+            c.url
+        FROM metrics_indexer_attempts m
+        LEFT JOIN production_metrics_gateway_subgraph_queries pm
+        ON m.deployment_hash = pm.deployment_hash
+        LEFT JOIN combined_indexer_dimensions c
+        ON m.indexer = c.indexer AND m.day_partition = c.day_partition AND pm.indexer_network = c.indexer_network
+        WHERE pm.indexer_network = 'arbitrum'
+        ORDER BY m.timestamp;
+        """)
