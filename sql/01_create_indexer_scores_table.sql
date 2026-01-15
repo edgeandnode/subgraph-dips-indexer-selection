@@ -31,10 +31,17 @@ CREATE TABLE IF NOT EXISTS `graph-mainnet.iisa_data_for_dips.indexer_scores` (
 
   -- Pre-normalized scores (0-1 scale, higher = better)
   -- These are computed once by the CronJob using IQR-based robust normalization
-  -- DataProcessor reads these directly; only existing_dips_agreements is normalized per-request
   norm_uptime_score FLOAT64,
   norm_success_rate FLOAT64,
   norm_stake_to_fees FLOAT64,
+
+  -- DIP agreement metrics
+  -- existing_dips_agreements: Updated at runtime when agreements are made (default 0)
+  -- avg_sync_duration: Not yet populated from data source (see GitHub issue)
+  -- indexing_agreement_acceptance_latency: Not yet populated from data source (see GitHub issue)
+  existing_dips_agreements INT64 DEFAULT 0,
+  avg_sync_duration FLOAT64,
+  indexing_agreement_acceptance_latency FLOAT64,
 
   -- Organization/location for decentralization checks
   org STRING,

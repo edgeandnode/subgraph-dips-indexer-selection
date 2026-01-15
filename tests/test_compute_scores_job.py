@@ -1139,6 +1139,14 @@ class TestMergeAndPrepareDataframes:
         assert "uptime" in result.columns
         assert "Latency Coefficient" in result.columns
 
+        # Placeholder columns for DIP metrics
+        assert "existing_dips_agreements" in result.columns
+        assert all(result["existing_dips_agreements"] == 0)
+        assert "avg_sync_duration" in result.columns
+        assert all(pd.isna(result["avg_sync_duration"]))
+        assert "indexing_agreement_acceptance_latency" in result.columns
+        assert all(pd.isna(result["indexing_agreement_acceptance_latency"]))
+
         # Dropped columns not present
         assert "% up_y" not in result.columns
         assert "observed_duration_full" not in result.columns

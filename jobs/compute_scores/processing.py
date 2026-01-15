@@ -756,4 +756,10 @@ def merge_and_prepare_dataframes(
     merged = pd.merge(merged, indexer_success_rate, on="indexer", how="left")
     merged = pd.merge(merged, stake_to_fees, on="indexer", how="left")
 
+    # Add placeholder columns for metrics not yet populated from data sources
+    # These are required by DataProcessor for scoring
+    merged["existing_dips_agreements"] = 0
+    merged["avg_sync_duration"] = np.nan
+    merged["indexing_agreement_acceptance_latency"] = np.nan
+
     return merged
