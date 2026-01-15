@@ -690,9 +690,11 @@ def calculate_indexer_uptime(df: pd.DataFrame, threshold_seconds: int = 120) -> 
 
     merged_restricted = pd.merge(observed_restricted, uptime_restricted, on="indexer", how="left").reset_index()
     merged_restricted["% up"] = round(merged_restricted["uptime_duration_restricted"] / merged_restricted["observed_duration_restricted"] * 100, 3)
+    merged_restricted = merged_restricted.sort_values(by="% up", ascending=False)
 
     merged_full = pd.merge(observed_full, uptime_full, on="indexer", how="left").reset_index()
     merged_full["% up"] = round(merged_full["uptime_duration_full"] / merged_full["observed_duration_full"] * 100, 3)
+    merged_full = merged_full.sort_values(by="% up", ascending=False)
 
     return pd.merge(merged_restricted, merged_full, on="indexer", how="left")
 
