@@ -47,16 +47,11 @@ ITERATIVE_FILTER_MIN_QUERIES_PER_INDEXER = 250
 ITERATIVE_FILTER_MIN_QUERIES_PER_DEPLOYMENT = 250
 
 # Column rename mappings for geolocation data
-GEOIP_DST_COLUMN_MAPPING = {
-    "country": "dst_country",
-    "latitude": "dst_lat",
-    "longitude": "dst_lon",
-}
-GEOIP_SRC_COLUMN_MAPPING = {
-    "country": "src_country",
-    "latitude": "src_lat",
-    "longitude": "src_lon",
-}
+def _geoip_column_mapping(prefix: str) -> dict:
+    return {"country": f"{prefix}_country", "latitude": f"{prefix}_lat", "longitude": f"{prefix}_lon"}
+
+GEOIP_DST_COLUMN_MAPPING = _geoip_column_mapping("dst")
+GEOIP_SRC_COLUMN_MAPPING = _geoip_column_mapping("src")
 
 
 def compute_all_scores(
@@ -355,9 +350,7 @@ def resolve_url_geoip(url: str, auth: str) -> dict:
 def is_private_ip(ip_addr: str) -> bool:
     """Check if an IP address is private (RFC 1918/3330)."""
     try:
-        (ip,) = __import__("struct").unpack(
-            "!I", socket.inet_pton(socket.AF_INET, ip_addr)
-        )
+        (ip,) = unpack("!I", socket.inet_pton(socket.AF_INET, ip_addr))
         private_networks = (
             (0x7F000000, 0xFF000000),  # 127.0.0.0/8
             (0xC0A80000, 0xFFFF0000),  # 192.168.0.0/16
