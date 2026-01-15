@@ -206,6 +206,11 @@ def transform_to_scores_schema(merged: pd.DataFrame, num_days: int) -> pd.DataFr
     scores["dst_lat"] = merged.get("dst_lat")
     scores["dst_lon"] = merged.get("dst_lon")
 
+    # DIP agreement metrics (placeholders until data sources available - see #15)
+    scores["existing_dips_agreements"] = merged.get("existing_dips_agreements", 0)
+    scores["avg_sync_duration"] = merged.get("avg_sync_duration")
+    scores["indexing_agreement_acceptance_latency"] = merged.get("indexing_agreement_acceptance_latency")
+
     # Metadata
     scores["computed_at"] = datetime.utcnow()
     scores["query_count"] = len(merged)
