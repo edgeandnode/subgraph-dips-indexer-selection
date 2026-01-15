@@ -33,6 +33,13 @@ from processing import (
     iterative_filter,
     calculate_indexer_success_rate,
     calculate_indexer_stake_to_fees,
+    adjust_rows,
+    strategic_sample,
+    hash_sampled_queries,
+    perform_latency_linear_regression,
+    calculate_indexer_uptime,
+    aggregate_indexer_info,
+    merge_and_prepare_dataframes,
 )
 from bq import BigQueryClient
 
@@ -534,3 +541,640 @@ class TestBigQueryClientIdempotency:
 
             # Assert - should return False on error (graceful handling)
             assert result is False
+
+
+# =============================================================================
+# PORTED TESTS FROM test_data_manager.py
+# These tests cover the critical processing functions that will be deleted
+# from IISA after the CronJob migration is complete.
+# =============================================================================
+
+
+class TestAdjustRows:
+    """Tests for the adjust_rows function."""
+
+    def test_adjust_rows_normal_case(self):
+        # Arrange
+        sample_data = pd.DataFrame({
+            "deployment_hash": ["hash1", "hash2", "hash3", "hash1"],
+            "indexer": ["index1", "index2", "index3", "indexer4"],
+            "num_rows": [50, 10000, 600, 50],
+        })
+
+        # Act
+        target_rows = 600
+        result = adjust_rows(sample_data, target_rows)
+
+        # Assert - result should be close to target
+        assert result > 0
+
+    def test_adjust_rows_empty_dataframe(self):
+        # Arrange
+        df = pd.DataFrame({"deployment_hash": [], "indexer": [], "num_rows": []})
+
+        # Act
+        target_rows = 100
+        result = adjust_rows(df, target_rows)
+
+        # Assert - should handle empty gracefully
+        assert result == 0 or df.empty
+
+    def test_adjust_rows_zero_target(self):
+        # Arrange
+        sample_data = pd.DataFrame({
+            "deployment_hash": ["hash1", "hash2"],
+            "indexer": ["index1", "index2"],
+            "num_rows": [50, 100],
+        })
+
+        # Act
+        target_rows = 0
+        result = adjust_rows(sample_data, target_rows)
+
+        # Assert
+        assert result == 0
+
+    def test_adjust_rows_negative_raises(self):
+        # Arrange
+        df = pd.DataFrame({
+            "deployment_hash": ["hash1"],
+            "indexer": ["index1"],
+            "num_rows": [100],
+        })
+
+        # Act & Assert
+        with pytest.raises(ValueError, match="non-negative"):
+            adjust_rows(df, -300)
+
+
+class TestStrategicSample:
+    """Tests for the strategic_sample function."""
+
+    @pytest.fixture
+    def sample_df(self):
+        return pd.DataFrame({
+            "deployment_hash": ["A", "A", "A", "B", "B", "C"] * 10000,
+            "indexer": ["X", "Y", "Z", "X", "Y", "X"] * 10000,
+            "query_id": range(60000),
+        })
+
+    def test_strategic_sample_basic(self, sample_df):
+        # Act
+        result_df, integer_root = strategic_sample(sample_df, target_rows_per_subgraph=30)
+
+        # Assert
+        sampled = result_df[result_df["sampled_query_id"].notna()]
+
+        # Check output df length unchanged
+        assert len(result_df) == len(sample_df)
+
+        # Check sampled count is reasonable
+        assert result_df["sampled_query_id"].notna().sum() == 90
+
+        # Verify integer_root calculation
+        assert isinstance(integer_root, int)
+        assert integer_root == int(np.sqrt(result_df["sampled_query_id"].notna().sum()))
+
+    def test_strategic_sample_empty_df(self):
+        # Arrange
+        empty_df = pd.DataFrame(columns=["deployment_hash", "indexer", "query_id"])
+
+        # Act
+        result_df, integer_root = strategic_sample(empty_df, target_rows_per_subgraph=10)
+
+        # Assert
+        assert result_df.empty
+        assert "sampled_query_id" in result_df.columns
+        assert integer_root == 0
+
+    def test_strategic_sample_large_target(self, sample_df):
+        # Act - target larger than data
+        result_df, integer_root = strategic_sample(
+            sample_df, target_rows_per_subgraph=10_000_000
+        )
+
+        # Assert - should sample all unique queries
+        assert len(result_df) == len(sample_df)
+        assert result_df["sampled_query_id"].notna().sum() == sample_df["query_id"].nunique()
+
+
+class TestHashSampledQueries:
+    """Tests for the hash_sampled_queries function."""
+
+    @pytest.fixture
+    def sample_df(self):
+        return pd.DataFrame({
+            "sampled_query_id": [1, 2, 3, None, 5, 6, np.nan, 8, 9, 10] * 1000,
+            "other_column": ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"] * 1000,
+        })
+
+    def test_hash_sampled_queries_basic(self, sample_df):
+        # Act
+        integer_root = 33
+        result = hash_sampled_queries(sample_df, integer_root)
+
+        # Assert
+        assert "sampled_query_id_hashed_mod_integer_root" in result.columns
+        assert result["sampled_query_id_hashed_mod_integer_root"].notna().sum() == 8000
+        assert result["sampled_query_id_hashed_mod_integer_root"].isna().sum() == 2000
+
+        # All hashed values within range
+        assert all(
+            0 <= x < integer_root
+            for x in result["sampled_query_id_hashed_mod_integer_root"].dropna()
+        )
+
+    def test_hash_sampled_queries_empty_df(self):
+        # Arrange
+        empty_df = pd.DataFrame(columns=["sampled_query_id"])
+
+        # Act
+        result = hash_sampled_queries(empty_df, 5)
+
+        # Assert
+        assert "sampled_query_id_hashed_mod_integer_root" in result.columns
+        assert result.empty
+
+    def test_hash_sampled_queries_all_null(self):
+        # Arrange
+        df = pd.DataFrame({"sampled_query_id": [None, None, None]})
+
+        # Act
+        result = hash_sampled_queries(df, 5)
+
+        # Assert
+        assert result["sampled_query_id_hashed_mod_integer_root"].isna().all()
+
+    def test_hash_sampled_queries_consistency(self, sample_df):
+        # Act - hash twice with same params
+        integer_root = 7
+        result1 = hash_sampled_queries(sample_df, integer_root)
+        result2 = hash_sampled_queries(sample_df, integer_root)
+
+        # Assert - results should be identical
+        pd.testing.assert_frame_equal(result1, result2)
+
+    def test_hash_sampled_queries_different_roots_differ(self, sample_df):
+        # Act
+        result1 = hash_sampled_queries(sample_df.copy(), 5)
+        result2 = hash_sampled_queries(sample_df.copy(), 10)
+
+        # Assert - different roots should produce different results
+        assert not result1["sampled_query_id_hashed_mod_integer_root"].equals(
+            result2["sampled_query_id_hashed_mod_integer_root"]
+        )
+
+    def test_hash_sampled_queries_original_unchanged(self, sample_df):
+        # Arrange
+        original_df = sample_df.copy()
+
+        # Act
+        _ = hash_sampled_queries(sample_df, 5)
+
+        # Assert - original should be unchanged
+        pd.testing.assert_frame_equal(original_df, sample_df)
+
+    def test_hash_sampled_queries_large_root(self):
+        # Arrange
+        df = pd.DataFrame({"sampled_query_id": range(1000)})
+        large_root = 10_000_000_000
+
+        # Act
+        result = hash_sampled_queries(df, large_root)
+
+        # Assert - all values within range
+        assert all(
+            0 <= x < large_root
+            for x in result["sampled_query_id_hashed_mod_integer_root"]
+        )
+
+
+class TestPerformLatencyLinearRegression:
+    """
+    Tests for the latency linear regression pipeline.
+    This is the CORE algorithm of the score computation.
+    """
+
+    @pytest.fixture
+    def sample_df(self):
+        np.random.seed(42)
+        return pd.DataFrame({
+            "sampled_query_id": range(10000),
+            "indexer": np.random.choice(["0xABC", "0xXYZ", "0x123", "0x789"], 10000),
+            "indexer_network": np.random.choice(["net1", "net2"], 10000),
+            "deployment_hash": np.random.choice(
+                ["deployment_1", "deployment_2", "deployment_3"], 10000
+            ),
+            "response_time_ms": np.random.randint(10, 20000, 10000),
+            "fee": np.random.uniform(0.000001, 0.01, 10000),
+            "distance_miles": np.random.uniform(0, 1000, 10000),
+        })
+
+    def test_linear_regression_produces_rankings(self, sample_df):
+        # Arrange
+        integer_root = 100
+        hashed_df = hash_sampled_queries(sample_df, integer_root)
+
+        predictor = ["response_time_ms"]
+        categorical = [
+            "indexer", "deployment_hash", "indexer_network",
+            "sampled_query_id_hashed_mod_integer_root",
+        ]
+        numeric = ["distance_miles", "fee"]
+
+        # Act
+        rankings, results = perform_latency_linear_regression(
+            hashed_df, predictor, categorical, numeric
+        )
+
+        # Assert - rankings should have expected columns
+        expected_columns = [
+            "indexer", "Latency Coefficient", "Standard Error", "p-value",
+            "Latency Coefficient + Error Confidence Interval",
+            "Robust Normalized Latency Coefficient + Error Confidence Interval",
+        ]
+        assert all(col in rankings.columns for col in expected_columns)
+
+        # Only indexer values in the indexer column
+        assert all(rankings["indexer"].isin(["0xABC", "0xXYZ", "0x123", "0x789"]))
+
+        # Coefficients should be numeric and non-null
+        assert rankings["Latency Coefficient"].notna().all()
+
+        # p-values between 0 and 1
+        assert rankings["p-value"].between(0, 1).all()
+
+    def test_linear_regression_empty_df_raises(self):
+        # Arrange
+        empty_df = pd.DataFrame(columns=[
+            "indexer", "deployment_hash", "indexer_network",
+            "response_time_ms", "fee", "distance_miles",
+        ])
+
+        predictor = ["response_time_ms"]
+        categorical = ["indexer", "deployment_hash", "indexer_network"]
+        numeric = ["distance_miles", "fee"]
+
+        # Act & Assert
+        with pytest.raises(ValueError):
+            perform_latency_linear_regression(empty_df, predictor, categorical, numeric)
+
+    def test_linear_regression_missing_columns_raises(self, sample_df):
+        # Arrange - remove required columns
+        df_missing = sample_df.drop(columns=["indexer", "fee"])
+
+        predictor = ["response_time_ms"]
+        categorical = ["indexer", "deployment_hash", "indexer_network"]
+        numeric = ["distance_miles", "fee"]
+
+        # Act & Assert
+        with pytest.raises(KeyError):
+            perform_latency_linear_regression(df_missing, predictor, categorical, numeric)
+
+    def test_linear_regression_deterministic(self, sample_df):
+        # Arrange
+        predictor = ["response_time_ms"]
+        categorical = ["indexer", "deployment_hash", "indexer_network"]
+        numeric = ["distance_miles", "fee"]
+
+        # Act - run twice
+        rankings1, _ = perform_latency_linear_regression(
+            sample_df, predictor, categorical, numeric
+        )
+        rankings2, _ = perform_latency_linear_regression(
+            sample_df, predictor, categorical, numeric
+        )
+
+        # Assert - results should be identical
+        pd.testing.assert_frame_equal(rankings1, rankings2)
+
+    def test_linear_regression_original_unchanged(self, sample_df):
+        # Arrange
+        original = sample_df.copy()
+        predictor = ["response_time_ms"]
+        categorical = ["indexer", "deployment_hash", "indexer_network"]
+        numeric = ["distance_miles", "fee"]
+
+        # Act
+        perform_latency_linear_regression(sample_df, predictor, categorical, numeric)
+
+        # Assert
+        pd.testing.assert_frame_equal(original, sample_df)
+
+
+class TestCalculateIndexerUptime:
+    """
+    Tests for the indexer uptime calculation.
+    This is critical for measuring indexer reliability.
+    """
+
+    @pytest.fixture
+    def sample_df(self):
+        return pd.DataFrame({
+            "indexer": ["A", "A", "A", "A", "B", "B", "C"],
+            "timestamp": [
+                datetime(2024, 1, 1, 12, 0),
+                datetime(2024, 1, 1, 12, 2),
+                datetime(2024, 1, 1, 12, 5),
+                datetime(2024, 1, 1, 12, 7),
+                datetime(2024, 1, 1, 12, 0),
+                datetime(2024, 1, 1, 12, 3),
+                datetime(2024, 1, 1, 12, 0),
+            ],
+            "status": [
+                "200 OK", "200 OK", "Error", "200 OK",
+                "200 OK", "Unavailable(MissingBlock)",
+                "200 OK",
+            ],
+        })
+
+    def test_uptime_base_case(self, sample_df):
+        # Act
+        result = calculate_indexer_uptime(sample_df)
+
+        # Assert - expected columns present
+        expected_columns = [
+            "indexer", "observed_duration_restricted", "uptime_duration_restricted",
+            "observed_duration_full", "uptime_duration_full", "% up_y", "% up_x",
+        ]
+        assert all(col in result.columns for col in expected_columns)
+
+        # All indexers present
+        assert set(result["indexer"]) == set(sample_df["indexer"])
+
+        # Percentages valid (0-100 or NaN for single-query indexers)
+        assert all(
+            (0 <= p <= 100) or np.isnan(p) for p in result["% up_x"]
+        )
+
+    def test_uptime_all_up(self):
+        # Arrange
+        df = pd.DataFrame({
+            "indexer": ["A", "A", "B", "B"],
+            "timestamp": [
+                datetime(2024, 1, 1, 12, 0),
+                datetime(2024, 1, 1, 12, 2),
+                datetime(2024, 1, 1, 12, 0),
+                datetime(2024, 1, 1, 12, 2),
+            ],
+            "status": ["200 OK", "Unavailable(MissingBlock)", "200 OK", "200 OK"],
+        })
+
+        # Act
+        result = calculate_indexer_uptime(df)
+
+        # Assert - all should be 100%
+        assert all(result["% up_x"] == 100)
+        assert all(result["% up_y"] == 100)
+
+    def test_uptime_all_down(self):
+        # Arrange
+        df = pd.DataFrame({
+            "indexer": ["A", "A", "B", "B"],
+            "timestamp": [
+                datetime(2024, 1, 1, 12, 0),
+                datetime(2024, 1, 1, 12, 2),
+                datetime(2024, 1, 1, 12, 0),
+                datetime(2024, 1, 1, 12, 2),
+            ],
+            "status": ["Error", "Bad", "504 Error", "Timeout"],
+        })
+
+        # Act
+        result = calculate_indexer_uptime(df)
+
+        # Assert - all should be 0%
+        assert all(result["% up_x"] == 0)
+        assert all(result["% up_y"] == 0)
+
+    def test_uptime_threshold_effect(self):
+        # Arrange - queries spaced 5 minutes apart
+        df = pd.DataFrame({
+            "indexer": ["A", "A", "A"],
+            "timestamp": [
+                datetime(2024, 1, 1, 12, 0),
+                datetime(2024, 1, 1, 12, 5),
+                datetime(2024, 1, 1, 12, 10),
+            ],
+            "status": ["200 OK", "200 OK", "200 OK"],
+        })
+
+        # Act - compare default (120s) vs lower threshold (60s)
+        result_default = calculate_indexer_uptime(df, threshold_seconds=120)
+        result_low = calculate_indexer_uptime(df, threshold_seconds=60)
+
+        # Assert - lower threshold should show lower restricted uptime
+        assert (
+            result_low["uptime_duration_restricted"].iloc[0]
+            < result_default["uptime_duration_restricted"].iloc[0]
+        )
+
+    def test_uptime_empty_df(self):
+        # Arrange
+        df = pd.DataFrame(columns=["indexer", "timestamp", "status"])
+
+        # Act
+        result = calculate_indexer_uptime(df)
+
+        # Assert
+        assert result.empty
+
+    def test_uptime_single_query_per_indexer(self):
+        # Arrange - single query can't compute uptime
+        df = pd.DataFrame({
+            "indexer": ["A", "B"],
+            "timestamp": [datetime(2024, 1, 1, 12, 0), datetime(2024, 1, 1, 12, 0)],
+            "status": ["200 OK", "Error"],
+        })
+
+        # Act
+        result = calculate_indexer_uptime(df)
+
+        # Assert - should have NaN uptime percentages
+        assert len(result) == 2
+        assert np.isnan(result["% up_x"].iloc[0])
+        assert np.isnan(result["% up_y"].iloc[0])
+
+    def test_uptime_rounding(self):
+        # Arrange
+        df = pd.DataFrame({
+            "indexer": ["A", "A", "A"],
+            "timestamp": [
+                datetime(2024, 1, 1, 12, 0),
+                datetime(2024, 1, 1, 12, 1),
+                datetime(2024, 1, 1, 12, 3),
+            ],
+            "status": ["200 OK", "Error", "200 OK"],
+        })
+
+        # Act
+        result = calculate_indexer_uptime(df)
+
+        # Assert - percentages rounded to 3 decimals
+        assert all(round(p, 3) == p for p in result["% up_x"].dropna())
+
+
+class TestAggregateIndexerInfo:
+    """Tests for the aggregate_indexer_info function."""
+
+    def test_aggregate_base_case(self):
+        # Arrange
+        df = pd.DataFrame({
+            "indexer": ["A", "A", "B", "B", "C", "C", "C"],
+            "org": ["X", "X", "Y", "Z", "W", "W", "W"],
+            "dst_lat": [10.1, 13.123445, 35, 31, 55, 45, 50],
+            "dst_lon": [22, 25.123445, 44, 41, 65, 60, 60],
+        })
+
+        # Act
+        result = aggregate_indexer_info(df)
+
+        # Assert - mode org selected
+        assert list(result["org"]) == ["X", "Y", "W"]
+
+        # Lat/lon rounded to nearest 20
+        assert list(result["dst_lat"]) == [20, 40, 40]
+        assert list(result["dst_lon"]) == [20, 40, 60]
+
+    def test_aggregate_empty_df(self):
+        # Arrange
+        df = pd.DataFrame(columns=["indexer", "org", "dst_lat", "dst_lon"])
+
+        # Act
+        result = aggregate_indexer_info(df)
+
+        # Assert
+        assert result.empty
+        assert list(result.columns) == ["indexer", "org", "dst_lat", "dst_lon"]
+
+    def test_aggregate_with_nans(self):
+        # Arrange
+        df = pd.DataFrame({
+            "indexer": ["A", "A", "B", "B", "B"],
+            "org": [np.nan, "X", "Y", np.nan, np.nan],
+            "dst_lat": [10, np.nan, np.nan, np.nan, np.nan],
+            "dst_lon": [20, np.nan, np.nan, np.nan, np.nan],
+        })
+
+        # Act
+        result = aggregate_indexer_info(df)
+
+        # Assert
+        assert list(result["indexer"]) == ["A", "B"]
+        assert list(result["org"]) == ["X", "Y"]
+
+
+class TestMergeAndPrepareDataframes:
+    """Tests for the final merge and prepare function."""
+
+    @pytest.fixture
+    def indexer_uptime(self):
+        return pd.DataFrame({
+            "indexer": ["0xABC", "0xXYZ", "0x123"],
+            "uptime": [99.5, 98.7, 97.0],
+            "observed_duration_full": [100, 200, 300],
+            "uptime_duration_full": [99, 197, 291],
+        })
+
+    @pytest.fixture
+    def indexer_rankings(self):
+        return pd.DataFrame({
+            "indexer": ["0xABC", "0xXYZ", "0x789"],
+            "Latency Coefficient": [0.5, 0.8, 1.2],
+            "Standard Error": [0.05, 0.08, 0.12],
+            "p-value": [0.01, 0.02, 0.03],
+            "% up_y": [95, 96, 97],
+        })
+
+    @pytest.fixture
+    def agg_df(self):
+        return pd.DataFrame({
+            "indexer": ["0xABC", "0xXYZ", "0x456"],
+            "org": ["AWS", "GCP", "Hetzner"],
+            "dst_lat": [40, 35, 50],
+            "dst_lon": [-74, -120, 8],
+        })
+
+    @pytest.fixture
+    def indexer_success_rate(self):
+        return pd.DataFrame({
+            "indexer": ["0xABC", "0xXYZ", "0xDEF"],
+            "average_status": [0.95, 0.92, 0.88],
+        })
+
+    @pytest.fixture
+    def stake_to_fees(self):
+        return pd.DataFrame({
+            "indexer": ["0xABC", "0xXYZ", "0xGHI"],
+            "stake_to_fees": [100, 200, 300],
+            "stake_to_fees_iqr_deviation": [-0.5, 0, 0.5],
+        })
+
+    def test_merge_base_case(
+        self, indexer_uptime, indexer_rankings, agg_df,
+        indexer_success_rate, stake_to_fees
+    ):
+        # Act
+        result = merge_and_prepare_dataframes(
+            indexer_uptime, indexer_rankings, agg_df,
+            indexer_success_rate, stake_to_fees,
+        )
+
+        # Assert - core columns present
+        assert "indexer" in result.columns
+        assert "uptime" in result.columns
+        assert "Latency Coefficient" in result.columns
+
+        # Dropped columns not present
+        assert "% up_y" not in result.columns
+        assert "observed_duration_full" not in result.columns
+
+    def test_merge_missing_indexer(
+        self, indexer_uptime, indexer_rankings, agg_df,
+        indexer_success_rate, stake_to_fees
+    ):
+        # Arrange - remove an indexer
+        indexer_uptime_modified = indexer_uptime[indexer_uptime["indexer"] != "0xABC"]
+
+        # Act
+        result = merge_and_prepare_dataframes(
+            indexer_uptime_modified, indexer_rankings, agg_df,
+            indexer_success_rate, stake_to_fees,
+        )
+
+        # Assert - removed indexer not in result
+        assert "0xABC" not in result["indexer"].values
+
+    def test_merge_no_common_indexers(
+        self, indexer_uptime, indexer_rankings, agg_df,
+        indexer_success_rate, stake_to_fees
+    ):
+        # Arrange - different indexer sets (no overlap with rankings)
+        indexer_uptime["indexer"] = ["0xAAA", "0xBBB", "0xCCC"]
+
+        # Act
+        result = merge_and_prepare_dataframes(
+            indexer_uptime, indexer_rankings, agg_df,
+            indexer_success_rate, stake_to_fees,
+        )
+
+        # Assert - result is empty because:
+        # 1. Left merge with rankings creates NaN for latency columns
+        # 2. dropna(subset=latency_columns) removes all rows
+        assert result.empty
+
+    def test_merge_preserves_columns(
+        self, indexer_uptime, indexer_rankings, agg_df,
+        indexer_success_rate, stake_to_fees
+    ):
+        # Arrange - add extra column
+        indexer_uptime["extra_col"] = [1, 2, 3]
+
+        # Act
+        result = merge_and_prepare_dataframes(
+            indexer_uptime, indexer_rankings, agg_df,
+            indexer_success_rate, stake_to_fees,
+        )
+
+        # Assert - extra column preserved
+        assert "extra_col" in result.columns
