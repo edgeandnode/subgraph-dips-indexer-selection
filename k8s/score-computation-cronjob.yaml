@@ -34,9 +34,10 @@ spec:
             resources:
               requests:
                 memory: "64Gi"
-                cpu: "4"
+                cpu: "2"
               limits:
                 memory: "64Gi"
+                cpu: "8"
             env:
             - name: BQ_PROJECT
               value: "graph-mainnet"
@@ -57,7 +58,6 @@ spec:
               value: /app/credentials/service-account.json
             securityContext:
               allowPrivilegeEscalation: false
-              readOnlyRootFilesystem: true
               capabilities:
                 drop:
                   - ALL
