@@ -103,7 +103,10 @@ def compute_all_scores(
     combined_queries = calculate_distances(combined_queries)
 
     # Filter to successful queries for regression
+    logger.info(f"Before filter_successful_queries: {len(combined_queries)} rows")
+    logger.info(f"  src_lat NaN: {combined_queries['src_lat'].isna().sum()}, dst_lat NaN: {combined_queries['dst_lat'].isna().sum()}")
     combined_queries_filtered = filter_successful_queries(combined_queries)
+    logger.info(f"After filter_successful_queries: {len(combined_queries_filtered)} rows")
 
     # Prepare for regression
     predictor = ["response_time_ms"]
@@ -111,7 +114,10 @@ def compute_all_scores(
     numeric = ["distance_miles", "fee"]
 
     filtered_data = combined_queries_filtered[predictor + categorical + numeric]
+    logger.info(f"After column selection: {len(filtered_data)} rows")
+    logger.info(f"  NaN counts - distance_miles: {filtered_data['distance_miles'].isna().sum()}, fee: {filtered_data['fee'].isna().sum()}")
     filtered_data = filtered_data.dropna(subset=numeric)
+    logger.info(f"After dropna(numeric): {len(filtered_data)} rows")
 
     # Apply iterative filtering
     filtered_data = iterative_filter(
@@ -472,7 +478,7 @@ def calculate_distances(data: pd.DataFrame) -> pd.DataFrame:
 
 def haversine_vectorized(lon1, lat1, lon2, lat2):
     """Vectorized haversine distance calculation."""
-    lon1, lat1, lon2, lat2 = np.radians([lon1, lat1, lon2, lat2])
+    lon1, lat1, lon2, lat2 = [np.radians(np.asarray(x, dtype=float)) for x in [lon1, lat1, lon2, lat2]]
     dlon = lon2 - lon1
     dlat = lat2 - lat1
     a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
@@ -493,28 +499,36 @@ def iterative_filter(
     min_queries_per_deployment: int,
 ) -> pd.DataFrame:
     """Iteratively filter data based on minimum thresholds."""
+    logger.info(f"iterative_filter starting with {len(df)} rows")
+    iteration = 0
     while True:
         initial_len = len(df)
+        iteration += 1
 
         # Ensure deployments have minimum indexers
         indexer_per_deployment = df.groupby("deployment_hash")["indexer"].nunique()
         df = df[df["deployment_hash"].map(indexer_per_deployment) >= min_deployment_indexers]
+        logger.info(f"  iter {iteration} after min_deployment_indexers ({min_deployment_indexers}): {len(df)} rows")
 
         # Ensure indexers serve minimum deployments
         deployment_per_indexer = df.groupby("indexer")["deployment_hash"].nunique()
         df = df[df["indexer"].map(deployment_per_indexer) >= min_deployments_per_indexer]
+        logger.info(f"  iter {iteration} after min_deployments_per_indexer ({min_deployments_per_indexer}): {len(df)} rows")
 
         # Ensure indexers serve minimum queries
         queries_per_indexer = df.groupby("indexer")["query_id"].nunique()
         df = df[df["indexer"].map(queries_per_indexer) >= min_queries_per_indexer]
+        logger.info(f"  iter {iteration} after min_queries_per_indexer ({min_queries_per_indexer}): {len(df)} rows")
 
         # Ensure deployments have minimum queries
         query_counts = df.groupby("deployment_hash").size()
         df = df[df["deployment_hash"].map(query_counts) >= min_queries_per_deployment]
+        logger.info(f"  iter {iteration} after min_queries_per_deployment ({min_queries_per_deployment}): {len(df)} rows")
 
         if len(df) == initial_len:
             break
 
+    logger.info(f"iterative_filter finished with {len(df)} rows after {iteration} iterations")
     return pd.DataFrame(df)
 
 
