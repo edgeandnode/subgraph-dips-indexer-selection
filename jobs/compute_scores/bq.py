@@ -6,7 +6,7 @@ Handles reading raw data and writing computed scores.
 
 import logging
 import socket
-from datetime import date
+from datetime import date, datetime, timezone
 from textwrap import dedent
 
 import pandas as pd
@@ -29,6 +29,7 @@ class BigQueryClient:
         self.dataset = dataset
         self.location = location
         self.scores_table = f"{project}.{dataset}.indexer_scores"
+        self.url_cache_table = f"{project}.{dataset}.indexer_url_cache"
 
         # Configure bigframes
         bpd.options.bigquery.project = project
@@ -59,6 +60,70 @@ class BigQueryClient:
             # Table might not exist yet
             logger.warning(f"Could not check for existing scores: {e}")
             return False
+
+    def ensure_url_cache_exists(self) -> None:
+        """Create the URL cache table if it doesn't exist."""
+        query = f"""
+        CREATE TABLE IF NOT EXISTS `{self.url_cache_table}` (
+            indexer STRING NOT NULL,
+            url STRING NOT NULL,
+            last_seen TIMESTAMP NOT NULL
+        )
+        """
+        bpd.read_gbq(query)
+        logger.info(f"Ensured URL cache table exists: {self.url_cache_table}")
+
+    def update_url_cache(self, max_age_days: int = 7) -> None:
+        """Incrementally update the URL cache with new data from gateway logs.
+
+        Only updates if the cache is older than max_age_days to avoid unnecessary
+        full table scans (source table is not partitioned).
+        """
+        # Get the last update timestamp from cache
+        last_update_query = f"""
+        SELECT
+            COALESCE(MAX(last_seen), TIMESTAMP('1970-01-01')) as last_update,
+            COUNT(*) as cache_size
+        FROM `{self.url_cache_table}`
+        """
+        result = self._read_gbq(last_update_query)
+        last_update = result["last_update"].iloc[0]
+        cache_size = result["cache_size"].iloc[0]
+
+        # Skip update if cache is fresh enough (unless empty)
+        cache_age_days = (datetime.now(timezone.utc) - last_update.to_pydatetime()).days
+        if cache_size > 0 and cache_age_days < max_age_days:
+            logger.info(f"URL cache is fresh ({cache_age_days} days old, {cache_size} indexers), skipping update")
+            return
+
+        logger.info(f"URL cache needs update (age={cache_age_days} days, size={cache_size})")
+
+        # Merge new data into cache
+        merge_query = f"""
+        MERGE `{self.url_cache_table}` AS cache
+        USING (
+            SELECT
+                gateway_indexer_eth_address as indexer,
+                ARRAY_AGG(gateway_indexer_url ORDER BY hour_timestamp DESC LIMIT 1)[OFFSET(0)] as url,
+                MAX(hour_timestamp) as last_seen
+            FROM `{self.project}.internal_metrics.metrics_subgraph_gateway_logs`
+            WHERE hour_timestamp > TIMESTAMP('{last_update}')
+              AND gateway_indexer_url IS NOT NULL AND gateway_indexer_url != ''
+              AND gateway_indexer_eth_address IS NOT NULL
+            GROUP BY gateway_indexer_eth_address
+        ) AS new_data
+        ON cache.indexer = new_data.indexer
+        WHEN MATCHED AND new_data.last_seen > cache.last_seen THEN
+            UPDATE SET url = new_data.url, last_seen = new_data.last_seen
+        WHEN NOT MATCHED THEN
+            INSERT (indexer, url, last_seen) VALUES (new_data.indexer, new_data.url, new_data.last_seen)
+        """
+        bpd.read_gbq(merge_query)
+
+        # Log cache stats
+        stats_query = f"SELECT COUNT(*) as cnt FROM `{self.url_cache_table}`"
+        stats = self._read_gbq(stats_query)
+        logger.info(f"URL cache updated, total indexers: {stats['cnt'].iloc[0]}")
 
     def fetch_initial_query_results(self, start_date: date, num_days: int) -> pd.DataFrame:
         """
@@ -246,42 +311,9 @@ class BigQueryClient:
             ORDER BY number_of_unique_indexer_networks DESC
         ),
 
-        combined_indexer_dimensions AS (
-            WITH indexer_dimensions AS (
-                SELECT
-                    day AS day_partition,
-                    indexer_wallet AS indexer,
-                    indexer_url AS url,
-                    'mainnet-gateway' AS indexer_network
-                FROM internal_metrics.indexer_dimensions_daily
-                WHERE day BETWEEN '{start_date}' AND DATE_ADD('{start_date}', INTERVAL {num_days} DAY)
-            ),
-            indexer_dimensions_arbitrum AS (
-                SELECT
-                    day AS day_partition,
-                    indexer_wallet AS indexer,
-                    indexer_url AS url,
-                    'mainnet-thegraph-arbitrum' AS indexer_network
-                FROM internal_metrics.indexer_dimensions_arbitrum_daily
-                WHERE day BETWEEN '{start_date}' AND DATE_ADD('{start_date}', INTERVAL {num_days} DAY)
-            ),
-            combined_data AS (
-                SELECT * FROM indexer_dimensions
-                UNION ALL
-                SELECT * FROM indexer_dimensions_arbitrum
-            )
-            SELECT
-                day_partition,
-                indexer,
-                url,
-                CASE
-                    WHEN indexer_network = 'mainnet-thegraph-arbitrum' THEN 'arbitrum'
-                    WHEN indexer_network = 'mainnet-gateway' THEN 'mainnet'
-                END AS indexer_network
-            FROM combined_data
-            WHERE indexer IS NOT NULL AND url IS NOT NULL
-            GROUP BY day_partition, indexer, url, indexer_network
-            ORDER BY day_partition
+        indexer_url_lookup AS (
+            SELECT indexer, url
+            FROM `{self.url_cache_table}`
         ),
 
         metrics_indexer_attempts AS (
@@ -336,8 +368,8 @@ class BigQueryClient:
         FROM metrics_indexer_attempts m
         LEFT JOIN production_metrics_gateway_subgraph_queries pm
         ON m.deployment_hash = pm.deployment_hash
-        LEFT JOIN combined_indexer_dimensions c
-        ON m.indexer = c.indexer AND m.day_partition = c.day_partition AND pm.indexer_network = c.indexer_network
+        LEFT JOIN indexer_url_lookup c
+        ON m.indexer = c.indexer
         WHERE pm.indexer_network = 'arbitrum'
         ORDER BY m.timestamp;
         """)

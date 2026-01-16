@@ -49,6 +49,10 @@ def main() -> int:
         logger.info("Scores already computed for today, skipping")
         return 0
 
+    # Update indexer URL cache (incremental, only scans new data)
+    bq_client.ensure_url_cache_exists()
+    bq_client.update_url_cache()
+
     # Compute timestamps
     end_date = date.today()
     start_date = end_date - timedelta(days=NUM_DAYS)

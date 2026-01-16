@@ -63,3 +63,4 @@ Thumbs.db
 !tests/__fixtures__/*.json
 !release-please-config.json
 !.release-please-manifest.json
+.secrets/
