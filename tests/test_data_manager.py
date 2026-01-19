@@ -2,7 +2,7 @@
 Test suite covering the DataManager class.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 from unittest.mock import MagicMock, patch
 
@@ -1972,3 +1972,190 @@ class TestMergeAndPrepareDataframes:
         # Check that new columns are present too
         new_expected_columns = {"new_col_1", "new_col_2", "new_col_3"}
         assert all(col in result.columns for col in new_expected_columns)
+
+
+class TestLoadScores:
+    """Tests for the load_scores() method that reads pre-computed scores from BigQuery."""
+
+    @pytest.fixture
+    def mock_scores_df(self):
+        """Create a mock DataFrame simulating the indexer_scores table."""
+        return pd.DataFrame({
+            "indexer": ["0xABC", "0xXYZ", "0x123"],
+            "url": ["https://a.com/", "https://b.com/", "https://c.com/"],
+            "lat_lin_reg_coefficient": [0.5, 0.3, 0.7],
+            "lat_coefficient_std_error": [0.05, 0.03, 0.07],
+            "lat_coefficient_upper_bound": [0.55, 0.33, 0.77],
+            "lat_normalized_score": [0.8, 0.9, 0.6],
+            "uptime_score": [0.98, 0.95, 0.99],
+            "success_rate": [0.95, 0.90, 0.97],
+            "stake_to_fees": [1000, 2000, 1500],
+            "stake_to_fees_iqr_deviation": [0.5, 1.0, 0.75],
+            "norm_uptime_score": [0.9, 0.7, 0.95],
+            "norm_success_rate": [0.85, 0.6, 0.9],
+            "norm_stake_to_fees": [0.5, 0.8, 0.65],
+            "org": ["hetzner", "amazon", "google"],
+            "dst_lat": [50.0, 40.0, 35.0],
+            "dst_lon": [10.0, -74.0, 139.0],
+            "existing_dips_agreements": [2, 1, 0],
+            "avg_sync_duration": [np.nan, np.nan, np.nan],
+            "indexing_agreement_acceptance_latency": [np.nan, np.nan, np.nan],
+            "computed_at": [datetime(2024, 1, 15, 12, 0)] * 3,
+            "query_count": [10000, 8000, 12000],
+            "num_days": [28, 28, 28],
+        })
+
+    @pytest.fixture
+    def mock_bigquery_with_scores(self, mock_scores_df):
+        """Create a mock BigQueryProvider that returns scores."""
+        mock_bq = MagicMock()
+        mock_bq.fetch_indexer_scores.return_value = (
+            mock_scores_df,
+            datetime(2024, 1, 15, 12, 0),
+        )
+        return mock_bq
+
+    @pytest.fixture
+    def mock_bigquery_empty_scores(self):
+        """Create a mock BigQueryProvider that returns empty scores."""
+        mock_bq = MagicMock()
+        mock_bq.fetch_indexer_scores.return_value = (pd.DataFrame(), None)
+        return mock_bq
+
+    @pytest.fixture
+    def mock_network_provider(self):
+        """Create a mock NetworkProvider."""
+        return MagicMock()
+
+    def test_load_scores_success(self, mock_bigquery_with_scores, mock_network_provider):
+        """Test that load_scores() successfully loads and transforms data."""
+        # Given
+        data_manager = DataManager(mock_bigquery_with_scores, mock_network_provider)
+
+        # When
+        result = data_manager.load_scores()
+
+        # Then
+        assert result is True
+        data = data_manager.get_data()
+        assert data is not None
+        assert len(data) == 3
+
+    def test_load_scores_column_transformation(
+        self, mock_bigquery_with_scores, mock_network_provider
+    ):
+        """Test that load_scores() correctly transforms column names."""
+        # Given
+        data_manager = DataManager(mock_bigquery_with_scores, mock_network_provider)
+        data_manager.load_scores()
+
+        # When
+        data = data_manager.get_data()
+
+        # Then - check renamed columns exist
+        assert "Latency Coefficient + Error Confidence Interval" in data.columns
+        assert "average_status" in data.columns
+        assert "% up_x" in data.columns
+        assert "destination_loc" in data.columns
+        assert "norm_lat_lin_reg_coefficient" in data.columns
+        assert "norm_stake_to_fees_iqr_deviation" in data.columns
+
+    def test_load_scores_uptime_conversion(
+        self, mock_bigquery_with_scores, mock_network_provider
+    ):
+        """Test that uptime is converted from 0-1 to percentage."""
+        # Given
+        data_manager = DataManager(mock_bigquery_with_scores, mock_network_provider)
+        data_manager.load_scores()
+
+        # When
+        data = data_manager.get_data()
+
+        # Then - uptime should be converted to percentage
+        # Original was 0.98, 0.95, 0.99 -> should become 98, 95, 99
+        assert data["% up_x"].iloc[0] == pytest.approx(98.0)
+        assert data["% up_x"].iloc[1] == pytest.approx(95.0)
+        assert data["% up_x"].iloc[2] == pytest.approx(99.0)
+
+    def test_load_scores_destination_loc_creation(
+        self, mock_bigquery_with_scores, mock_network_provider
+    ):
+        """Test that destination_loc is created from lat/lon."""
+        # Given
+        data_manager = DataManager(mock_bigquery_with_scores, mock_network_provider)
+        data_manager.load_scores()
+
+        # When
+        data = data_manager.get_data()
+
+        # Then - destination_loc should be "lat,lon" string
+        assert data["destination_loc"].iloc[0] == "50.0,10.0"
+        assert data["destination_loc"].iloc[1] == "40.0,-74.0"
+        assert data["destination_loc"].iloc[2] == "35.0,139.0"
+
+    def test_load_scores_empty_table(
+        self, mock_bigquery_empty_scores, mock_network_provider
+    ):
+        """Test that load_scores() returns False when table is empty."""
+        # Given
+        data_manager = DataManager(mock_bigquery_empty_scores, mock_network_provider)
+
+        # When
+        result = data_manager.load_scores()
+
+        # Then
+        assert result is False
+        assert data_manager.get_data() is None
+
+    def test_load_scores_staleness_check(
+        self, mock_bigquery_with_scores, mock_network_provider, caplog
+    ):
+        """Test that staleness warnings are logged for old scores."""
+        # Given - mock scores from 100 hours ago
+        old_timestamp = datetime.now(timezone.utc) - timedelta(hours=100)
+        mock_bigquery_with_scores.fetch_indexer_scores.return_value = (
+            mock_bigquery_with_scores.fetch_indexer_scores.return_value[0],
+            old_timestamp,
+        )
+        data_manager = DataManager(mock_bigquery_with_scores, mock_network_provider)
+
+        # When
+        import logging
+        with caplog.at_level(logging.WARNING):
+            data_manager.load_scores()
+
+        # Then - should log a warning about stale scores
+        assert any("stale" in record.message.lower() for record in caplog.records)
+
+    def test_get_scores_age(self, mock_bigquery_with_scores, mock_network_provider):
+        """Test that get_scores_age() returns correct age."""
+        # Given
+        data_manager = DataManager(mock_bigquery_with_scores, mock_network_provider)
+
+        # Before loading scores, age should be None
+        assert data_manager.get_scores_age() is None
+
+        # When
+        data_manager.load_scores()
+
+        # Then - age should be a timedelta
+        age = data_manager.get_scores_age()
+        assert age is not None
+        assert isinstance(age, timedelta)
+
+    def test_load_scores_preserves_precomputed_normalized_values(
+        self, mock_bigquery_with_scores, mock_network_provider
+    ):
+        """Test that pre-computed normalized values are preserved."""
+        # Given
+        data_manager = DataManager(mock_bigquery_with_scores, mock_network_provider)
+        data_manager.load_scores()
+
+        # When
+        data = data_manager.get_data()
+
+        # Then - pre-computed normalized values should be present
+        assert "norm_uptime_score" in data.columns
+        assert "norm_success_rate" in data.columns
+        assert data["norm_uptime_score"].iloc[0] == pytest.approx(0.9)
+        assert data["norm_success_rate"].iloc[0] == pytest.approx(0.85)
