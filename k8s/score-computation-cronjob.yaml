@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: subgraph-dips-indexer-selection-iisa-daily-cronjob-samuel
+  labels:
+    app: iisa-score-computation
+    owner: samuel
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: score-computation
+  namespace: subgraph-dips-indexer-selection-iisa-daily-cronjob-samuel
+  labels:
+    app: iisa-score-computation
+spec:
+  schedule: "0 0 * * *"  # Daily at midnight UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          nodeSelector:
+            cloud.google.com/gke-nodepool: high-memory-pool
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+          containers:
+          - name: compute-scores
+            image: gcr.io/graph-mainnet/iisa-score-computation:latest
+            resources:
+              requests:
+                memory: "64Gi"
+                cpu: "2"
+              limits:
+                memory: "64Gi"
+                cpu: "8"
+            env:
+            - name: BQ_PROJECT
+              value: "graph-mainnet"
+            - name: BQ_DATASET
+              value: "iisa_data_for_dips"
+            - name: BQ_LOCATION
+              value: "US"
+            - name: NUM_DAYS
+              value: "28"
+            - name: TARGET_ROWS
+              value: "20000000"
+            - name: IPINFO_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: iisa-ipinfo-credentials
+                  key: ipinfo_api_key
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /app/credentials/service-account.json
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop:
+                  - ALL
+            volumeMounts:
+            - name: gcp-credentials
+              mountPath: /app/credentials
+              readOnly: true
+          restartPolicy: Never
+          volumes:
+          - name: gcp-credentials
+            secret:
+              secretName: iisa-gcp-credentials
