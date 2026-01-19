@@ -23,6 +23,8 @@ spec:
       backoffLimit: 1
       template:
         spec:
+          nodeSelector:
+            cloud.google.com/gke-nodepool: high-memory-pool
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
@@ -30,7 +32,7 @@ spec:
             fsGroup: 1000
           containers:
           - name: compute-scores
-            image: ghcr.io/edgeandnode/iisa-score-computation:latest
+            image: gcr.io/graph-mainnet/iisa-score-computation:latest
             resources:
               requests:
                 memory: "64Gi"
@@ -52,7 +54,7 @@ spec:
             - name: IPINFO_AUTH
               valueFrom:
                 secretKeyRef:
-                  name: iisa-secrets
+                  name: iisa-ipinfo-credentials
                   key: ipinfo_api_key
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /app/credentials/service-account.json
