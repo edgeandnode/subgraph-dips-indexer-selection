@@ -91,28 +91,32 @@ class IISAState:
 
     def refresh_data(self) -> bool:
         """
-        Fetch fresh data from BigQuery.
+        Load pre-computed indexer scores from BigQuery.
 
-        Returns True if data was fetched successfully, False otherwise.
+        This method loads scores from the indexer_scores table (populated by CronJob)
+        instead of computing them in-container. This is much faster and uses less memory.
+
+        Returns True if scores were loaded successfully, False otherwise.
         """
         if not self._initialized or self.data_manager is None:
             logger.warning("Cannot refresh data: DataManager not initialized")
             return False
 
         try:
-            logger.info("Fetching data from BigQuery...")
-            self.data_manager.fetch_data_and_update()
-            self._history = self.data_manager.get_data()
+            logger.info("Loading pre-computed indexer scores from BigQuery...")
+            success = self.data_manager.load_scores()
 
-            if self._history is not None:
-                logger.info(f"Data fetched successfully: {len(self._history)} rows")
-                return True
-            else:
-                logger.warning("Data fetch returned None")
-                return False
+            if success:
+                self._history = self.data_manager.get_data()
+                if self._history is not None:
+                    logger.info(f"Scores loaded successfully: {len(self._history)} indexers")
+                    return True
+
+            logger.warning("Failed to load scores from BigQuery")
+            return False
 
         except Exception as e:
-            logger.error(f"Failed to fetch data: {e}")
+            logger.error(f"Failed to load scores: {e}")
             return False
 
 

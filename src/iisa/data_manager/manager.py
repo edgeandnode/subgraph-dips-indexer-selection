@@ -1,6 +1,8 @@
 import logging
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Tuple, cast
+
+import pandas as pd
 
 import pandera as pa
 from pandera.typing import DataFrame, Series
@@ -46,6 +48,10 @@ ITERATIVE_FILTER_MIN_DEPLOYMENT_INDEXERS = 2
 ITERATIVE_FILTER_MIN_DEPLOYMENTS_PER_INDEXER = 1
 ITERATIVE_FILTER_MIN_QUERIES_PER_INDEXER = 250
 ITERATIVE_FILTER_MIN_QUERIES_PER_DEPLOYMENT = 250
+
+# Constants for scores staleness warnings
+STALE_SCORES_WARNING_HOURS = 48
+STALE_SCORES_CRITICAL_HOURS = 168  # 7 days
 
 # Module-level logger
 logger = logging.getLogger(__name__)
@@ -271,6 +277,9 @@ class DataManager:
             LinearRegressionResultsDataFrame
         ] = None
 
+        # Timestamp when pre-computed scores were generated (for staleness checks)
+        self._scores_computed_at: Optional[datetime] = None
+
     def fetch_data_and_update(
         self,
         *,
@@ -305,6 +314,132 @@ class DataManager:
             num_days=num_days,
             target_rows=target_rows,
         )
+
+    def load_scores(self) -> bool:
+        """
+        Load pre-computed indexer scores from BigQuery indexer_scores table.
+
+        This is the lightweight alternative to fetch_data_and_update(). Instead of
+        fetching ~20M rows and computing linear regression in-container (64GB RAM),
+        this method fetches ~1K pre-computed scores (seconds, minimal RAM).
+
+        :return: True if scores were loaded successfully, False otherwise.
+        """
+        logger.info("Loading pre-computed indexer scores from BigQuery")
+
+        scores_df, computed_at = self._bq.fetch_indexer_scores()
+
+        if scores_df.empty:
+            logger.warning("No pre-computed scores available in indexer_scores table")
+            self._data = None
+            return False
+
+        # Store and check staleness
+        self._scores_computed_at = computed_at
+        self._check_scores_staleness(computed_at)
+
+        # Transform scores table format to DataProcessor-compatible format
+        self._data = self._transform_scores_to_perf_history(scores_df)
+
+        logger.info(f"Loaded scores for {len(self._data)} indexers")
+        return True
+
+    def _transform_scores_to_perf_history(
+        self, scores_df: pd.DataFrame
+    ) -> PerfHistoryDataFrame:
+        """
+        Transform indexer_scores table format to DataProcessor-compatible format.
+
+        The CronJob writes columns with different names than what DataProcessor expects.
+        This method acts as an adapter, renaming and transforming columns.
+
+        Column mapping:
+        - lat_coefficient_upper_bound -> "Latency Coefficient + Error Confidence Interval"
+        - uptime_score (0-1) -> "% up_x" (0-100)
+        - success_rate -> "average_status"
+        - dst_lat, dst_lon -> "destination_loc" (combined string)
+        - norm_stake_to_fees -> "norm_stake_to_fees_iqr_deviation"
+
+        :param scores_df: DataFrame from indexer_scores table.
+        :return: DataFrame compatible with DataProcessor.
+        """
+        df = scores_df.copy()
+
+        # TODO: Refactor DataProcessor to use the cleaner CronJob column names directly
+        # (e.g., "lat_coefficient_upper_bound" instead of "Latency Coefficient + Error
+        # Confidence Interval") and remove this adapter logic.
+        df = df.rename(columns={
+            "lat_coefficient_upper_bound": "Latency Coefficient + Error Confidence Interval",
+            "success_rate": "average_status",
+            "norm_stake_to_fees": "norm_stake_to_fees_iqr_deviation",
+            "lat_normalized_score": "norm_lat_lin_reg_coefficient",
+        })
+
+        # Convert uptime from 0-1 to percentage (DataProcessor expects "% up_x")
+        if "uptime_score" in df.columns:
+            df["% up_x"] = df["uptime_score"] * 100
+
+        # Create synthetic destination_loc from lat/lon for decentralization checks
+        if "dst_lat" in df.columns and "dst_lon" in df.columns:
+            df["destination_loc"] = (
+                df["dst_lat"].fillna(0).astype(str) + "," +
+                df["dst_lon"].fillna(0).astype(str)
+            )
+
+        # Ensure existing_dips_agreements is present (initialized to 0)
+        if "existing_dips_agreements" not in df.columns:
+            df["existing_dips_agreements"] = 0
+
+        return cast(PerfHistoryDataFrame, df)
+
+    def _check_scores_staleness(self, computed_at: Optional[datetime]) -> None:
+        """
+        Log warnings if pre-computed scores are stale.
+
+        :param computed_at: Timestamp when scores were computed.
+        """
+        if computed_at is None:
+            logger.warning("Scores have no computation timestamp")
+            return
+
+        now = datetime.now(timezone.utc)
+
+        # Ensure computed_at is timezone-aware
+        if computed_at.tzinfo is None:
+            computed_at = computed_at.replace(tzinfo=timezone.utc)
+
+        age = now - computed_at
+        age_hours = age.total_seconds() / 3600
+
+        if age_hours > STALE_SCORES_CRITICAL_HOURS:
+            logger.error(
+                f"Scores are critically stale ({age_hours:.1f}h old, "
+                f"threshold: {STALE_SCORES_CRITICAL_HOURS}h). CronJob may have failed."
+            )
+        elif age_hours > STALE_SCORES_WARNING_HOURS:
+            logger.warning(
+                f"Scores are stale ({age_hours:.1f}h old, "
+                f"threshold: {STALE_SCORES_WARNING_HOURS}h). Consider checking CronJob status."
+            )
+        else:
+            logger.debug(f"Scores are fresh ({age_hours:.1f}h old)")
+
+    def get_scores_age(self) -> Optional[timedelta]:
+        """
+        Return the age of the current scores.
+
+        :return: Age as timedelta, or None if scores haven't been loaded.
+        """
+        if self._scores_computed_at is None:
+            return None
+
+        now = datetime.now(timezone.utc)
+        computed_at = self._scores_computed_at
+
+        if computed_at.tzinfo is None:
+            computed_at = computed_at.replace(tzinfo=timezone.utc)
+
+        return now - computed_at
 
     def get_data(self) -> Optional[PerfHistoryDataFrame]:
         """

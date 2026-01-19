@@ -4,9 +4,9 @@ The "Google BigQuery" provider.
 
 import logging
 import socket
-from datetime import date
+from datetime import date, datetime
 from textwrap import dedent
-from typing import NewType, cast
+from typing import NewType, Optional, Tuple, cast
 
 import pandas as pd
 import pandera as pa
@@ -300,6 +300,48 @@ class BigQueryProvider:
         )
 
         return cast(StakeToFeesDataFrame, dataframe)
+
+    def fetch_indexer_scores(
+        self, dataset: str = "iisa_data_for_dips"
+    ) -> Tuple[pd.DataFrame, Optional[datetime]]:
+        """
+        Fetch pre-computed indexer scores from the indexer_scores table.
+
+        This method retrieves the most recent scores computed by the CronJob.
+        Returns ~1K rows (one per indexer) instead of 20M raw query rows.
+
+        :param dataset: The BigQuery dataset containing the indexer_scores table.
+        :return: A tuple of (DataFrame with scores, timestamp when scores were computed).
+                 If the table is empty, returns (empty DataFrame, None).
+        """
+        logger.info("Fetching pre-computed indexer scores from BigQuery")
+
+        # Get the project from bigframes options
+        project = bpd.options.bigquery.project
+
+        query = QueryStr(f"""
+            SELECT *
+            FROM `{project}.{dataset}.indexer_scores`
+            WHERE computed_at = (
+                SELECT MAX(computed_at)
+                FROM `{project}.{dataset}.indexer_scores`
+            )
+        """)
+
+        dataframe = self._read_gbq_dataframe(query)
+
+        if dataframe.empty:
+            logger.warning("No scores found in indexer_scores table")
+            return dataframe, None
+
+        # Extract the computation timestamp
+        computed_at = pd.to_datetime(dataframe["computed_at"].iloc[0])
+
+        logger.info(
+            f"Fetched {len(dataframe)} indexer scores (computed at {computed_at})"
+        )
+
+        return dataframe, computed_at
 
 
 def _get_combined_query(

@@ -578,22 +578,27 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
         return merged
 
     # Normalise latency linear regression score
-    if "Latency Coefficient + Error Confidence Interval" in merged.columns:
-        merged["norm_lat_lin_reg_coefficient"] = 1 - _normalize_generic(
-            merged["Latency Coefficient + Error Confidence Interval"]
-        )  # lower is better
-    else:
-        merged["norm_lat_lin_reg_coefficient"] = np.nan
+    # Use pre-computed if available (from CronJob), otherwise compute
+    if "norm_lat_lin_reg_coefficient" not in merged.columns:
+        if "Latency Coefficient + Error Confidence Interval" in merged.columns:
+            merged["norm_lat_lin_reg_coefficient"] = 1 - _normalize_generic(
+                merged["Latency Coefficient + Error Confidence Interval"]
+            )  # lower is better
+        else:
+            merged["norm_lat_lin_reg_coefficient"] = np.nan
 
     # Normalise uptime score
-    if "% up_x" in merged.columns:
-        merged["norm_uptime_score"] = _normalize_uptime_and_success_rate(
-            merged["% up_x"]
-        )  # higher is better
-    else:
-        merged["norm_uptime_score"] = np.nan
+    # Use pre-computed if available, otherwise compute
+    if "norm_uptime_score" not in merged.columns:
+        if "% up_x" in merged.columns:
+            merged["norm_uptime_score"] = _normalize_uptime_and_success_rate(
+                merged["% up_x"]
+            )  # higher is better
+        else:
+            merged["norm_uptime_score"] = np.nan
 
     # Normalise the number of indexing agreements each indexer has
+    # ALWAYS normalize fresh - this is dynamic and changes per request
     if "existing_dips_agreements" in merged.columns:
         merged["norm_existing_dips_agreements"] = 1 - _normalize_generic(
             merged["existing_dips_agreements"]
@@ -602,38 +607,46 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
         merged["norm_existing_dips_agreements"] = np.nan
 
     # Normalise stake to fees ratio
-    if "stake_to_fees_iqr_deviation" in merged.columns:
-        merged["norm_stake_to_fees_iqr_deviation"] = _normalize_generic(
-            merged["stake_to_fees_iqr_deviation"]
-        )  # higher is better
-    else:
-        merged["norm_stake_to_fees_iqr_deviation"] = np.nan
+    # Use pre-computed if available, otherwise compute
+    if "norm_stake_to_fees_iqr_deviation" not in merged.columns:
+        if "stake_to_fees_iqr_deviation" in merged.columns:
+            merged["norm_stake_to_fees_iqr_deviation"] = _normalize_generic(
+                merged["stake_to_fees_iqr_deviation"]
+            )  # higher is better
+        else:
+            merged["norm_stake_to_fees_iqr_deviation"] = np.nan
 
     # Normalise success rate score
-    if "average_status" in merged.columns:
-        merged["norm_success_rate"] = _normalize_uptime_and_success_rate(
-            merged["average_status"]
-        )  # higher is better
-    else:
-        merged["norm_success_rate"] = np.nan
+    # Use pre-computed if available, otherwise compute
+    if "norm_success_rate" not in merged.columns:
+        if "average_status" in merged.columns:
+            merged["norm_success_rate"] = _normalize_uptime_and_success_rate(
+                merged["average_status"]
+            )  # higher is better
+        else:
+            merged["norm_success_rate"] = np.nan
 
     # Normalize avg_sync_duration
-    if "avg_sync_duration" in merged.columns:
-        merged["norm_avg_sync_duration"] = 1 - _normalize_generic(
-            merged["avg_sync_duration"]
-        )  # lower is better
-    else:
-        merged["norm_avg_sync_duration"] = np.nan
+    # Use pre-computed if available, otherwise compute
+    if "norm_avg_sync_duration" not in merged.columns:
+        if "avg_sync_duration" in merged.columns:
+            merged["norm_avg_sync_duration"] = 1 - _normalize_generic(
+                merged["avg_sync_duration"]
+            )  # lower is better
+        else:
+            merged["norm_avg_sync_duration"] = np.nan
 
     # Normalize indexing_agreement_acceptance_latency
-    if "indexing_agreement_acceptance_latency" in merged.columns:
-        merged["norm_indexing_agreement_acceptance_latency"] = (
-            _normalize_indexing_agreement_acceptance_latency(
-                merged["indexing_agreement_acceptance_latency"]
-            )
-        )  # lower is better
-    else:
-        merged["norm_indexing_agreement_acceptance_latency"] = np.nan
+    # Use pre-computed if available, otherwise compute
+    if "norm_indexing_agreement_acceptance_latency" not in merged.columns:
+        if "indexing_agreement_acceptance_latency" in merged.columns:
+            merged["norm_indexing_agreement_acceptance_latency"] = (
+                _normalize_indexing_agreement_acceptance_latency(
+                    merged["indexing_agreement_acceptance_latency"]
+                )
+            )  # lower is better
+        else:
+            merged["norm_indexing_agreement_acceptance_latency"] = np.nan
 
     # Fill NaN values with 0 for all norm_ columns except norm_indexing_agreement_acceptance_latency
     norm_columns = [
