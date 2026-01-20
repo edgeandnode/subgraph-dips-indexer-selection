@@ -13,7 +13,7 @@ from typing import Optional
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 
-from iisa import BigQueryProvider, DataManager, GeoipResolver, NetworkProvider
+from iisa import BigQueryProvider, DataManager
 from iisa.select.processor import DataProcessor
 
 from .config import Settings, get_settings
@@ -41,7 +41,6 @@ class IISAState:
 
     def __init__(self) -> None:
         self.settings: Optional[Settings] = None
-        self.geoip: Optional[GeoipResolver] = None
         self.data_manager: Optional[DataManager] = None
         self._history: Optional[pd.DataFrame] = None
         self._initialized: bool = False
@@ -59,24 +58,12 @@ class IISAState:
         try:
             logger.info("Initializing IISA providers...")
 
-            # Initialize GeoIP resolver (keep reference for per-request resolution)
-            self.geoip = GeoipResolver(auth=settings.ipinfo_api_key)
-
-            # Initialize BigQuery provider
             bigquery = BigQueryProvider(
                 project=settings.gcp_project,
                 location=settings.gcp_location,
             )
 
-            # Initialize Network provider
-            network = NetworkProvider(geoip=self.geoip)
-
-            # Initialize DataManager
-            self.data_manager = DataManager(
-                bigquery=bigquery,
-                network=network,
-                num_days=settings.num_days_lookback,
-            )
+            self.data_manager = DataManager(bigquery)
 
             logger.info("IISA providers initialized successfully")
             self._initialized = True
@@ -143,8 +130,8 @@ async def lifespan(app: FastAPI):
 
     On startup:
     1. Load settings from environment
-    2. Initialize IISA providers (BigQuery, GeoIP, Network)
-    3. Attempt to fetch initial data from BigQuery
+    2. Initialize BigQuery provider and DataManager
+    3. Load pre-computed scores from BigQuery
 
     If any step fails, the service continues in fallback mode with random selection.
     """
