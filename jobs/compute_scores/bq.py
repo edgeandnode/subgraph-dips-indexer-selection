@@ -153,7 +153,8 @@ class BigQueryClient:
         if not df.empty:
             df.sort_values(by="num_rows", ascending=False, inplace=True)
 
-        logger.info(f"Fetched initial query results: {len(df)} rows")
+        memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
+        logger.info(f"Fetched initial query results: {len(df)} rows ({memory_mb:.1f} MB)")
         return df
 
     def fetch_combined_query_results(
@@ -217,7 +218,8 @@ class BigQueryClient:
             df.dropna(subset=["url"], inplace=True)
             df["url"] = df["url"].apply(lambda url: url if url.endswith("/") else url + "/")
 
-        logger.info(f"Fetched combined query results: {len(df)} rows")
+        memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
+        logger.info(f"Fetched combined query results: {len(df)} rows ({memory_mb:.1f} MB)")
         return df
 
     def fetch_stake_to_fees(self, start_ts: str) -> pd.DataFrame:
@@ -248,7 +250,8 @@ class BigQueryClient:
 
     def write_scores(self, scores_df: pd.DataFrame) -> None:
         """Write computed scores to the indexer_scores table."""
-        logger.info(f"Writing {len(scores_df)} scores to {self.scores_table}")
+        memory_mb = scores_df.memory_usage(deep=True).sum() / (1024 * 1024)
+        logger.info(f"Writing {len(scores_df)} scores ({memory_mb:.2f} MB) to {self.scores_table}")
 
         # Convert to bigframes and write
         bf_df = bpd.DataFrame(scores_df)
