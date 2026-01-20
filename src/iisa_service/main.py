@@ -146,7 +146,6 @@ async def lifespan(app: FastAPI):
     logger.info("Starting IISA service...")
     logger.info(f"GCP Project: {settings.gcp_project}")
     logger.info(f"GCP Location: {settings.gcp_location}")
-    logger.info(f"Lookback days: {settings.num_days_lookback}")
 
     # Initialize providers
     if _state.initialize(settings):

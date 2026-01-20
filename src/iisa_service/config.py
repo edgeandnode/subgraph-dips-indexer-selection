@@ -26,16 +26,10 @@ class Settings(BaseSettings):
     gcp_project: str
     gcp_location: str = "US"
 
-    # IPinfo.io API for GeoIP resolution
-    ipinfo_api_key: str
-
     # Service configuration
     host: str = "0.0.0.0"
     port: int = 8080
     log_level: str = "INFO"
-
-    # Data configuration
-    num_days_lookback: int = 28
 
 
 @lru_cache
