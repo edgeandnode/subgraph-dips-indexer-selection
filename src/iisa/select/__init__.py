@@ -1,6 +1,5 @@
-from .iisa import select_many, select_one
+from .processor import DataProcessor
 
 __all__ = [
-    "select_many",
-    "select_one",
+    "DataProcessor",
 ]
