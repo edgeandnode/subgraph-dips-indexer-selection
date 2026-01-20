@@ -47,7 +47,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/iisa", "src/iisa_service"]
+packages = ["src/iisa"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src/"]
