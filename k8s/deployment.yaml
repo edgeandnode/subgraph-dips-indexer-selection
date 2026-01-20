@@ -33,8 +33,6 @@ spec:
               value: "8080"
             - name: IISA_LOG_LEVEL
               value: "INFO"
-            - name: IISA_NUM_DAYS_LOOKBACK
-              value: "28"
             - name: IISA_GCP_PROJECT
               valueFrom:
                 configMapKeyRef:
@@ -45,11 +43,6 @@ spec:
                 configMapKeyRef:
                   name: iisa-config
                   key: gcp_location
-            - name: IISA_IPINFO_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: iisa-secrets
-                  key: ipinfo_api_key
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /app/credentials/service-account.json
           securityContext:
@@ -85,10 +78,10 @@ spec:
           resources:
             requests:
               cpu: 500m
-              memory: 2Gi
+              memory: 1Gi
             limits:
               cpu: "4"
-              memory: 40Gi
+              memory: 2Gi
           volumeMounts:
             - name: gcp-credentials
               mountPath: /app/credentials
