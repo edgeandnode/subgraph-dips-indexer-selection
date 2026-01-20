@@ -1,11 +1,32 @@
+"""
+Indexer selection algorithm for IISA.
+
+Selects the best indexers for subgraphs based on weighted scoring of multiple
+metrics including latency, uptime, success rate, and economic security.
+"""
+
 import logging
 from types import MappingProxyType
-from typing import Optional, TypedDict, cast
+from typing import NewType, Optional, TypedDict, cast
 
 import numpy as np
 import pandas as pd
 
-from ..typing import DeploymentId, IndexerId
+__all__ = [
+    "DataProcessor",
+    "DeploymentId",
+    "IndexerId",
+    "IpfsHashStr",
+    "EthAddressStr",
+    "QueryIdStr",
+]
+
+# Type aliases for domain concepts
+QueryIdStr = NewType("QueryIdStr", str)
+IpfsHashStr = NewType("IpfsHashStr", str)
+DeploymentId = IpfsHashStr
+EthAddressStr = NewType("EthAddressStr", str)
+IndexerId = EthAddressStr
 
 # Module-level logger
 logger = logging.getLogger(__name__)
@@ -25,7 +46,6 @@ class WeightsDict(TypedDict, total=False):
     success_rate: float
     avg_sync_duration: float
     indexing_agreement_acceptance_latency: float
-    # "initial/ongoing_sync_price": float # 0.09 <- future weight, above weights will change slightly when implemented
 
 
 DEFAULT_WEIGHTS = cast(
@@ -726,7 +746,7 @@ def _normalize_indexing_agreement_acceptance_latency(
 ) -> pd.Series:
     """
     Normalize indexing agreement acceptance latency using a piecewise function:
-    logistic for x ≤ x0, linear for x > x0.
+    logistic for x <= x0, linear for x > x0.
 
     Note:
     - Indexing agreement acceptance latency should be measured in hours to 2 d.p, not minutes or seconds.
@@ -762,7 +782,7 @@ def _normalize_indexing_agreement_acceptance_latency(
 
     def piecewise_function(x):
         """
-        Apply a piecewise function: logistic for x ≤ x0, linear for x > x0.
+        Apply a piecewise function: logistic for x <= x0, linear for x > x0.
         """
         return np.where(x <= x0, logistic(x), logistic(x0) + m * (x - x0))
 

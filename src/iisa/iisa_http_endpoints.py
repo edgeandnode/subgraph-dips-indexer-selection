@@ -1,28 +1,137 @@
 """
-IISA Service - FastAPI service for the Indexing Indexer Selection Algorithm.
+IISA HTTP API - FastAPI endpoints for the Indexing Indexer Selection Algorithm.
 
-This service exposes HTTP endpoints for indexer selection that match the API
+This module exposes HTTP endpoints for indexer selection that match the API
 contract expected by the Rust HTTP client in dipper-iisa.
+
+Endpoints:
+- GET /health - Health check, reports if data is loaded
+- POST /refresh - Reload scores from BigQuery
+- POST /select-one - Select single best indexer for a deployment
+- POST /select-many - Select multiple indexers for a deployment
 """
 
 import logging
 import random
 from contextlib import asynccontextmanager
+from functools import lru_cache
 from typing import Optional
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from iisa import BigQueryProvider, DataManager
-from iisa.select.processor import DataProcessor
+from .indexer_selection import DataProcessor
+from .score_loader import BigQueryProvider, DataManager
 
-from .config import Settings, get_settings
-from .models import (
-    HealthResponse,
-    MultiSelectionResponse,
-    SelectionRequest,
-    SingleSelectionResponse,
-)
+__all__ = ["app", "Settings", "get_settings"]
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+
+class Settings(BaseSettings):
+    """
+    Service configuration loaded from environment variables.
+
+    All settings are prefixed with IISA_ in environment variables.
+    For example, IISA_GCP_PROJECT sets the gcp_project field.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="IISA_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # Google Cloud Platform
+    gcp_project: str
+    gcp_location: str = "US"
+
+    # Service configuration
+    host: str = "0.0.0.0"
+    port: int = 8080
+    log_level: str = "INFO"
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """
+    Get cached settings instance.
+
+    Settings are loaded once and cached for the lifetime of the process.
+    """
+    return Settings()
+
+
+# =============================================================================
+# Request/Response Models
+# =============================================================================
+
+
+class CandidateIndexer(BaseModel):
+    """
+    A candidate indexer with ID and URL.
+
+    The URL is used for GeoIP resolution to determine geographic diversity.
+    """
+
+    id: str
+    url: str
+
+
+class SelectionRequest(BaseModel):
+    """
+    Request body for indexer selection endpoints.
+
+    Matches the SelectionRequest struct in the Rust HTTP client.
+    """
+
+    deployment_id: str
+    candidates: Optional[list[CandidateIndexer]] = None
+    existing_indexers: Optional[list[str]] = None
+    pending_agreements: Optional[dict[str, list[str]]] = None
+    num_candidates: Optional[int] = None
+    indexer_denylist: Optional[list[str]] = None
+    declined_indexers: Optional[dict[str, list[str]]] = None
+
+
+class SingleSelectionResponse(BaseModel):
+    """
+    Response for the /select-one endpoint.
+
+    Returns a single selected indexer ID or None if no selection was made.
+    """
+
+    indexer_id: Optional[str] = None
+
+
+class MultiSelectionResponse(BaseModel):
+    """
+    Response for the /select-many endpoint.
+
+    Returns a list of selected indexer IDs.
+    """
+
+    indexer_ids: list[str]
+
+
+class HealthResponse(BaseModel):
+    """
+    Response for the /health endpoint.
+    """
+
+    status: str
+    data_loaded: bool
+
+
+# =============================================================================
+# Service State
+# =============================================================================
 
 # Configure logging
 logging.basicConfig(
@@ -37,13 +146,11 @@ class IISAState:
     Holds the IISA service state including initialized providers and cached data.
     """
 
-
     def __init__(self) -> None:
         self.settings: Optional[Settings] = None
         self.data_manager: Optional[DataManager] = None
         self._history: Optional[pd.DataFrame] = None
         self._initialized: bool = False
-
 
     def initialize(self, settings: Settings) -> bool:
         """
@@ -73,7 +180,6 @@ class IISAState:
             logger.warning("Service will operate in random selection fallback mode")
             self._initialized = False
             return False
-
 
     def refresh_data(self) -> bool:
         """
@@ -105,12 +211,10 @@ class IISAState:
             logger.error(f"Failed to load scores: {e}")
             return False
 
-
     @property
     def history(self) -> Optional[pd.DataFrame]:
         """Get the cached history DataFrame."""
         return self._history
-
 
     @property
     def is_ready(self) -> bool:
@@ -120,6 +224,11 @@ class IISAState:
 
 # Global state
 _state = IISAState()
+
+
+# =============================================================================
+# FastAPI Application
+# =============================================================================
 
 
 @asynccontextmanager
@@ -172,6 +281,11 @@ app = FastAPI(
 )
 
 
+# =============================================================================
+# Endpoints
+# =============================================================================
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
     """
@@ -201,7 +315,8 @@ async def refresh_data():
 
     success = _state.refresh_data()
     if success:
-        return {"status": "success", "rows": len(_state.history) if _state.history is not None else 0}
+        row_count = len(_state.history) if _state.history is not None else 0
+        return {"status": "success", "rows": row_count}
     else:
         raise HTTPException(status_code=500, detail="Failed to refresh data from BigQuery")
 
@@ -324,7 +439,7 @@ if __name__ == "__main__":
     settings = get_settings()
     logger.info(f"Starting IISA service on {settings.host}:{settings.port}")
     uvicorn.run(
-        "iisa_service.main:app",
+        "iisa.iisa_http_endpoints:app",
         host=settings.host,
         port=settings.port,
         reload=False,

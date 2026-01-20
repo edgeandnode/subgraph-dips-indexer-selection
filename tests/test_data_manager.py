@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from iisa.data_manager import DataManager
+from iisa import DataManager
 
 
 class TestDataManager:

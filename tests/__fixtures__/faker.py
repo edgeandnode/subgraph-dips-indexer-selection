@@ -6,7 +6,7 @@ from faker import Faker
 from faker.providers import BaseProvider, geo, internet
 from faker_airtravel import AirTravelProvider
 
-from iisa.typing import (
+from iisa.indexer_selection import (
     DeploymentId,
     EthAddressStr,
     IndexerId,

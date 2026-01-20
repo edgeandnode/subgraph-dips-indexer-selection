@@ -4,15 +4,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from iisa.select.processor import (
+from iisa.indexer_selection import (
     DataProcessor,
+    DeploymentId,
+    IndexerId,
     _calculate_weighted_score,
     _normalize_generic,
     _normalize_indexing_agreement_acceptance_latency,
     _normalize_metrics,
     _normalize_uptime_and_success_rate,
 )
-from iisa.typing import DeploymentId, IndexerId
 
 
 def process_subgraph(
@@ -100,7 +101,7 @@ class TestProcessSubgraph:
     """
 
     @pytest.mark.skip(reason="Flaky test: high dependency on internal details")
-    @patch("iisa.select.processor.DataProcessor")
+    @patch("iisa.indexer_selection.DataProcessor")
     def test_process_subgraph(
         self, mock__data_processor, sample_data, mock__bigquery_provider
     ):
@@ -275,7 +276,7 @@ class TestDataProcessor:
         This test verifies the get_indexer_selections method correctly identifies the
         recent added and cancelled indexers.
         """
-        with patch("iisa.select.processor.DataProcessor._process_data"):
+        with patch("iisa.indexer_selection.DataProcessor._process_data"):
             # Create a DataProcessor instance
             processor = DataProcessor(
                 history=sample_data,
@@ -315,7 +316,7 @@ class TestDataProcessor:
         It ensures that the method returns empty lists for both added and cancelled indexers
         when there are no indexers in either group.
         """
-        with patch("iisa.select.processor.DataProcessor._process_data"):
+        with patch("iisa.indexer_selection.DataProcessor._process_data"):
             processor = DataProcessor(
                 history=sample_data,
                 deployment_id=DeploymentId("test_subgraph"),
@@ -330,10 +331,10 @@ class TestDataProcessor:
         assert added == {}
         assert cancelled == {}
 
-    @patch("iisa.select.processor.DataProcessor._fetch_number_of_indexer_agreements")
-    @patch("iisa.select.processor.DataProcessor._get_current_group")
-    @patch("iisa.select.processor.DataProcessor._normalize_and_score")
-    @patch("iisa.select.processor.DataProcessor._assign_indexers_to_subgraph")
+    @patch("iisa.indexer_selection.DataProcessor._fetch_number_of_indexer_agreements")
+    @patch("iisa.indexer_selection.DataProcessor._get_current_group")
+    @patch("iisa.indexer_selection.DataProcessor._normalize_and_score")
+    @patch("iisa.indexer_selection.DataProcessor._assign_indexers_to_subgraph")
     def test_process_data(
         self,
         mock_assign,
@@ -410,7 +411,7 @@ class TestDataProcessor:
         'existing_dips_agreements' column based on the existing_agreements.
         """
         # Create a DataProcessor instance with specific existing agreements
-        with patch("iisa.select.processor.DataProcessor._process_data"):
+        with patch("iisa.indexer_selection.DataProcessor._process_data"):
             processor = DataProcessor(
                 history=sample_data,
                 deployment_id=DeploymentId("test_subgraph"),
@@ -501,8 +502,8 @@ class TestDataProcessor:
         result = processor._get_current_group()
         assert result == []
 
-    @patch("iisa.select.processor._normalize_metrics")
-    @patch("iisa.select.processor._calculate_weighted_score")
+    @patch("iisa.indexer_selection._normalize_metrics")
+    @patch("iisa.indexer_selection._calculate_weighted_score")
     def test_normalize_and_score(
         self, mock_calculate_score, mock_normalize, sample_data, mock__bigquery_provider
     ):
@@ -525,7 +526,7 @@ class TestDataProcessor:
         normalization and score calculation, as these are implementation details that may change.
         """
         # Create a DataProcessor instance
-        with patch("iisa.select.processor.DataProcessor._process_data"):
+        with patch("iisa.indexer_selection.DataProcessor._process_data"):
             processor = DataProcessor(
                 history=sample_data,
                 deployment_id=DeploymentId("test_subgraph"),
@@ -591,10 +592,10 @@ class TestDataProcessor:
         2. The method calls _replace_underperforming_indexers when there are 3 or more indexers.
         """
         with patch(
-            "iisa.select.processor.DataProcessor._add_indexers_to_group"
+            "iisa.indexer_selection.DataProcessor._add_indexers_to_group"
         ) as mock_add:
             with patch(
-                "iisa.select.processor.DataProcessor._replace_underperforming_indexers)"
+                "iisa.indexer_selection.DataProcessor._replace_underperforming_indexers)"
             ) as mock_replace:
                 processor = DataProcessor(
                     history=sample_data,
@@ -664,7 +665,7 @@ class TestDataProcessor:
         )
 
         with patch(
-            "iisa.select.processor.DataProcessor._find_best_replacement_or_select_best_indexer"
+            "iisa.indexer_selection.DataProcessor._find_best_replacement_or_select_best_indexer"
         ) as mock_select:
             mock_select.side_effect = ["B", "C", "D", None]
             processor.current_group = initial_group.copy()
@@ -680,7 +681,7 @@ class TestDataProcessor:
 
         # Test when no suitable indexers are found
         with patch(
-            "iisa.select.processor.DataProcessor._find_best_replacement_or_select_best_indexer",
+            "iisa.indexer_selection.DataProcessor._find_best_replacement_or_select_best_indexer",
             return_value=None,
         ):
             processor.current_group = ["A"]
@@ -779,10 +780,10 @@ class TestDataProcessor:
 
         with (
             patch(
-                "iisa.select.processor.DataProcessor._find_best_replacement_or_select_best_indexer"
+                "iisa.indexer_selection.DataProcessor._find_best_replacement_or_select_best_indexer"
             ) as mock_find,
             patch(
-                "iisa.select.processor.DataProcessor._calculate_group_score"
+                "iisa.indexer_selection.DataProcessor._calculate_group_score"
             ) as mock_score,
         ):
             mock_find.side_effect = ["D", None, None]
@@ -823,7 +824,7 @@ class TestDataProcessor:
         processor.indexer_denylist = ["E"]
 
         with patch(
-            "iisa.select.processor.DataProcessor._meets_decentralization_requirements"
+            "iisa.indexer_selection.DataProcessor._meets_decentralization_requirements"
         ) as mock_decentralization:
             mock_decentralization.side_effect = [True]
 
