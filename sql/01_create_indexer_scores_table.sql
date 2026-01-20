@@ -44,9 +44,10 @@ CREATE TABLE IF NOT EXISTS `graph-mainnet.iisa_data_for_dips.indexer_scores` (
   indexing_agreement_acceptance_latency FLOAT64,
 
   -- Organization/location for decentralization checks
+  -- Lat/lon are rounded to nearest 20 degrees for privacy bucketing
   org STRING,
-  dst_lat FLOAT64,
-  dst_lon FLOAT64,
+  dst_lat INT64,
+  dst_lon INT64,
 
   -- Metadata
   computed_at TIMESTAMP NOT NULL,

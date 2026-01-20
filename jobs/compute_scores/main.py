@@ -11,11 +11,22 @@ This script:
 
 import logging
 import os
+import resource
 import sys
+import time
 from datetime import date, datetime, timedelta
 
 from bq import BigQueryClient
 from processing import compute_all_scores
+
+
+def get_peak_memory_mb() -> float:
+    """Get peak memory usage in MB."""
+    # ru_maxrss is in bytes on Linux, KB on macOS
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return usage / 1024 / 1024  # macOS: bytes -> MB
+    return usage / 1024  # Linux: KB -> MB
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,8 +45,9 @@ TARGET_ROWS = int(os.environ.get("TARGET_ROWS", "20000000"))
 
 def main() -> int:
     """Main entry point for the score computation job."""
+    pipeline_start = time.time()
     logger.info("Starting score computation job")
-    logger.info(f"Configuration: project={BQ_PROJECT}, dataset={BQ_DATASET}, num_days={NUM_DAYS}")
+    logger.info(f"Configuration: project={BQ_PROJECT}, dataset={BQ_DATASET}, num_days={NUM_DAYS}, target_rows={TARGET_ROWS}")
 
     # Initialize BigQuery client
     bq_client = BigQueryClient(
@@ -79,12 +91,15 @@ def main() -> int:
 
         # Write scores to BigQuery
         bq_client.write_scores(scores_df)
-        logger.info("Successfully wrote scores to BigQuery")
 
+        elapsed = time.time() - pipeline_start
+        logger.info(f"Pipeline completed in {elapsed:.1f}s ({elapsed/60:.1f}m), peak memory: {get_peak_memory_mb():.0f} MB")
         return 0
 
     except Exception as e:
-        logger.exception(f"Failed to compute scores: {e}")
+        elapsed = time.time() - pipeline_start
+        logger.exception(f"Failed to compute scores after {elapsed:.1f}s: {e}")
+        logger.info(f"Peak memory at failure: {get_peak_memory_mb():.0f} MB")
         return 1
 
 
