@@ -9,7 +9,7 @@ Tests the new functions introduced for the CronJob, particularly:
 """
 
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -19,7 +19,7 @@ import pytest
 import sys
 from pathlib import Path
 
-jobs_path = Path(__file__).parent.parent / "jobs" / "compute_scores"
+jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
 from processing import (

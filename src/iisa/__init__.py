@@ -1,18 +1,17 @@
 """
 The Indexing Indexer Selection Algorithm (IISA) module.
+
+This module provides:
+- score_loader: Fetches pre-computed indexer scores from BigQuery
+- indexer_selection: Selects indexers based on weighted scoring
+- iisa_http_endpoints: FastAPI HTTP endpoints for the service
 """
 
-from .bq import BigQueryProvider
-from .data_manager import DataManager
-from .geoip import GeoipResolver
-from .network import NetworkProvider
-from .select import select_many, select_one
+from .indexer_selection import DataProcessor
+from .score_loader import BigQueryProvider, DataManager
 
 __all__ = [
     "BigQueryProvider",
     "DataManager",
-    "GeoipResolver",
-    "NetworkProvider",
-    "select_many",
-    "select_one",
+    "DataProcessor",
 ]
