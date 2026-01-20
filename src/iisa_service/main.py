@@ -18,7 +18,6 @@ from iisa.select.processor import DataProcessor
 
 from .config import Settings, get_settings
 from .models import (
-    CandidateIndexer,
     HealthResponse,
     MultiSelectionResponse,
     SelectionRequest,
