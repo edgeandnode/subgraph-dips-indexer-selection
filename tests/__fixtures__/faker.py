@@ -7,13 +7,11 @@ from faker.providers import BaseProvider, geo, internet
 from faker_airtravel import AirTravelProvider
 
 from iisa.typing import (
-    BASE58_ALPHABET,
     DeploymentId,
     EthAddressStr,
     IndexerId,
     IpfsHashStr,
     QueryIdStr,
-    SubgraphId,
 )
 
 
@@ -70,15 +68,6 @@ class CustomProvider(BaseProvider):
         :return: A random subgraph deployment ID.
         """
         return DeploymentId(self.ipfs_hash())
-
-    def subgraph_id(self) -> SubgraphId:
-        """
-        Generate a random subgraph ID.
-
-        :return: A random subgraph ID.
-        """
-        subgraph = "".join(random.choices(BASE58_ALPHABET, k=46))
-        return SubgraphId(subgraph)
 
 
 def init_faker_instance(faker: Faker):
