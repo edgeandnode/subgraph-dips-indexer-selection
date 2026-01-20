@@ -23,8 +23,6 @@ spec:
       backoffLimit: 1
       template:
         spec:
-          nodeSelector:
-            cloud.google.com/gke-nodepool: high-memory-pool
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
