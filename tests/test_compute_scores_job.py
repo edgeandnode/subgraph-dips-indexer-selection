@@ -19,7 +19,7 @@ import pytest
 import sys
 from pathlib import Path
 
-jobs_path = Path(__file__).parent.parent / "jobs" / "compute_scores"
+jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
 from processing import (
