@@ -196,11 +196,12 @@ class TestTransformToScoresSchema:
             "org": ["AWS", "GCP", "Hetzner"],
             "dst_lat": [40.0, 35.0, 50.0],
             "dst_lon": [-74.0, -120.0, 8.0],
+            "query_count": [1000, 2000, 1500],
         })
 
     def test_transform_basic(self, sample_merged_df):
         # Act
-        result = transform_to_scores_schema(sample_merged_df, num_days=28)
+        result = transform_to_scores_schema(sample_merged_df)
 
         # Assert - check required columns exist
         required_columns = [
@@ -212,29 +213,22 @@ class TestTransformToScoresSchema:
             "stake_to_fees", "stake_to_fees_iqr_deviation",
             "norm_uptime_score", "norm_success_rate", "norm_stake_to_fees",
             "org", "dst_lat", "dst_lon",
-            "computed_at", "query_count", "num_days",
+            "computed_at", "query_count",
         ]
         for col in required_columns:
             assert col in result.columns, f"Missing column: {col}"
 
     def test_transform_uptime_conversion(self, sample_merged_df):
         # Act
-        result = transform_to_scores_schema(sample_merged_df, num_days=28)
+        result = transform_to_scores_schema(sample_merged_df)
 
         # Assert - uptime should be converted from percentage to 0-1 scale
         assert result["uptime_score"].iloc[0] == pytest.approx(0.995)
         assert result["uptime_score"].iloc[1] == pytest.approx(0.95)
 
-    def test_transform_num_days(self, sample_merged_df):
-        # Act
-        result = transform_to_scores_schema(sample_merged_df, num_days=14)
-
-        # Assert
-        assert all(result["num_days"] == 14)
-
     def test_transform_computed_at_is_recent(self, sample_merged_df):
         # Act
-        result = transform_to_scores_schema(sample_merged_df, num_days=28)
+        result = transform_to_scores_schema(sample_merged_df)
 
         # Assert - computed_at should be recent
         now = datetime.now(timezone.utc)
@@ -244,12 +238,19 @@ class TestTransformToScoresSchema:
 
     def test_transform_normalized_scores_bounded(self, sample_merged_df):
         # Act
-        result = transform_to_scores_schema(sample_merged_df, num_days=28)
+        result = transform_to_scores_schema(sample_merged_df)
 
         # Assert - all normalized scores should be between 0 and 1
         for col in ["norm_uptime_score", "norm_success_rate", "norm_stake_to_fees", "lat_normalized_score"]:
             values = result[col].dropna()
             assert all(0 <= v <= 1 for v in values), f"{col} has values outside [0, 1]"
+
+    def test_transform_query_count_preserved(self, sample_merged_df):
+        # Act
+        result = transform_to_scores_schema(sample_merged_df)
+
+        # Assert - query_count should be preserved from input
+        assert list(result["query_count"]) == [1000, 2000, 1500]
 
 
 class TestIsPrivateIp:
@@ -1035,6 +1036,7 @@ class TestAggregateIndexerInfo:
         # Arrange
         df = pd.DataFrame({
             "indexer": ["A", "A", "B", "B", "C", "C", "C"],
+            "url": ["https://a.com", "https://a.com", "https://b.com", "https://b.com", "https://c.com", "https://c.com", "https://c.com"],
             "org": ["X", "X", "Y", "Z", "W", "W", "W"],
             "dst_lat": [10.1, 13.123445, 35, 31, 55, 45, 50],
             "dst_lon": [22, 25.123445, 44, 41, 65, 60, 60],
@@ -1042,6 +1044,9 @@ class TestAggregateIndexerInfo:
 
         # Act
         result = aggregate_indexer_info(df)
+
+        # Assert - url preserved (first non-null)
+        assert list(result["url"]) == ["https://a.com", "https://b.com", "https://c.com"]
 
         # Assert - mode org selected
         assert list(result["org"]) == ["X", "Y", "W"]
@@ -1052,19 +1057,20 @@ class TestAggregateIndexerInfo:
 
     def test_aggregate_indexer_info_empty_df(self):
         # Arrange
-        df = pd.DataFrame(columns=["indexer", "org", "dst_lat", "dst_lon"])
+        df = pd.DataFrame(columns=["indexer", "url", "org", "dst_lat", "dst_lon"])
 
         # Act
         result = aggregate_indexer_info(df)
 
         # Assert
         assert result.empty
-        assert list(result.columns) == ["indexer", "org", "dst_lat", "dst_lon"]
+        assert list(result.columns) == ["indexer", "url", "org", "dst_lat", "dst_lon"]
 
     def test_aggregate_indexer_info_with_nans(self):
         # Arrange
         df = pd.DataFrame({
             "indexer": ["A", "A", "B", "B", "B"],
+            "url": [np.nan, "https://a.com", "https://b.com", np.nan, np.nan],
             "org": [np.nan, "X", "Y", np.nan, np.nan],
             "dst_lat": [10, np.nan, np.nan, np.nan, np.nan],
             "dst_lon": [20, np.nan, np.nan, np.nan, np.nan],
@@ -1075,6 +1081,7 @@ class TestAggregateIndexerInfo:
 
         # Assert
         assert list(result["indexer"]) == ["A", "B"]
+        assert list(result["url"]) == ["https://a.com", "https://b.com"]
         assert list(result["org"]) == ["X", "Y"]
 
 
@@ -1104,6 +1111,7 @@ class TestMergeAndPrepareDataframes:
     def agg_df(self):
         return pd.DataFrame({
             "indexer": ["0xABC", "0xXYZ", "0x456"],
+            "url": ["https://abc.com", "https://xyz.com", "https://456.com"],
             "org": ["AWS", "GCP", "Hetzner"],
             "dst_lat": [40, 35, 50],
             "dst_lon": [-74, -120, 8],
@@ -1124,20 +1132,28 @@ class TestMergeAndPrepareDataframes:
             "stake_to_fees_iqr_deviation": [-0.5, 0, 0.5],
         })
 
+    @pytest.fixture
+    def indexer_query_count(self):
+        return pd.DataFrame({
+            "indexer": ["0xABC", "0xXYZ", "0x123"],
+            "query_count": [1000, 2000, 1500],
+        })
+
     def test_merge_base_case(
         self, indexer_uptime, indexer_rankings, agg_df,
-        indexer_success_rate, stake_to_fees
+        indexer_success_rate, stake_to_fees, indexer_query_count
     ):
         # Act
         result = merge_and_prepare_dataframes(
             indexer_uptime, indexer_rankings, agg_df,
-            indexer_success_rate, stake_to_fees,
+            indexer_success_rate, stake_to_fees, indexer_query_count,
         )
 
         # Assert - core columns present
         assert "indexer" in result.columns
         assert "uptime" in result.columns
         assert "Latency Coefficient" in result.columns
+        assert "query_count" in result.columns
 
         # Placeholder columns for DIP metrics
         assert "existing_dips_agreements" in result.columns
@@ -1153,7 +1169,7 @@ class TestMergeAndPrepareDataframes:
 
     def test_merge__missing_indexer(
         self, indexer_uptime, indexer_rankings, agg_df,
-        indexer_success_rate, stake_to_fees
+        indexer_success_rate, stake_to_fees, indexer_query_count
     ):
         # Arrange - remove an indexer
         indexer_uptime_modified = indexer_uptime[indexer_uptime["indexer"] != "0xABC"]
@@ -1161,7 +1177,7 @@ class TestMergeAndPrepareDataframes:
         # Act
         result = merge_and_prepare_dataframes(
             indexer_uptime_modified, indexer_rankings, agg_df,
-            indexer_success_rate, stake_to_fees,
+            indexer_success_rate, stake_to_fees, indexer_query_count,
         )
 
         # Assert - removed indexer not in result
@@ -1169,7 +1185,7 @@ class TestMergeAndPrepareDataframes:
 
     def test_merge_no_common_indexers(
         self, indexer_uptime, indexer_rankings, agg_df,
-        indexer_success_rate, stake_to_fees
+        indexer_success_rate, stake_to_fees, indexer_query_count
     ):
         # Arrange - different indexer sets (no overlap with rankings)
         indexer_uptime["indexer"] = ["0xAAA", "0xBBB", "0xCCC"]
@@ -1177,7 +1193,7 @@ class TestMergeAndPrepareDataframes:
         # Act
         result = merge_and_prepare_dataframes(
             indexer_uptime, indexer_rankings, agg_df,
-            indexer_success_rate, stake_to_fees,
+            indexer_success_rate, stake_to_fees, indexer_query_count,
         )
 
         # Assert - result is empty because:
@@ -1187,7 +1203,7 @@ class TestMergeAndPrepareDataframes:
 
     def test_merge_additional_columns(
         self, indexer_uptime, indexer_rankings, agg_df,
-        indexer_success_rate, stake_to_fees
+        indexer_success_rate, stake_to_fees, indexer_query_count
     ):
         # Arrange - add extra column
         indexer_uptime["extra_col"] = [1, 2, 3]
@@ -1195,7 +1211,7 @@ class TestMergeAndPrepareDataframes:
         # Act
         result = merge_and_prepare_dataframes(
             indexer_uptime, indexer_rankings, agg_df,
-            indexer_success_rate, stake_to_fees,
+            indexer_success_rate, stake_to_fees, indexer_query_count,
         )
 
         # Assert - extra column preserved

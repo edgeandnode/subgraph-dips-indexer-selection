@@ -303,11 +303,16 @@ def calculate_iqr_deviation(series: pd.Series) -> pd.Series:
 
     Returns (value - median) / IQR for each value in the series.
     Used for robust normalization that's less sensitive to outliers.
+
+    If IQR is zero (all values in Q1-Q3 range are identical), returns 0 for all values
+    since there's no meaningful deviation to measure.
     """
     median_val = series.median()
     q1 = series.quantile(0.25)
     q3 = series.quantile(0.75)
     iqr = q3 - q1
+    if iqr == 0:
+        return pd.Series([0.0] * len(series), index=series.index)
     return (series - median_val) / iqr
 
 
@@ -675,13 +680,11 @@ def calculate_indexer_success_rate(df: pd.DataFrame) -> pd.DataFrame:
     df_filtered["status_numeric"] = df_filtered["status"].apply(
         lambda x: 1 if x in [REQUEST_STATUS_OK, REQUEST_STATUS_UNAVAILABLE_MISSING_BLOCK] else 0
     )
-    result = (
+    return (
         df_filtered.groupby("indexer")
         .agg(average_status=("status_numeric", "mean"))
         .reset_index()
     )
-    # Sort by success rate, with indexer name as tie-breaker for deterministic ordering
-    return result.sort_values(by=["average_status", "indexer"], ascending=[True, True])
 
 
 def calculate_indexer_uptime(df: pd.DataFrame, threshold_seconds: int = 120) -> pd.DataFrame:
