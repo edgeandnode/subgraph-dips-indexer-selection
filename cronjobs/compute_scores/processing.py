@@ -104,7 +104,17 @@ def compute_all_scores(
 
     # Filter to successful queries for regression
     logger.info(f"Before filter_successful_queries: {len(combined_queries)} rows")
-    logger.info(f"  src_lat NaN: {combined_queries['src_lat'].isna().sum()}, dst_lat NaN: {combined_queries['dst_lat'].isna().sum()}")
+    dst_lat_nan_count = combined_queries["dst_lat"].isna().sum()
+    logger.info(f"  src_lat NaN: {combined_queries['src_lat'].isna().sum()}, dst_lat NaN: {dst_lat_nan_count}")
+
+    # Fail-fast: if ALL dst_lat values are NaN, GeoIP resolution failed completely
+    if dst_lat_nan_count == len(combined_queries):
+        raise RuntimeError(
+            "All dst_lat values are NaN - GeoIP resolution failed for all indexers. "
+            "This typically means IPINFO_AUTH is not set or invalid. "
+            "Check that the ipinfo.io API token is configured correctly."
+        )
+
     combined_queries_filtered = filter_successful_queries(combined_queries)
     logger.info(f"After filter_successful_queries: {len(combined_queries_filtered)} rows")
 
@@ -119,6 +129,14 @@ def compute_all_scores(
     filtered_data = filtered_data.dropna(subset=numeric)
     logger.info(f"After dropna(numeric): {len(filtered_data)} rows")
 
+    # Fail-fast: if no rows remain after dropping NaN, something is wrong with the data
+    if len(filtered_data) == 0:
+        raise RuntimeError(
+            "No rows remain after dropping NaN values in numeric columns (distance_miles, fee). "
+            "This typically means GeoIP resolution failed (all distances are NaN) or "
+            "there's a data quality issue with the source tables."
+        )
+
     # Apply iterative filtering
     filtered_data = iterative_filter(
         filtered_data,
@@ -127,6 +145,13 @@ def compute_all_scores(
         ITERATIVE_FILTER_MIN_QUERIES_PER_INDEXER,
         ITERATIVE_FILTER_MIN_QUERIES_PER_DEPLOYMENT,
     )
+
+    # Fail-fast: if iterative filtering removed all data, thresholds may be too strict
+    if len(filtered_data) == 0:
+        raise RuntimeError(
+            "No rows remain after iterative filtering. Either the data volume is too low "
+            "or the filter thresholds are too strict for the current dataset."
+        )
 
     # Strategic sampling
     filtered_data, integer_root = strategic_sample(filtered_data, target_rows_per_subgraph)
@@ -146,6 +171,9 @@ def compute_all_scores(
         filtered_data, predictor, categorical, numeric
     )
 
+    # Calculate per-indexer query count (queries used in regression for each indexer)
+    indexer_query_count = filtered_data.groupby("indexer").size().reset_index(name="query_count")
+
     # Calculate other metrics
     indexer_success_rate = calculate_indexer_success_rate(combined_queries)
     indexer_uptime = calculate_indexer_uptime(data_for_uptime)
@@ -164,15 +192,16 @@ def compute_all_scores(
         agg_df,
         indexer_success_rate,
         stake_to_fees,
+        indexer_query_count,
     )
 
     # Transform to indexer_scores schema with pre-normalized values
-    scores_df = transform_to_scores_schema(merged, num_days)
+    scores_df = transform_to_scores_schema(merged)
 
     return scores_df
 
 
-def transform_to_scores_schema(merged: pd.DataFrame, num_days: int) -> pd.DataFrame:
+def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     """
     Transform the merged DataFrame to match the indexer_scores BigQuery schema.
 
@@ -231,8 +260,7 @@ def transform_to_scores_schema(merged: pd.DataFrame, num_days: int) -> pd.DataFr
 
     # Metadata
     scores["computed_at"] = datetime.now(timezone.utc)
-    scores["query_count"] = len(merged)
-    scores["num_days"] = num_days
+    scores["query_count"] = merged.get("query_count")  # Per-indexer query count used in regression
 
     return scores
 
@@ -275,11 +303,16 @@ def calculate_iqr_deviation(series: pd.Series) -> pd.Series:
 
     Returns (value - median) / IQR for each value in the series.
     Used for robust normalization that's less sensitive to outliers.
+
+    If IQR is zero (all values in Q1-Q3 range are identical), returns 0 for all values
+    since there's no meaningful deviation to measure.
     """
     median_val = series.median()
     q1 = series.quantile(0.25)
     q3 = series.quantile(0.75)
     iqr = q3 - q1
+    if iqr == 0:
+        return pd.Series([0.0] * len(series), index=series.index)
     return (series - median_val) / iqr
 
 
@@ -718,9 +751,15 @@ def aggregate_indexer_info(df: pd.DataFrame) -> pd.DataFrame:
     def round_to_20(x):
         return x if pd.isna(x) else round(x / 20) * 20
 
+    def first_non_null(x):
+        """Return first non-null value, or NaN if all null."""
+        non_null = x.dropna()
+        return non_null.iloc[0] if len(non_null) > 0 else np.nan
+
     agg_df = (
         df.groupby("indexer")
         .agg({
+            "url": first_non_null,  # Take first non-null URL for this indexer
             "org": lambda x: x.mode()[0] if not x.mode().empty else np.nan,
             "dst_lat": lambda x: x.mode()[0] if not x.mode().empty else np.nan,
             "dst_lon": lambda x: x.mode()[0] if not x.mode().empty else np.nan,
@@ -740,6 +779,7 @@ def merge_and_prepare_dataframes(
     agg_df: pd.DataFrame,
     indexer_success_rate: pd.DataFrame,
     stake_to_fees: pd.DataFrame,
+    indexer_query_count: pd.DataFrame,
 ) -> pd.DataFrame:
     """Merge all indexer data into a single DataFrame."""
     merged = pd.merge(indexer_uptime, indexer_rankings, on="indexer", how="left")
@@ -755,6 +795,7 @@ def merge_and_prepare_dataframes(
     merged = pd.merge(merged, agg_df, on="indexer", how="left")
     merged = pd.merge(merged, indexer_success_rate, on="indexer", how="left")
     merged = pd.merge(merged, stake_to_fees, on="indexer", how="left")
+    merged = pd.merge(merged, indexer_query_count, on="indexer", how="left")
 
     # Add placeholder columns for metrics not yet populated from data sources
     # These are required by DataProcessor for scoring
