@@ -51,8 +51,7 @@ CREATE TABLE IF NOT EXISTS `graph-mainnet.iisa_data_for_dips.indexer_scores` (
 
   -- Metadata
   computed_at TIMESTAMP NOT NULL,
-  query_count INT64,  -- Number of queries used in computation
-  num_days INT64      -- Lookback window used
+  query_count INT64   -- Number of queries used in regression for this indexer
 )
 PARTITION BY DATE(computed_at)
 CLUSTER BY indexer;
