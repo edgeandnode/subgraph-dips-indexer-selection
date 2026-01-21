@@ -1216,3 +1216,123 @@ class TestMergeAndPrepareDataframes:
 
         # Assert - extra column preserved
         assert "extra_col" in result.columns
+
+
+# =============================================================================
+# SCHEMA VALIDATION TESTS
+# These tests ensure the code output matches the BigQuery table schema.
+# =============================================================================
+
+
+def parse_bigquery_schema(sql_file_path: Path) -> set:
+    """
+    Parse a BigQuery CREATE TABLE statement and extract column names.
+
+    Returns a set of column names defined in the SQL schema.
+    """
+    sql_content = sql_file_path.read_text()
+
+    # Extract the part between parentheses (column definitions)
+    import re
+    match = re.search(r'CREATE TABLE[^(]+\((.*?)\)\s*(?:PARTITION|CLUSTER|;)', sql_content, re.DOTALL)
+    if not match:
+        raise ValueError(f"Could not parse CREATE TABLE statement from {sql_file_path}")
+
+    columns_section = match.group(1)
+
+    # Extract column names (first word on each line that defines a column)
+    # Column lines look like: "  column_name TYPE," or "  column_name TYPE NOT NULL,"
+    column_names = set()
+    for line in columns_section.split('\n'):
+        line = line.strip()
+        # Skip comments and empty lines
+        if not line or line.startswith('--'):
+            continue
+        # Extract first word (column name)
+        parts = line.split()
+        if parts and not parts[0].startswith('--'):
+            # Column name is the first word, remove any trailing commas
+            col_name = parts[0].rstrip(',')
+            # Skip if it looks like a SQL keyword
+            if col_name.upper() not in ('CREATE', 'TABLE', 'IF', 'NOT', 'EXISTS', 'PARTITION', 'CLUSTER', 'BY'):
+                column_names.add(col_name)
+
+    return column_names
+
+
+class TestSchemaValidation:
+    """
+    Tests that verify the code output matches the BigQuery table schema.
+
+    These tests catch schema drift between code and SQL definitions without
+    requiring BigQuery access.
+    """
+
+    @pytest.fixture
+    def sql_schema_path(self):
+        return Path(__file__).parent.parent / "sql" / "01_create_indexer_scores_table.sql"
+
+    @pytest.fixture
+    def sample_merged_df(self):
+        """Sample input DataFrame for transform_to_scores_schema."""
+        return pd.DataFrame({
+            "indexer": ["0xABC", "0xDEF"],
+            "url": ["https://a.com", "https://b.com"],
+            "Latency Coefficient": [0.5, 1.0],
+            "Standard Error": [0.1, 0.2],
+            "Latency Coefficient + Error Confidence Interval": [0.65, 1.3],
+            "Robust Normalized Latency Coefficient + Error Confidence Interval": [-0.5, 0.5],
+            "% up_x": [99.5, 95.0],
+            "observed_duration_restricted": [1000, 2000],
+            "uptime_duration_restricted": [995, 1900],
+            "average_status": [0.98, 0.95],
+            "stake_to_fees": [100.0, 200.0],
+            "stake_to_fees_iqr_deviation": [-1.0, 1.0],
+            "org": ["AWS", "GCP"],
+            "dst_lat": [40.0, 35.0],
+            "dst_lon": [-74.0, -120.0],
+            "query_count": [1000, 2000],
+            "existing_dips_agreements": [0, 0],
+            "avg_sync_duration": [None, None],
+            "indexing_agreement_acceptance_latency": [None, None],
+        })
+
+    def test_output_columns_match_bigquery_schema(self, sql_schema_path, sample_merged_df):
+        """
+        Verify that transform_to_scores_schema outputs exactly the columns
+        defined in the BigQuery table schema.
+
+        This catches:
+        - Column name typos
+        - Missing columns in code output
+        - Extra columns not in BigQuery schema
+        - Schema drift when SQL or code changes
+        """
+        # Arrange
+        expected_columns = parse_bigquery_schema(sql_schema_path)
+
+        # Act
+        result = transform_to_scores_schema(sample_merged_df)
+        actual_columns = set(result.columns)
+
+        # Assert - exact match
+        missing_in_output = expected_columns - actual_columns
+        extra_in_output = actual_columns - expected_columns
+
+        assert not missing_in_output, f"Columns in SQL but missing from output: {missing_in_output}"
+        assert not extra_in_output, f"Columns in output but not in SQL schema: {extra_in_output}"
+        assert actual_columns == expected_columns
+
+    def test_schema_parser_works(self, sql_schema_path):
+        """Verify the SQL parser extracts the expected columns."""
+        columns = parse_bigquery_schema(sql_schema_path)
+
+        # Spot check some expected columns
+        assert "indexer" in columns
+        assert "url" in columns
+        assert "lat_lin_reg_coefficient" in columns
+        assert "computed_at" in columns
+        assert "query_count" in columns
+
+        # Should have 23 columns total
+        assert len(columns) == 23, f"Expected 23 columns, got {len(columns)}: {columns}"
