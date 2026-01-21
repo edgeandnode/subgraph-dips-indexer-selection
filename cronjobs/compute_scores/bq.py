@@ -6,6 +6,8 @@ Handles reading raw data and writing computed scores.
 
 import logging
 import socket
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import date, datetime, timezone
 from textwrap import dedent
 
@@ -37,14 +39,19 @@ class BigQueryClient:
         bpd.options.display.progress_bar = None
 
     @retry(
-        retry=retry_if_exception_type((ConnectionError, socket.timeout)),
+        retry=retry_if_exception_type((ConnectionError, socket.timeout, TimeoutError)),
         stop=stop_after_attempt(10),
         wait=wait_exponential(multiplier=1, max=60),
         reraise=True,
     )
-    def _read_gbq(self, query: str) -> pd.DataFrame:
-        """Execute a query and return results as pandas DataFrame."""
-        return bpd.read_gbq(query).to_pandas()
+    def _read_gbq(self, query: str, timeout_seconds: int = 600) -> pd.DataFrame:
+        """Execute a query and return results as pandas DataFrame with timeout protection."""
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(lambda: bpd.read_gbq(query).to_pandas())
+            try:
+                return future.result(timeout=timeout_seconds)
+            except FuturesTimeoutError:
+                raise TimeoutError(f"BigQuery read timed out after {timeout_seconds}s")
 
     def scores_exist_for_today(self) -> bool:
         """Check if scores have already been computed today."""
@@ -147,7 +154,7 @@ class BigQueryClient:
         FROM BasicFilter;
         """)
 
-        logger.debug("Fetching initial query results")
+        logger.info("Fetching initial query results")
         df = self._read_gbq(query)
 
         if not df.empty:
@@ -185,11 +192,15 @@ class BigQueryClient:
 
         for batch_size in batch_sizes:
             try:
-                logger.info(f"Attempting batch size: {batch_size}")
+                logger.info(f"Starting batch read with size {batch_size:,}")
                 offset = 0
                 df = pd.DataFrame()
+                batch_num = 0
+                batch_start_time = time.time()
 
                 while True:
+                    batch_num += 1
+                    read_start = time.time()
                     paginated_query = f"""
                     SELECT * FROM `{destination_table}`
                     LIMIT {batch_size} OFFSET {offset}
@@ -199,15 +210,22 @@ class BigQueryClient:
                     if batch_df.empty:
                         break
 
-                    logger.debug(f"Fetched {len(batch_df)} rows from offset {offset}")
+                    read_elapsed = time.time() - read_start
+                    total_so_far = len(df) + len(batch_df)
+                    logger.info(
+                        f"Batch {batch_num}: fetched {len(batch_df):,} rows in {read_elapsed:.1f}s "
+                        f"(total: {total_so_far:,} rows)"
+                    )
                     df = pd.concat([df, batch_df], ignore_index=True)
                     offset += batch_size
 
+                total_elapsed = time.time() - batch_start_time
+                logger.info(f"Batch read complete: {len(df):,} rows in {total_elapsed:.1f}s")
                 # Success
                 break
 
             except Exception as e:
-                logger.warning(f"Batch size {batch_size} failed: {e}")
+                logger.warning(f"Batch size {batch_size:,} failed: {e}")
                 continue
 
         if df.empty:
@@ -241,7 +259,7 @@ class BigQueryClient:
         GROUP BY indexer, recent_slashable_stake;
         """)
 
-        logger.debug("Fetching stake-to-fees data")
+        logger.info("Fetching stake-to-fees data")
         df = self._read_gbq(query)
         df.set_index("indexer", inplace=True)
 
