@@ -213,6 +213,7 @@ def compute_all_scores(
     # Transform to indexer_scores schema with pre-normalized values
     scores_df = transform_to_scores_schema(merged)
 
+    logger.info(f"Score computation complete: {len(scores_df)} indexers, columns: {list(scores_df.columns)}")
     return scores_df
 
 
@@ -365,6 +366,12 @@ def resolve_indexer_geoip(combined_queries: pd.DataFrame) -> pd.DataFrame:
     # Rename columns to match expected schema
     indexers_df = indexers_df.rename(columns=GEOIP_DST_COLUMN_MAPPING)
 
+    # Log GeoIP resolution summary
+    total = len(indexers_df)
+    failed = indexers_df["dst_lat"].isna().sum()
+    resolved = total - failed
+    logger.info(f"GeoIP resolution complete: {resolved}/{total} resolved, {failed} failed")
+
     return indexers_df
 
 
@@ -408,7 +415,8 @@ def is_private_ip(ip_addr: str) -> bool:
             (0x0A000000, 0xFF000000),  # 10.0.0.0/8
         )
         return any((ip & mask) == network for network, mask in private_networks)
-    except Exception:
+    except Exception as e:
+        logger.debug(f"is_private_ip check failed for {ip_addr}: {e}")
         return False
 
 
@@ -457,7 +465,9 @@ def adjust_rows(initial_query_results: pd.DataFrame, target_rows: int) -> int:
             x = int(x * 1.01)
         df["num_rows_restricted"] = df["num_rows"].clip(upper=x)
 
-    return df["num_rows_restricted"].max()
+    result = df["num_rows_restricted"].max()
+    logger.info(f"Calculated target rows per subgraph: {result}")
+    return result
 
 
 def merge_in_indexers_info(combined_queries: pd.DataFrame, indexers: pd.DataFrame) -> pd.DataFrame:
@@ -623,7 +633,15 @@ def perform_latency_linear_regression(
     )
 
     pipeline = Pipeline([("preprocessor", preprocessor), ("regressor", LinearRegression())])
-    pipeline.fit(x, y)
+    try:
+        logger.info(f"Fitting linear regression model with {len(x)} samples, {len(categorical)} categorical and {len(numeric)} numeric features")
+        pipeline.fit(x, y)
+    except Exception:
+        logger.exception("Linear regression fitting failed")
+        raise RuntimeError(
+            "Latency linear regression failed. This may indicate data quality issues "
+            "(e.g., insufficient variance, collinearity, or too few samples)."
+        )
     y_pred = pipeline.predict(x)
 
     # Analyze results

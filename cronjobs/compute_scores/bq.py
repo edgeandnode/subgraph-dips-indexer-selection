@@ -77,8 +77,12 @@ class BigQueryClient:
             last_seen TIMESTAMP NOT NULL
         )
         """
-        bpd.read_gbq(query)
-        logger.info(f"Ensured URL cache table exists: {self.url_cache_table}")
+        try:
+            bpd.read_gbq(query)
+            logger.info(f"Ensured URL cache table exists: {self.url_cache_table}")
+        except Exception:
+            logger.exception(f"Failed to create URL cache table: {self.url_cache_table}")
+            raise
 
     def update_url_cache(self, max_age_days: int = 7) -> None:
         """Incrementally update the URL cache with new data from gateway logs.
@@ -125,7 +129,11 @@ class BigQueryClient:
         WHEN NOT MATCHED THEN
             INSERT (indexer, url, last_seen) VALUES (new_data.indexer, new_data.url, new_data.last_seen)
         """
-        bpd.read_gbq(merge_query)
+        try:
+            bpd.read_gbq(merge_query)
+        except Exception:
+            logger.exception("Failed to merge new data into URL cache")
+            raise
 
         # Log cache stats
         stats_query = f"SELECT COUNT(*) as cnt FROM `{self.url_cache_table}`"
@@ -233,7 +241,11 @@ class BigQueryClient:
 
         # Post-processing
         if not df.empty:
+            rows_before = len(df)
             df.dropna(subset=["url"], inplace=True)
+            rows_dropped = rows_before - len(df)
+            if rows_dropped > 0:
+                logger.info(f"Dropped {rows_dropped} rows with null URLs")
             df["url"] = df["url"].apply(lambda url: url if url.endswith("/") else url + "/")
 
         memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
