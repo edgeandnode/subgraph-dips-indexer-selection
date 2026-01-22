@@ -15,8 +15,7 @@ on:
     # Allow manual trigger
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/iisa-score-computation
+  IMAGE_NAME: dockermoonboi9001/iisa-score-computation
   DOCKERFILE_PATH: cronjobs/compute_scores/Dockerfile
 
 jobs:
@@ -24,18 +23,16 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Log in to GitHub Container Registry
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Get current date for tagging
         id: date
@@ -45,21 +42,21 @@ jobs:
         run: |
           docker build \
             --build-arg DBIP_DATE=${{ steps.date.outputs.date }} \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.date.outputs.date }} \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            -t ${{ env.IMAGE_NAME }}:${{ steps.date.outputs.date }} \
+            -t ${{ env.IMAGE_NAME }}:latest \
             -f ${{ env.DOCKERFILE_PATH }} \
             cronjobs/compute_scores/
 
       - name: Push Docker image
         run: |
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.date.outputs.date }}
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ env.IMAGE_NAME }}:${{ steps.date.outputs.date }}
+          docker push ${{ env.IMAGE_NAME }}:latest
 
       - name: Summary
         run: |
           echo "## Docker Image Rebuilt" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image**: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.date.outputs.date }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: \`${{ env.IMAGE_NAME }}:${{ steps.date.outputs.date }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **DB-IP Database**: ${{ steps.date.outputs.date }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "The image includes the latest DB-IP Lite City database for offline GeoIP resolution." >> $GITHUB_STEP_SUMMARY

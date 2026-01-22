@@ -29,10 +29,10 @@ spec:
             runAsGroup: 1000
             fsGroup: 1000
           imagePullSecrets:
-          - name: ghcr-pull-secret
+          - name: dockerhub-pull-secret
           containers:
           - name: compute-scores
-            image: ghcr.io/edgeandnode/iisa-score-computation:latest
+            image: dockermoonboi9001/iisa-score-computation:latest
             resources:
               requests:
                 memory: "64Gi"
