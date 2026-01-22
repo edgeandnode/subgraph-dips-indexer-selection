@@ -96,7 +96,7 @@ class SelectionRequest(BaseModel):
     existing_indexers: Optional[list[str]] = None
     pending_agreements: Optional[dict[str, list[str]]] = None
     num_candidates: Optional[int] = None
-    indexer_denylist: Optional[list[str]] = None
+    blocklist: Optional[list[str]] = None
     declined_indexers: Optional[dict[str, list[str]]] = None
 
 
@@ -419,7 +419,7 @@ def _select_with_processor(request: SelectionRequest, num_to_select: int) -> lis
         existing_agreements=existing_agreements,
         pending_agreements=pending_agreements,
         declined_indexers=request.declined_indexers or {},
-        indexer_denylist=request.indexer_denylist or [],
+        indexer_denylist=request.blocklist or [],
     )
 
     # Get selections
