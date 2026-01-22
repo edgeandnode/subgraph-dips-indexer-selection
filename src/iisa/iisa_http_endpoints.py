@@ -332,22 +332,24 @@ async def select_one(request: SelectionRequest) -> SingleSelectionResponse:
     candidates = request.candidates or []
 
     if not candidates:
+        logger.warning(f"No candidates provided for deployment {request.deployment_id}")
         return SingleSelectionResponse(indexer_id=None)
 
     # If IISA data is ready, use DataProcessor for intelligent selection
     if _state.is_ready and _state.history is not None:
         try:
             selected = _select_with_processor(request, num_to_select=1)
-            return SingleSelectionResponse(
-                indexer_id=selected[0] if selected else None
-            )
-        except Exception as e:
-            logger.error(f"DataProcessor selection failed: {e}")
-            logger.info("Falling back to random selection")
+            indexer_id = selected[0] if selected else None
+            logger.info(f"Selected indexer {indexer_id} for deployment {request.deployment_id}")
+            return SingleSelectionResponse(indexer_id=indexer_id)
+        except Exception:
+            logger.exception(f"DataProcessor selection failed for deployment {request.deployment_id}")
 
     # Fallback: random selection (extract ID from CandidateIndexer)
-    logger.debug(f"Random selection from {len(candidates)} candidates")
+    if not _state.is_ready:
+        logger.warning(f"No IISA data loaded, using random selection for deployment {request.deployment_id}")
     selected = random.choice(candidates)
+    logger.info(f"Random selection: indexer {selected.id} for deployment {request.deployment_id}")
     return SingleSelectionResponse(indexer_id=selected.id)
 
 
@@ -368,22 +370,26 @@ async def select_many(request: SelectionRequest) -> MultiSelectionResponse:
     candidates = request.candidates or []
 
     if not candidates or request.num_candidates <= 0:
+        logger.warning(f"No candidates or num_candidates<=0 for deployment {request.deployment_id}")
         return MultiSelectionResponse(indexer_ids=[])
 
     # If IISA data is ready, use DataProcessor for intelligent selection
     if _state.is_ready and _state.history is not None:
         try:
             selected = _select_with_processor(request, num_to_select=request.num_candidates)
+            logger.info(f"Selected {len(selected)} indexers for deployment {request.deployment_id}: {selected}")
             return MultiSelectionResponse(indexer_ids=selected)
-        except Exception as e:
-            logger.error(f"DataProcessor selection failed: {e}")
-            logger.info("Falling back to random selection")
+        except Exception:
+            logger.exception(f"DataProcessor selection failed for deployment {request.deployment_id}")
 
     # Fallback: random selection (extract IDs from CandidateIndexer objects)
+    if not _state.is_ready:
+        logger.warning(f"No IISA data loaded, using random selection for deployment {request.deployment_id}")
     k = min(request.num_candidates, len(candidates))
-    logger.debug(f"Random selection of {k} from {len(candidates)} candidates")
     selected = random.sample(candidates, k)
-    return MultiSelectionResponse(indexer_ids=[c.id for c in selected])
+    selected_ids = [c.id for c in selected]
+    logger.info(f"Random selection: {len(selected_ids)} indexers for deployment {request.deployment_id}: {selected_ids}")
+    return MultiSelectionResponse(indexer_ids=selected_ids)
 
 
 def _select_with_processor(request: SelectionRequest, num_to_select: int) -> list[str]:
