@@ -1,0 +1,66 @@
+name: Rebuild CronJob Image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'cronjobs/compute_scores/**'
+      - '.github/workflows/rebuild-cronjob-image.yml'
+  schedule:
+    # Run on the 1st of every month at 00:00 UTC
+    # DB-IP updates their database monthly
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+    # Allow manual trigger
+
+env:
+  IMAGE_NAME: gcr.io/graph-mainnet/iisa-score-computation
+  DOCKERFILE_PATH: cronjobs/compute_scores/Dockerfile
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker gcr.io --quiet
+
+      - name: Get current date for tagging
+        id: date
+        run: echo "date=$(date +%Y-%m)" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg DBIP_DATE=${{ steps.date.outputs.date }} \
+            -t ${{ env.IMAGE_NAME }}:${{ steps.date.outputs.date }} \
+            -t ${{ env.IMAGE_NAME }}:latest \
+            -f ${{ env.DOCKERFILE_PATH }} \
+            cronjobs/compute_scores/
+
+      - name: Push Docker image
+        run: |
+          docker push ${{ env.IMAGE_NAME }}:${{ steps.date.outputs.date }}
+          docker push ${{ env.IMAGE_NAME }}:latest
+
+      - name: Summary
+        run: |
+          echo "## Docker Image Rebuilt" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: \`${{ env.IMAGE_NAME }}:${{ steps.date.outputs.date }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **DB-IP Database**: ${{ steps.date.outputs.date }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "The image includes the latest DB-IP Lite City database for offline GeoIP resolution." >> $GITHUB_STEP_SUMMARY

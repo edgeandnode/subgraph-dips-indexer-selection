@@ -49,11 +49,6 @@ spec:
               value: "28"
             - name: TARGET_ROWS
               value: "20000000"
-            - name: IPINFO_AUTH
-              valueFrom:
-                secretKeyRef:
-                  name: iisa-ipinfo-credentials
-                  key: ipinfo_api_key
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /app/credentials/service-account.json
             securityContext:
