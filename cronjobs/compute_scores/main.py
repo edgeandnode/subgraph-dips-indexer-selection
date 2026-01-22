@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 BQ_PROJECT = os.environ.get("BQ_PROJECT", "graph-mainnet")
 BQ_DATASET = os.environ.get("BQ_DATASET", "iisa_data_for_dips")
 BQ_LOCATION = os.environ.get("BQ_LOCATION", "US")
-IPINFO_AUTH = os.environ.get("IPINFO_AUTH", "")
 NUM_DAYS = int(os.environ.get("NUM_DAYS", "28"))
 TARGET_ROWS = int(os.environ.get("TARGET_ROWS", "20000000"))
 
@@ -48,13 +47,6 @@ def validate_configuration() -> None:
     This implements fail-fast principle - better to fail in 1 second than 30 minutes.
     """
     errors = []
-
-    # Check required environment variables
-    if not IPINFO_AUTH:
-        errors.append(
-            "IPINFO_AUTH environment variable is required for GeoIP resolution. "
-            "Without it, indexer locations cannot be determined and all data will be dropped."
-        )
 
     # Validate numeric config
     if NUM_DAYS < 1:
@@ -123,7 +115,6 @@ def main() -> int:
             start_ts=start_ts,
             num_days=NUM_DAYS,
             target_rows=TARGET_ROWS,
-            ipinfo_auth=IPINFO_AUTH,
         )
 
         if scores_df.empty:

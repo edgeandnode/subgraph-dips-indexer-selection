@@ -5,9 +5,8 @@ This module contains functions extracted and adapted from the IISA codebase
 for computing latency regression, uptime, success rate, and stake-to-fees metrics.
 """
 
-import gzip
-import json
 import logging
+import os
 import socket
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -16,9 +15,10 @@ from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 import airportsdata
+import geoip2.database
+import geoip2.errors
 import numpy as np
 import pandas as pd
-import requests
 from numpy.linalg import pinv
 from scipy.stats import t
 from sklearn.compose import ColumnTransformer
@@ -26,12 +26,6 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +33,28 @@ logger = logging.getLogger(__name__)
 LATENCY_COEFFICIENT_STANDARD_ERROR_MULTIPLIER = 1.5
 REQUEST_STATUS_OK = "200 OK"
 REQUEST_STATUS_UNAVAILABLE_MISSING_BLOCK = "Unavailable(MissingBlock)"
+
+# GeoIP database path (DB-IP Lite City, bundled in Docker image)
+# IMPORTANT: Do not remove this attribution - required by DB-IP CC BY 4.0 license terms
+# Attribution: This product includes IP geolocation data created by DB-IP, available from https://db-ip.com
+GEOIP_DATABASE_PATH = os.environ.get("GEOIP_DATABASE_PATH", "/app/dbip-city-lite.mmdb")
+
+# Global GeoIP reader (lazy initialized)
+_geoip_reader: Optional[geoip2.database.Reader] = None
+
+
+def get_geoip_reader() -> geoip2.database.Reader:
+    """Get or create the GeoIP database reader."""
+    global _geoip_reader
+    if _geoip_reader is None:
+        if not os.path.exists(GEOIP_DATABASE_PATH):
+            raise FileNotFoundError(
+                f"GeoIP database not found at {GEOIP_DATABASE_PATH}. "
+                "Ensure the DB-IP database is bundled in the Docker image."
+            )
+        _geoip_reader = geoip2.database.Reader(GEOIP_DATABASE_PATH)
+        logger.info(f"Loaded GeoIP database from {GEOIP_DATABASE_PATH}")
+    return _geoip_reader
 
 # Iterative filter constants
 ITERATIVE_FILTER_MIN_DEPLOYMENT_INDEXERS = 2
@@ -65,7 +81,6 @@ def compute_all_scores(
     start_ts: str,
     num_days: int,
     target_rows: int,
-    ipinfo_auth: str,
 ) -> pd.DataFrame:
     """
     Compute all indexer scores and return as a DataFrame ready for BigQuery.
@@ -88,7 +103,7 @@ def compute_all_scores(
     )
 
     # Get unique indexers and resolve GeoIP
-    indexers_df = resolve_indexer_geoip(combined_queries, ipinfo_auth)
+    indexers_df = resolve_indexer_geoip(combined_queries)
 
     # Merge indexer info into combined queries
     combined_queries = merge_in_indexers_info(combined_queries, indexers_df)
@@ -316,9 +331,11 @@ def calculate_iqr_deviation(series: pd.Series) -> pd.Series:
     return (series - median_val) / iqr
 
 
-def resolve_indexer_geoip(combined_queries: pd.DataFrame, ipinfo_auth: str) -> pd.DataFrame:
+def resolve_indexer_geoip(combined_queries: pd.DataFrame) -> pd.DataFrame:
     """
     Extract unique indexers from query data and resolve their GeoIP information.
+
+    Uses the bundled DB-IP Lite City database for offline lookups.
     """
     # Get unique indexer/url pairs
     unique_indexers = combined_queries[["indexer", "url"]].drop_duplicates()
@@ -326,14 +343,14 @@ def resolve_indexer_geoip(combined_queries: pd.DataFrame, ipinfo_auth: str) -> p
 
     logger.info(f"Resolving GeoIP for {len(unique_indexers)} unique indexers")
 
-    # Create GeoIP resolver
+    # Create GeoIP resolver with caching
     geoip_cache: Dict[str, dict] = {}
 
     def resolve_url(url: str) -> dict:
         if url in geoip_cache:
             return geoip_cache[url]
 
-        result = resolve_url_geoip(url, ipinfo_auth)
+        result = resolve_url_geoip(url)
         geoip_cache[url] = result
         return result
 
@@ -351,8 +368,8 @@ def resolve_indexer_geoip(combined_queries: pd.DataFrame, ipinfo_auth: str) -> p
     return indexers_df
 
 
-def resolve_url_geoip(url: str, auth: str) -> dict:
-    """Resolve GeoIP information for a URL."""
+def resolve_url_geoip(url: str) -> dict:
+    """Resolve GeoIP information for a URL using local DB-IP database."""
     try:
         parsed = urlparse(url)
         host = parsed.hostname
@@ -372,11 +389,8 @@ def resolve_url_geoip(url: str, auth: str) -> dict:
         if is_private_ip(ip_addr):
             return _empty_geoip_result(ip_addr)
 
-        # Fetch from ipinfo.io
-        if not auth:
-            return _empty_geoip_result(ip_addr)
-
-        return fetch_ipinfo(ip_addr, auth)
+        # Lookup in local DB-IP database
+        return lookup_geoip(ip_addr)
 
     except Exception as e:
         logger.warning(f"GeoIP resolution failed for {url}: {e}")
@@ -398,42 +412,24 @@ def is_private_ip(ip_addr: str) -> bool:
         return False
 
 
-@retry(
-    retry=retry_if_exception_type((ConnectionError, requests.exceptions.ConnectionError, socket.timeout)),
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, max=30),
-)
-def fetch_ipinfo(ip_addr: str, auth: str) -> dict:
-    """Fetch IP info from ipinfo.io API."""
+def lookup_geoip(ip_addr: str) -> dict:
+    """Look up GeoIP information from the local DB-IP database."""
     try:
-        response = requests.get(
-            f"https://ipinfo.io/{ip_addr}/json?token={auth}",
-            timeout=5,
-        )
-        response.raise_for_status()
-
-        try:
-            data = response.json()
-        except requests.exceptions.JSONDecodeError:
-            data = json.loads(gzip.decompress(response.content))
-
-        loc = data.get("loc", "")
-        lat, lon = None, None
-        if loc:
-            try:
-                lat, lon = map(float, loc.split(","))
-            except ValueError:
-                pass
+        reader = get_geoip_reader()
+        response = reader.city(ip_addr)
 
         return {
-            "ip_addr": data.get("ip"),
-            "org": data.get("org"),
-            "country": data.get("country"),
-            "latitude": lat,
-            "longitude": lon,
+            "ip_addr": ip_addr,
+            "org": None,  # DB-IP City Lite doesn't include ASN/org info
+            "country": response.country.iso_code,
+            "latitude": response.location.latitude,
+            "longitude": response.location.longitude,
         }
+    except geoip2.errors.AddressNotFoundError:
+        logger.debug(f"IP address not found in GeoIP database: {ip_addr}")
+        return _empty_geoip_result(ip_addr)
     except Exception as e:
-        logger.warning(f"ipinfo.io request failed: {e}")
+        logger.warning(f"GeoIP lookup failed for {ip_addr}: {e}")
         return _empty_geoip_result(ip_addr)
 
 
