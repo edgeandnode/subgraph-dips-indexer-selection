@@ -17,7 +17,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 
-from bq import BigQueryClient
+from bq import BigQueryClient, PermissionError
 from processing import compute_all_scores
 
 logging.basicConfig(
@@ -90,6 +90,13 @@ def main() -> int:
         dataset=BQ_DATASET,
         location=BQ_LOCATION,
     )
+
+    # Fail-fast: validate permissions before any expensive operations
+    try:
+        bq_client.validate_permissions()
+    except PermissionError as e:
+        logger.error(f"Permission validation failed:\n{e}")
+        return 1
 
     # Check idempotency - skip if already computed today
     if bq_client.scores_exist_for_today():
