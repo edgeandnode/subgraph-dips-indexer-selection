@@ -12,10 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from datetime import date, datetime, timezone
 from textwrap import dedent
 
-import bigframes
 import pandas as pd
-from bigframes import pandas as bpd
-from google.auth import default as google_auth_default
 from google.oauth2 import service_account
 from tenacity import (
     retry,
@@ -37,7 +34,7 @@ class BigQueryClient:
         self.scores_table = f"{project}.{dataset}.indexer_scores"
         self.url_cache_table = f"{project}.{dataset}.indexer_url_cache"
 
-        # Load service account file if available
+        # Load service account BEFORE importing bigframes to avoid interactive auth
         creds_file = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
         if creds_file and os.path.exists(creds_file):
             credentials = service_account.Credentials.from_service_account_file(
@@ -46,10 +43,15 @@ class BigQueryClient:
             )
             logger.info(f"Loaded service account from {creds_file}")
         else:
+            from google.auth import default as google_auth_default
             credentials, _ = google_auth_default(
                 scopes=["https://www.googleapis.com/auth/cloud-platform"]
             )
             logger.info("Using application default auth")
+
+        # Import bigframes AFTER setting up credentials
+        import bigframes
+        from bigframes import pandas as bpd
 
         # Initialize bigframes with explicit context to avoid interactive auth
         context = bigframes.BigQueryOptions(
@@ -60,6 +62,8 @@ class BigQueryClient:
         bigframes.connect(context)
         logger.info("Connected to BigQuery via bigframes")
 
+        # Store bpd reference for use in methods
+        self._bpd = bpd
         bpd.options.display.progress_bar = None
 
     @retry(
@@ -71,7 +75,7 @@ class BigQueryClient:
     def _read_gbq(self, query: str, timeout_seconds: int = 600) -> pd.DataFrame:
         """Execute a query and return results as pandas DataFrame with timeout protection."""
         with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(lambda: bpd.read_gbq(query).to_pandas())
+            future = executor.submit(lambda: self._bpd.read_gbq(query).to_pandas())
             try:
                 return future.result(timeout=timeout_seconds)
             except FuturesTimeoutError:
@@ -102,7 +106,7 @@ class BigQueryClient:
         )
         """
         try:
-            bpd.read_gbq(query)
+            self._bpd.read_gbq(query)
             logger.info(f"Ensured URL cache table exists: {self.url_cache_table}")
         except Exception:
             logger.exception(f"Failed to create URL cache table: {self.url_cache_table}")
@@ -154,7 +158,7 @@ class BigQueryClient:
             INSERT (indexer, url, last_seen) VALUES (new_data.indexer, new_data.url, new_data.last_seen)
         """
         try:
-            bpd.read_gbq(merge_query)
+            self._bpd.read_gbq(merge_query)
         except Exception:
             logger.exception("Failed to merge new data into URL cache")
             raise
@@ -213,7 +217,7 @@ class BigQueryClient:
         logger.info("Running combined query and writing to intermediate table")
 
         # Run query and write to intermediate table
-        intermediate_df = bpd.read_gbq(query)
+        intermediate_df = self._bpd.read_gbq(query)
         intermediate_df.to_gbq(destination_table, if_exists="replace")
 
         logger.info("Reading from intermediate table in batches")
@@ -308,7 +312,7 @@ class BigQueryClient:
         logger.info(f"Writing {len(scores_df)} scores ({memory_mb:.2f} MB) to {self.scores_table}")
 
         # Convert to bigframes and write
-        bf_df = bpd.DataFrame(scores_df)
+        bf_df = self._bpd.DataFrame(scores_df)
         bf_df.to_gbq(self.scores_table, if_exists="append")
 
         logger.info("Successfully wrote scores to BigQuery")
