@@ -5,6 +5,7 @@ Handles reading raw data and writing computed scores.
 """
 
 import logging
+import os
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -13,6 +14,8 @@ from textwrap import dedent
 
 import pandas as pd
 from bigframes import pandas as bpd
+from google.auth import default as google_auth_default
+from google.oauth2 import service_account
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -33,9 +36,22 @@ class BigQueryClient:
         self.scores_table = f"{project}.{dataset}.indexer_scores"
         self.url_cache_table = f"{project}.{dataset}.indexer_url_cache"
 
-        # Configure bigframes
+        # Load credentials from service account file if available
+        creds_file = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if creds_file and os.path.exists(creds_file):
+            credentials = service_account.Credentials.from_service_account_file(
+                creds_file,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            logger.info(f"Loaded credentials from {creds_file}")
+        else:
+            credentials, _ = google_auth_default()
+            logger.info("Using default credentials")
+
+        # Configure bigframes with explicit credentials
         bpd.options.bigquery.project = project
         bpd.options.bigquery.location = location
+        bpd.options.bigquery.credentials = credentials
         bpd.options.display.progress_bar = None
 
     @retry(
