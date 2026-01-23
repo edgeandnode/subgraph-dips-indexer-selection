@@ -33,6 +33,7 @@ spec:
           containers:
           - name: compute-scores
             image: dockermoonboi9001/iisa-score-computation:latest
+            imagePullPolicy: Always
             resources:
               requests:
                 memory: "64Gi"
