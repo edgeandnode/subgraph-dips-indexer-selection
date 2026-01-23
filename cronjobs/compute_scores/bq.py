@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from datetime import date, datetime, timezone
 from textwrap import dedent
 
+import bigframes
 import pandas as pd
 from bigframes import pandas as bpd
 from google.auth import default as google_auth_default
@@ -36,22 +37,29 @@ class BigQueryClient:
         self.scores_table = f"{project}.{dataset}.indexer_scores"
         self.url_cache_table = f"{project}.{dataset}.indexer_url_cache"
 
-        # Load credentials from service account file if available
+        # Load service account file if available
         creds_file = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
         if creds_file and os.path.exists(creds_file):
             credentials = service_account.Credentials.from_service_account_file(
                 creds_file,
                 scopes=["https://www.googleapis.com/auth/cloud-platform"],
             )
-            logger.info(f"Loaded credentials from {creds_file}")
+            logger.info(f"Loaded service account from {creds_file}")
         else:
-            credentials, _ = google_auth_default()
-            logger.info("Using default credentials")
+            credentials, _ = google_auth_default(
+                scopes=["https://www.googleapis.com/auth/cloud-platform"]
+            )
+            logger.info("Using application default auth")
 
-        # Configure bigframes with explicit credentials
-        bpd.options.bigquery.project = project
-        bpd.options.bigquery.location = location
-        bpd.options.bigquery.credentials = credentials
+        # Initialize bigframes with explicit context to avoid interactive auth
+        context = bigframes.BigQueryOptions(
+            credentials=credentials,
+            project=project,
+            location=location,
+        )
+        bigframes.connect(context)
+        logger.info("Connected to BigQuery via bigframes")
+
         bpd.options.display.progress_bar = None
 
     @retry(
