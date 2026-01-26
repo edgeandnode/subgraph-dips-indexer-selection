@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
 
     steps:
       - name: Checkout code
@@ -57,13 +58,33 @@ jobs:
           docker push ${{ steps.tags.outputs.sha_tag }}
 
       - name: Update CronJob image tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          BRANCH_NAME="chore/update-cronjob-image-${{ steps.tags.outputs.sha_short }}"
           sed -i 's|image: ${{ env.IMAGE_NAME }}:.*|image: ${{ steps.tags.outputs.sha_tag }}|' k8s/score-computation-cronjob.yaml
+
+          # Check if there are actual changes
+          if git diff --quiet k8s/score-computation-cronjob.yaml; then
+            echo "No changes to k8s yaml, skipping PR creation"
+            exit 0
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH_NAME"
           git add k8s/score-computation-cronjob.yaml
-          git diff --cached --quiet || git commit -m "chore(k8s): update cronjob image to sha-${{ steps.tags.outputs.sha_short }}"
-          git push
+          git commit -m "chore(k8s): update cronjob image to sha-${{ steps.tags.outputs.sha_short }}"
+          git push -u origin "$BRANCH_NAME"
+
+          gh pr create \
+            --title "chore(k8s): update cronjob image to sha-${{ steps.tags.outputs.sha_short }}" \
+            --body "Updates the CronJob to use image \`${{ steps.tags.outputs.sha_tag }}\`
+
+          After merging, run:
+          \`\`\`bash
+          kubectl apply -f k8s/score-computation-cronjob.yaml
+          \`\`\`"
 
       - name: Summary
         run: |
