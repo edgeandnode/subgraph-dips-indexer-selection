@@ -21,11 +21,13 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -33,23 +35,42 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Generate image tags
+        id: tags
+        run: |
+          SHA_SHORT=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "sha_short=$SHA_SHORT" >> $GITHUB_OUTPUT
+          echo "sha_tag=${{ env.IMAGE_NAME }}:sha-$SHA_SHORT" >> $GITHUB_OUTPUT
+
       - name: Build Docker image
         run: |
           docker build \
             --build-arg MAXMIND_LICENSE_KEY=${{ secrets.MAXMIND_LICENSE_KEY }} \
             -t ${{ env.IMAGE_NAME }}:latest \
+            -t ${{ steps.tags.outputs.sha_tag }} \
             -f ${{ env.DOCKERFILE_PATH }} \
             cronjobs/compute_scores/
 
       - name: Push Docker image
         run: |
           docker push ${{ env.IMAGE_NAME }}:latest
+          docker push ${{ steps.tags.outputs.sha_tag }}
+
+      - name: Update CronJob image tag
+        run: |
+          sed -i 's|image: ${{ env.IMAGE_NAME }}:.*|image: ${{ steps.tags.outputs.sha_tag }}|' k8s/score-computation-cronjob.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/score-computation-cronjob.yaml
+          git diff --cached --quiet || git commit -m "chore(k8s): update cronjob image to sha-${{ steps.tags.outputs.sha_short }}"
+          git push
 
       - name: Summary
         run: |
           echo "## Docker Image Rebuilt" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **Image**: \`${{ env.IMAGE_NAME }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **SHA tag**: \`${{ steps.tags.outputs.sha_tag }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **GeoLite2-City**: location lookups" >> $GITHUB_STEP_SUMMARY
           echo "- **GeoLite2-ASN**: organization lookups" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
