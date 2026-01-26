@@ -24,6 +24,12 @@ from tenacity import (
 logger = logging.getLogger(__name__)
 
 
+class PermissionError(Exception):
+    """Raised when the service account lacks required BigQuery permissions."""
+
+    pass
+
+
 class BigQueryClient:
     """BigQuery client for reading raw data and writing computed scores."""
 
@@ -65,6 +71,102 @@ class BigQueryClient:
         # Store bpd reference for use in methods
         self._bpd = bpd
         bpd.options.display.progress_bar = None
+
+    def validate_permissions(self) -> None:
+        """Validate that the service account has all required BigQuery permissions.
+
+        Tests read access to source datasets, write access to target dataset,
+        and BigQuery Storage API access. Fails fast with clear error messages.
+
+        Raises:
+            PermissionError: If any required permission is missing.
+        """
+        errors = []
+
+        # Test 1: Read from internal_metrics (source data)
+        logger.info("Validating permissions: testing read access to internal_metrics...")
+        try:
+            test_query = """
+            SELECT 1 FROM `internal_metrics.metrics_indexer_attempts` LIMIT 1
+            """
+            self._bpd.read_gbq(test_query).to_pandas()
+            logger.info("  [OK] Read access to internal_metrics.metrics_indexer_attempts")
+        except Exception as e:
+            error_msg = str(e)
+            if "permission" in error_msg.lower() or "403" in error_msg:
+                errors.append(f"Cannot read internal_metrics.metrics_indexer_attempts: {error_msg}")
+                logger.error(f"  [FAIL] {errors[-1]}")
+            else:
+                # Non-permission error (e.g., table doesn't exist) - log but don't fail permission check
+                logger.warning(f"  [WARN] Unexpected error reading internal_metrics: {error_msg}")
+
+        # Test 2: Read from production_metrics (source data)
+        logger.info("Validating permissions: testing read access to production_metrics...")
+        try:
+            test_query = """
+            SELECT 1 FROM `production_metrics.prod_metrics_gateway_subgraph_queries` LIMIT 1
+            """
+            self._bpd.read_gbq(test_query).to_pandas()
+            logger.info("  [OK] Read access to production_metrics.prod_metrics_gateway_subgraph_queries")
+        except Exception as e:
+            error_msg = str(e)
+            if "permission" in error_msg.lower() or "403" in error_msg:
+                errors.append(f"Cannot read production_metrics.prod_metrics_gateway_subgraph_queries: {error_msg}")
+                logger.error(f"  [FAIL] {errors[-1]}")
+            else:
+                logger.warning(f"  [WARN] Unexpected error reading production_metrics: {error_msg}")
+
+        # Test 3: Write to target dataset (create temp table and delete)
+        logger.info("Validating permissions: testing write access to target dataset...")
+        test_table = f"{self.project}.{self.dataset}._permission_test"
+        try:
+            create_query = f"""
+            CREATE OR REPLACE TABLE `{test_table}` AS SELECT 1 as test_col
+            """
+            self._bpd.read_gbq(create_query)
+            # Clean up
+            drop_query = f"DROP TABLE IF EXISTS `{test_table}`"
+            self._bpd.read_gbq(drop_query)
+            logger.info(f"  [OK] Write access to {self.project}.{self.dataset}")
+        except Exception as e:
+            error_msg = str(e)
+            if "permission" in error_msg.lower() or "403" in error_msg:
+                errors.append(f"Cannot write to {self.project}.{self.dataset}: {error_msg}")
+                logger.error(f"  [FAIL] {errors[-1]}")
+            else:
+                logger.warning(f"  [WARN] Unexpected error writing to dataset: {error_msg}")
+
+        # Test 4: BigQuery Storage Read API (readSessionUser permission)
+        # Use a larger result set to ensure Storage API is triggered (not REST fallback)
+        logger.info("Validating permissions: testing BigQuery Storage Read API access...")
+        try:
+            storage_test_query = """
+            SELECT num FROM UNNEST(GENERATE_ARRAY(1, 1000)) AS num
+            """
+            result = self._bpd.read_gbq(storage_test_query).to_pandas()
+            if len(result) == 1000:
+                logger.info("  [OK] BigQuery Storage Read API access")
+            else:
+                logger.warning(f"  [WARN] Storage API test returned unexpected rows: {len(result)}")
+        except Exception as e:
+            error_msg = str(e)
+            if "permission" in error_msg.lower() or "403" in error_msg or "storage" in error_msg.lower():
+                errors.append(f"Cannot use BigQuery Storage Read API: {error_msg}")
+                logger.error(f"  [FAIL] {errors[-1]}")
+            else:
+                logger.warning(f"  [WARN] Unexpected error testing Storage API: {error_msg}")
+
+        if errors:
+            error_summary = "\n".join(f"  - {e}" for e in errors)
+            raise PermissionError(
+                f"Service account lacks {len(errors)} required permission(s):\n{error_summary}\n\n"
+                "Required roles:\n"
+                "  - roles/bigquery.dataViewer on graph-mainnet (read source data)\n"
+                "  - roles/bigquery.dataEditor on iisa_data_for_dips dataset (write scores)\n"
+                "  - roles/bigquery.readSessionUser on graph-mainnet (Storage API)"
+            )
+
+        logger.info("Permission validation passed")
 
     @retry(
         retry=retry_if_exception_type((ConnectionError, socket.timeout, TimeoutError)),
