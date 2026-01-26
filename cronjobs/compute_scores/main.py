@@ -18,7 +18,7 @@ import time
 from datetime import date, datetime, timedelta
 
 from bq import BigQueryClient, PermissionError
-from processing import compute_all_scores
+from processing import compute_all_scores, validate_geoip_databases
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,6 +84,13 @@ def main() -> int:
     except ConfigurationError:
         return 1
 
+    # Fail-fast: validate GeoIP databases exist before any expensive operations
+    try:
+        validate_geoip_databases()
+    except FileNotFoundError as e:
+        logger.error(f"GeoIP database validation failed: {e}")
+        return 1
+
     # Initialize BigQuery client
     bq_client = BigQueryClient(
         project=BQ_PROJECT,
@@ -113,6 +120,16 @@ def main() -> int:
     start_ts = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     logger.info(f"Computing scores for period: {start_date} to {end_date}")
+
+    # Fail-fast: validate source data exists for date range (cheap LIMIT 1 query)
+    if not bq_client.source_data_exists(start_date, NUM_DAYS):
+        logger.error(f"No source data found for date range {start_date} to {end_date}")
+        return 1
+
+    # Fail-fast: validate URL cache has data (required for GeoIP resolution)
+    if not bq_client.url_cache_has_data():
+        logger.error("URL cache is empty - GeoIP resolution will fail for all indexers")
+        return 1
 
     # Fetch and compute scores
     try:
