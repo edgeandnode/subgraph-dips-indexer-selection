@@ -44,6 +44,44 @@ _geoip_city_reader: Optional[geoip2.database.Reader] = None
 _geoip_asn_reader: Optional[geoip2.database.Reader] = None
 
 
+def validate_geoip_databases() -> None:
+    """Validate that GeoIP databases exist and are readable.
+
+    This is a fail-fast check that runs before expensive BigQuery operations.
+    Raises FileNotFoundError if databases are missing or unreadable.
+    """
+    errors = []
+
+    # Check City database
+    if not os.path.exists(GEOIP_CITY_DATABASE_PATH):
+        errors.append(f"GeoLite2-City database not found at {GEOIP_CITY_DATABASE_PATH}")
+    else:
+        try:
+            reader = geoip2.database.Reader(GEOIP_CITY_DATABASE_PATH)
+            reader.close()
+            logger.info(f"  [OK] GeoLite2-City database: {GEOIP_CITY_DATABASE_PATH}")
+        except Exception as e:
+            errors.append(f"GeoLite2-City database unreadable: {e}")
+
+    # Check ASN database
+    if not os.path.exists(GEOIP_ASN_DATABASE_PATH):
+        errors.append(f"GeoLite2-ASN database not found at {GEOIP_ASN_DATABASE_PATH}")
+    else:
+        try:
+            reader = geoip2.database.Reader(GEOIP_ASN_DATABASE_PATH)
+            reader.close()
+            logger.info(f"  [OK] GeoLite2-ASN database: {GEOIP_ASN_DATABASE_PATH}")
+        except Exception as e:
+            errors.append(f"GeoLite2-ASN database unreadable: {e}")
+
+    if errors:
+        raise FileNotFoundError(
+            "GeoIP database validation failed:\n  - " + "\n  - ".join(errors)
+        )
+
+    logger.info("GeoIP database validation passed")
+
+
 def get_geoip_city_reader() -> geoip2.database.Reader:
     """Get or create the GeoIP City database reader."""
     global _geoip_city_reader

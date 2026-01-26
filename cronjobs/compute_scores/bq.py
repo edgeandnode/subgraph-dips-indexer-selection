@@ -9,7 +9,7 @@ import os
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from textwrap import dedent
 
 import pandas as pd
@@ -190,16 +190,64 @@ class BigQueryClient:
     def scores_exist_for_today(self) -> bool:
         """Check if scores have already been computed today."""
         query = f"""
-        SELECT COUNT(*) as cnt
+        SELECT 1
         FROM `{self.scores_table}`
         WHERE DATE(computed_at) = CURRENT_DATE()
+        LIMIT 1
         """
         try:
             result = self._read_gbq(query)
-            return result["cnt"].iloc[0] > 0
+            return len(result) > 0
         except Exception as e:
             # Table might not exist yet
             logger.warning(f"Could not check for existing scores: {e}")
+            return False
+
+    def source_data_exists(self, start_date: date, num_days: int) -> bool:
+        """Check if source data exists for the date range (zero-cost metadata query).
+
+        Uses INFORMATION_SCHEMA.PARTITIONS to check partition existence without
+        scanning any actual table data.
+        """
+        start = start_date.strftime("%Y%m%d")
+        end = (start_date + timedelta(days=num_days)).strftime("%Y%m%d")
+        query = f"""
+        SELECT 1
+        FROM `{self.project}.internal_metrics.INFORMATION_SCHEMA.PARTITIONS`
+        WHERE table_name = 'metrics_indexer_attempts'
+          AND partition_id BETWEEN '{start}' AND '{end}'
+        LIMIT 1
+        """
+        try:
+            logger.info("Validating source data exists for date range (via INFORMATION_SCHEMA)...")
+            result = self._read_gbq(query)
+            exists = len(result) > 0
+            if exists:
+                logger.info("  [OK] Source data partitions exist for date range")
+            return exists
+        except Exception as e:
+            logger.warning(f"Could not check for source data: {e}")
+            return False
+
+    def url_cache_has_data(self) -> bool:
+        """Check if URL cache has data (cheap LIMIT 1 query).
+
+        Empty URL cache means GeoIP resolution will fail for all indexers.
+        """
+        query = f"""
+        SELECT 1
+        FROM `{self.url_cache_table}`
+        LIMIT 1
+        """
+        try:
+            logger.info("Validating URL cache has data...")
+            result = self._read_gbq(query)
+            has_data = len(result) > 0
+            if has_data:
+                logger.info("  [OK] URL cache has data")
+            return has_data
+        except Exception as e:
+            logger.warning(f"Could not check URL cache: {e}")
             return False
 
     def ensure_url_cache_exists(self) -> None:
