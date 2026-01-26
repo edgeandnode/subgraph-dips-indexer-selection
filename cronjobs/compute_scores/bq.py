@@ -136,6 +136,26 @@ class BigQueryClient:
             else:
                 logger.warning(f"  [WARN] Unexpected error writing to dataset: {error_msg}")
 
+        # Test 4: BigQuery Storage Read API (readSessionUser permission)
+        # Use a larger result set to ensure Storage API is triggered (not REST fallback)
+        logger.info("Validating permissions: testing BigQuery Storage Read API access...")
+        try:
+            storage_test_query = """
+            SELECT num FROM UNNEST(GENERATE_ARRAY(1, 1000)) AS num
+            """
+            result = self._bpd.read_gbq(storage_test_query).to_pandas()
+            if len(result) == 1000:
+                logger.info("  [OK] BigQuery Storage Read API access")
+            else:
+                logger.warning(f"  [WARN] Storage API test returned unexpected rows: {len(result)}")
+        except Exception as e:
+            error_msg = str(e)
+            if "permission" in error_msg.lower() or "403" in error_msg or "storage" in error_msg.lower():
+                errors.append(f"Cannot use BigQuery Storage Read API: {error_msg}")
+                logger.error(f"  [FAIL] {errors[-1]}")
+            else:
+                logger.warning(f"  [WARN] Unexpected error testing Storage API: {error_msg}")
+
         if errors:
             error_summary = "\n".join(f"  - {e}" for e in errors)
             raise PermissionError(
