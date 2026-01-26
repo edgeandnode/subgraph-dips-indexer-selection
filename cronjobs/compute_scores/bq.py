@@ -93,7 +93,8 @@ class BigQueryClient:
             logger.info("  [OK] Read access to internal_metrics.metrics_indexer_attempts")
         except Exception as e:
             error_msg = str(e)
-            if "permission" in error_msg.lower() or "403" in error_msg:
+            # Check for actual permission errors (403 or "Access Denied")
+            if "403" in error_msg or "access denied" in error_msg.lower():
                 errors.append(f"Cannot read internal_metrics.metrics_indexer_attempts: {error_msg}")
                 logger.error(f"  [FAIL] {errors[-1]}")
             else:
@@ -110,7 +111,8 @@ class BigQueryClient:
             logger.info("  [OK] Read access to production_metrics.prod_metrics_gateway_subgraph_queries")
         except Exception as e:
             error_msg = str(e)
-            if "permission" in error_msg.lower() or "403" in error_msg:
+            # Check for actual permission errors (403 or "Access Denied")
+            if "403" in error_msg or "access denied" in error_msg.lower():
                 errors.append(f"Cannot read production_metrics.prod_metrics_gateway_subgraph_queries: {error_msg}")
                 logger.error(f"  [FAIL] {errors[-1]}")
             else:
@@ -118,7 +120,7 @@ class BigQueryClient:
 
         # Test 3: Write to target dataset (create temp table and delete)
         logger.info("Validating permissions: testing write access to target dataset...")
-        test_table = f"{self.project}.{self.dataset}._permission_test"
+        test_table = f"{self.project}.{self.dataset}._write_access_test"
         try:
             create_query = f"""
             CREATE OR REPLACE TABLE `{test_table}` AS SELECT 1 as test_col
@@ -130,7 +132,8 @@ class BigQueryClient:
             logger.info(f"  [OK] Write access to {self.project}.{self.dataset}")
         except Exception as e:
             error_msg = str(e)
-            if "permission" in error_msg.lower() or "403" in error_msg:
+            # Check for actual permission errors (403 or "Access Denied")
+            if "403" in error_msg or "access denied" in error_msg.lower():
                 errors.append(f"Cannot write to {self.project}.{self.dataset}: {error_msg}")
                 logger.error(f"  [FAIL] {errors[-1]}")
             else:
@@ -150,7 +153,8 @@ class BigQueryClient:
                 logger.warning(f"  [WARN] Storage API test returned unexpected rows: {len(result)}")
         except Exception as e:
             error_msg = str(e)
-            if "permission" in error_msg.lower() or "403" in error_msg or "storage" in error_msg.lower():
+            # Check for actual permission errors (403 or "Access Denied")
+            if "403" in error_msg or "access denied" in error_msg.lower():
                 errors.append(f"Cannot use BigQuery Storage Read API: {error_msg}")
                 logger.error(f"  [FAIL] {errors[-1]}")
             else:
