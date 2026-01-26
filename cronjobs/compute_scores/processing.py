@@ -34,27 +34,42 @@ LATENCY_COEFFICIENT_STANDARD_ERROR_MULTIPLIER = 1.5
 REQUEST_STATUS_OK = "200 OK"
 REQUEST_STATUS_UNAVAILABLE_MISSING_BLOCK = "Unavailable(MissingBlock)"
 
-# GeoIP database path (DB-IP Lite City, bundled in Docker image)
-# IMPORTANT: Do not remove this attribution - required by DB-IP CC BY 4.0 license terms
-# Attribution: This product includes IP geolocation data created by DB-IP, available from https://db-ip.com
-GEOIP_DATABASE_PATH = os.environ.get("GEOIP_DATABASE_PATH", "/app/dbip-city-lite.mmdb")
+# GeoIP database paths (MaxMind GeoLite2, bundled in Docker image)
+# Attribution: This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com
+GEOIP_CITY_DATABASE_PATH = os.environ.get("GEOIP_CITY_DATABASE_PATH", "/app/GeoLite2-City.mmdb")
+GEOIP_ASN_DATABASE_PATH = os.environ.get("GEOIP_ASN_DATABASE_PATH", "/app/GeoLite2-ASN.mmdb")
 
-# Global GeoIP reader (lazy initialized)
-_geoip_reader: Optional[geoip2.database.Reader] = None
+# Global GeoIP readers (lazy initialized)
+_geoip_city_reader: Optional[geoip2.database.Reader] = None
+_geoip_asn_reader: Optional[geoip2.database.Reader] = None
 
 
-def get_geoip_reader() -> geoip2.database.Reader:
-    """Get or create the GeoIP database reader."""
-    global _geoip_reader
-    if _geoip_reader is None:
-        if not os.path.exists(GEOIP_DATABASE_PATH):
+def get_geoip_city_reader() -> geoip2.database.Reader:
+    """Get or create the GeoIP City database reader."""
+    global _geoip_city_reader
+    if _geoip_city_reader is None:
+        if not os.path.exists(GEOIP_CITY_DATABASE_PATH):
             raise FileNotFoundError(
-                f"GeoIP database not found at {GEOIP_DATABASE_PATH}. "
-                "Ensure the DB-IP database is bundled in the Docker image."
+                f"GeoIP City database not found at {GEOIP_CITY_DATABASE_PATH}. "
+                "Ensure GeoLite2-City.mmdb is bundled in the Docker image."
             )
-        _geoip_reader = geoip2.database.Reader(GEOIP_DATABASE_PATH)
-        logger.info(f"Loaded GeoIP database from {GEOIP_DATABASE_PATH}")
-    return _geoip_reader
+        _geoip_city_reader = geoip2.database.Reader(GEOIP_CITY_DATABASE_PATH)
+        logger.info(f"Loaded GeoIP City database from {GEOIP_CITY_DATABASE_PATH}")
+    return _geoip_city_reader
+
+
+def get_geoip_asn_reader() -> geoip2.database.Reader:
+    """Get or create the GeoIP ASN database reader."""
+    global _geoip_asn_reader
+    if _geoip_asn_reader is None:
+        if not os.path.exists(GEOIP_ASN_DATABASE_PATH):
+            raise FileNotFoundError(
+                f"GeoIP ASN database not found at {GEOIP_ASN_DATABASE_PATH}. "
+                "Ensure GeoLite2-ASN.mmdb is bundled in the Docker image."
+            )
+        _geoip_asn_reader = geoip2.database.Reader(GEOIP_ASN_DATABASE_PATH)
+        logger.info(f"Loaded GeoIP ASN database from {GEOIP_ASN_DATABASE_PATH}")
+    return _geoip_asn_reader
 
 # Iterative filter constants
 ITERATIVE_FILTER_MIN_DEPLOYMENT_INDEXERS = 2
@@ -336,7 +351,7 @@ def resolve_indexer_geoip(combined_queries: pd.DataFrame) -> pd.DataFrame:
     """
     Extract unique indexers from query data and resolve their GeoIP information.
 
-    Uses the bundled DB-IP Lite City database for offline lookups.
+    Uses bundled MaxMind GeoLite2 databases for offline lookups.
     """
     # Get unique indexer/url pairs
     unique_indexers = combined_queries[["indexer", "url"]].drop_duplicates()
@@ -376,7 +391,7 @@ def resolve_indexer_geoip(combined_queries: pd.DataFrame) -> pd.DataFrame:
 
 
 def resolve_url_geoip(url: str) -> dict:
-    """Resolve GeoIP information for a URL using local DB-IP database."""
+    """Resolve GeoIP information for a URL using local GeoLite2 databases."""
     try:
         parsed = urlparse(url)
         host = parsed.hostname
@@ -396,7 +411,7 @@ def resolve_url_geoip(url: str) -> dict:
         if is_private_ip(ip_addr):
             return _empty_geoip_result(ip_addr)
 
-        # Lookup in local DB-IP database
+        # Lookup in local GeoLite2 databases
         return lookup_geoip(ip_addr)
 
     except Exception as e:
@@ -421,17 +436,27 @@ def is_private_ip(ip_addr: str) -> bool:
 
 
 def lookup_geoip(ip_addr: str) -> dict:
-    """Look up GeoIP information from the local DB-IP database."""
+    """Look up GeoIP information from MaxMind GeoLite2 databases."""
     try:
-        reader = get_geoip_reader()
-        response = reader.city(ip_addr)
+        # Location from City database
+        city_reader = get_geoip_city_reader()
+        city_response = city_reader.city(ip_addr)
+
+        # Org from ASN database
+        org = None
+        try:
+            asn_reader = get_geoip_asn_reader()
+            asn_response = asn_reader.asn(ip_addr)
+            org = asn_response.autonomous_system_organization
+        except geoip2.errors.AddressNotFoundError:
+            pass  # IP not in ASN database
 
         return {
             "ip_addr": ip_addr,
-            "org": None,  # DB-IP City Lite doesn't include ASN/org info
-            "country": response.country.iso_code,
-            "latitude": response.location.latitude,
-            "longitude": response.location.longitude,
+            "org": org,
+            "country": city_response.country.iso_code,
+            "latitude": city_response.location.latitude,
+            "longitude": city_response.location.longitude,
         }
     except geoip2.errors.AddressNotFoundError:
         logger.debug(f"IP address not found in GeoIP database: {ip_addr}")
