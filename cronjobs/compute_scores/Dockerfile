@@ -22,13 +22,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Download DB-IP Lite City database (updated monthly)
-# IMPORTANT: Do not remove this attribution - required by DB-IP CC BY 4.0 license terms
-# Attribution: This product includes IP geolocation data created by DB-IP, available from https://db-ip.com
-ARG DBIP_DATE
-RUN DBIP_DATE=${DBIP_DATE:-$(date +%Y-%m)} && \
-    curl -fsSL "https://download.db-ip.com/free/dbip-city-lite-${DBIP_DATE}.mmdb.gz" | gunzip > /app/dbip-city-lite.mmdb && \
-    echo "Downloaded DB-IP database for ${DBIP_DATE}"
+# Download MaxMind GeoLite2 databases
+# Attribution: This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com
+ARG MAXMIND_LICENSE_KEY
+RUN if [ -n "$MAXMIND_LICENSE_KEY" ]; then \
+    curl -fsSL "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz" | \
+    tar -xzf - --strip-components=1 -C /app --wildcards "*/GeoLite2-City.mmdb" && \
+    echo "Downloaded GeoLite2-City database" && \
+    curl -fsSL "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-ASN&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz" | \
+    tar -xzf - --strip-components=1 -C /app --wildcards "*/GeoLite2-ASN.mmdb" && \
+    echo "Downloaded GeoLite2-ASN database"; \
+    else echo "Error: MAXMIND_LICENSE_KEY required" && exit 1; fi
 
 # Copy installed packages from builder
 COPY --from=builder /install /usr/local
@@ -37,7 +41,7 @@ COPY --from=builder /install /usr/local
 COPY *.py .
 
 # Run as non-root user
-RUN useradd -m appuser && chown appuser:appuser /app/dbip-city-lite.mmdb
+RUN useradd -m appuser && chown appuser:appuser /app/*.mmdb
 USER appuser
 
 # Entry point

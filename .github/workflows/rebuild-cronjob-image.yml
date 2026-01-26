@@ -9,7 +9,7 @@ on:
       - '.github/workflows/rebuild-cronjob-image.yml'
   schedule:
     # Run on the 1st of every month at 00:00 UTC
-    # DB-IP updates their database monthly
+    # MaxMind updates GeoLite2 databases weekly, but monthly rebuild is sufficient
     - cron: '0 0 1 * *'
   workflow_dispatch:
     # Allow manual trigger
@@ -34,29 +34,24 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Get current date for tagging
-        id: date
-        run: echo "date=$(date +%Y-%m)" >> $GITHUB_OUTPUT
-
       - name: Build Docker image
         run: |
           docker build \
-            --build-arg DBIP_DATE=${{ steps.date.outputs.date }} \
-            -t ${{ env.IMAGE_NAME }}:${{ steps.date.outputs.date }} \
+            --build-arg MAXMIND_LICENSE_KEY=${{ secrets.MAXMIND_LICENSE_KEY }} \
             -t ${{ env.IMAGE_NAME }}:latest \
             -f ${{ env.DOCKERFILE_PATH }} \
             cronjobs/compute_scores/
 
       - name: Push Docker image
         run: |
-          docker push ${{ env.IMAGE_NAME }}:${{ steps.date.outputs.date }}
           docker push ${{ env.IMAGE_NAME }}:latest
 
       - name: Summary
         run: |
           echo "## Docker Image Rebuilt" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image**: \`${{ env.IMAGE_NAME }}:${{ steps.date.outputs.date }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **DB-IP Database**: ${{ steps.date.outputs.date }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: \`${{ env.IMAGE_NAME }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **GeoLite2-City**: location lookups" >> $GITHUB_STEP_SUMMARY
+          echo "- **GeoLite2-ASN**: organization lookups" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "The image includes the latest DB-IP Lite City database for offline GeoIP resolution." >> $GITHUB_STEP_SUMMARY
+          echo "This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com" >> $GITHUB_STEP_SUMMARY
