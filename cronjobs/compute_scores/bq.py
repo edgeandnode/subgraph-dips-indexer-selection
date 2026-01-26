@@ -465,11 +465,17 @@ class BigQueryClient:
         memory_mb = scores_df.memory_usage(deep=True).sum() / (1024 * 1024)
         logger.info(f"Writing {len(scores_df)} scores ({memory_mb:.2f} MB) to {self.scores_table}")
 
-        # Ensure string columns maintain their dtype (defensive measure for schema stability)
+        # Ensure consistent dtypes for schema stability
         string_columns = ["org"]
         for col in string_columns:
             if col in scores_df.columns:
                 scores_df[col] = scores_df[col].astype("object")
+
+        # Ensure float columns are float64 (not int when all values happen to be whole numbers)
+        float_columns = ["dst_lat", "dst_lon"]
+        for col in float_columns:
+            if col in scores_df.columns:
+                scores_df[col] = scores_df[col].astype("float64")
 
         # Convert to bigframes and write
         bf_df = self._bpd.DataFrame(scores_df)
