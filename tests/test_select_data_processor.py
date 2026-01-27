@@ -1265,6 +1265,160 @@ class TestNormalizeMetrics:
         ].max()
 
 
+class TestTargetSize:
+    """Tests for variable target_size parameter in DataProcessor."""
+
+    @pytest.fixture
+    def sample_data_with_scores(self):
+        """Sample data with all required fields for DataProcessor."""
+        return pd.DataFrame(
+            {
+                "indexer": ["A", "B", "C", "D", "E"],
+                "deployment_hash": ["hash1"] * 5,
+                "destination_loc": ["loc1", "loc2", "loc3", "loc4", "loc5"],
+                "org": ["org1", "org2", "org3", "org4", "org5"],
+                "existing_dips_agreements": [0, 0, 0, 0, 0],
+                "weighted_score": [0.9, 0.8, 0.7, 0.6, 0.5],
+                "lat_lin_reg_coefficient": [0.1, 0.2, 0.3, 0.4, 0.5],
+                "uptime_score": [0.9, 0.8, 0.7, 0.6, 0.5],
+                "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3, 0.4, 0.5],
+                "success_rate": [0.95, 0.90, 0.85, 0.80, 0.75],
+                "avg_sync_duration": [100, 200, 300, 400, 500],
+                "indexing_agreement_acceptance_latency": [1, 2, 3, 4, 5],
+            }
+        )
+
+    def test_target_size_defaults_to_three(self, sample_data_with_scores):
+        """Default target_size is 3 for backwards compatibility."""
+        # Arrange & Act
+        with patch("iisa.indexer_selection.DataProcessor._process_data"):
+            processor = DataProcessor(
+                history=sample_data_with_scores,
+                deployment_id=DeploymentId("test_subgraph"),
+            )
+
+        # Assert
+        assert processor.target_size == 3
+
+    def test_target_size_custom_value(self, sample_data_with_scores):
+        """Custom target_size is stored correctly."""
+        # Arrange & Act
+        with patch("iisa.indexer_selection.DataProcessor._process_data"):
+            processor = DataProcessor(
+                history=sample_data_with_scores,
+                deployment_id=DeploymentId("test_subgraph"),
+                target_size=5,
+            )
+
+        # Assert
+        assert processor.target_size == 5
+
+    def test_target_size_one_selects_single_indexer(self, sample_data_with_scores):
+        """With target_size=1, only one indexer is selected."""
+        # Arrange & Act
+        processor = DataProcessor(
+            history=sample_data_with_scores,
+            deployment_id=DeploymentId("test_subgraph"),
+            target_size=1,
+        )
+
+        # Assert
+        assert len(processor.current_group) == 1
+
+    def test_target_size_five_selects_five_indexers(self, sample_data_with_scores):
+        """With target_size=5, five indexers are selected."""
+        # Arrange & Act
+        processor = DataProcessor(
+            history=sample_data_with_scores,
+            deployment_id=DeploymentId("test_subgraph"),
+            target_size=5,
+        )
+
+        # Assert
+        assert len(processor.current_group) == 5
+
+    def test_target_size_respects_available_indexers(self, sample_data_with_scores):
+        """target_size > available indexers returns all available."""
+        # Arrange & Act
+        processor = DataProcessor(
+            history=sample_data_with_scores,
+            deployment_id=DeploymentId("test_subgraph"),
+            target_size=10,  # More than available
+        )
+
+        # Assert - Should have at most 5 (all available indexers)
+        assert len(processor.current_group) <= 5
+
+    def test_target_size_removes_excess_indexers(self, sample_data_with_scores):
+        """Existing group larger than target_size gets trimmed."""
+        # Arrange & Act
+        processor = DataProcessor(
+            history=sample_data_with_scores,
+            deployment_id=DeploymentId("test_subgraph"),
+            existing_agreements={
+                DeploymentId("test_subgraph"): [
+                    IndexerId("A"),
+                    IndexerId("B"),
+                    IndexerId("C"),
+                    IndexerId("D"),
+                ]
+            },
+            target_size=2,
+        )
+
+        # Assert - Should have reduced to 2
+        assert len(processor.current_group) == 2
+
+    def test_target_size_adds_to_small_group(self, sample_data_with_scores):
+        """Existing group smaller than target_size gets expanded."""
+        # Arrange & Act
+        processor = DataProcessor(
+            history=sample_data_with_scores,
+            deployment_id=DeploymentId("test_subgraph"),
+            existing_agreements={
+                DeploymentId("test_subgraph"): [IndexerId("A")]
+            },
+            target_size=4,
+        )
+
+        # Assert - Should have expanded to 4
+        assert len(processor.current_group) == 4
+
+
+class TestDecentralizationBestEffort:
+    """Tests for best-effort decentralization behavior."""
+
+    def test_fallback_when_decentralization_not_possible(self):
+        """When no indexer meets decentralization, still return best candidate."""
+        # All indexers have the same org and location - decentralization impossible
+        data = pd.DataFrame(
+            {
+                "indexer": ["A", "B", "C"],
+                "deployment_hash": ["hash1"] * 3,
+                "destination_loc": ["loc1", "loc1", "loc1"],  # Same location
+                "org": ["org1", "org1", "org1"],  # Same org
+                "existing_dips_agreements": [0, 0, 0],
+                "weighted_score": [0.9, 0.8, 0.7],
+                "lat_lin_reg_coefficient": [0.1, 0.2, 0.3],
+                "uptime_score": [0.9, 0.8, 0.7],
+                "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3],
+                "success_rate": [0.95, 0.90, 0.85],
+                "avg_sync_duration": [100, 200, 300],
+                "indexing_agreement_acceptance_latency": [1, 2, 3],
+            }
+        )
+
+        # Arrange & Act
+        processor = DataProcessor(
+            history=data,
+            deployment_id=DeploymentId("test_subgraph"),
+            target_size=3,
+        )
+
+        # Assert - Should still select 3 indexers even though decentralization not met
+        assert len(processor.current_group) == 3
+
+
 class TestCalculateWeightedScore:
     @pytest.fixture
     def sample_weights(self):

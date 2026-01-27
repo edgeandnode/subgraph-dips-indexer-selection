@@ -90,10 +90,15 @@ class DataProcessor:
         declined_indexers: Optional[dict[DeploymentId, IndexerId]] = None,
         indexer_denylist: Optional[list[IndexerId]] = None,
         weights: Optional[WeightsDict] = None,
+        target_size: int = 3,
     ):
         """
         Initialize the DataProcessor class with data, deployment ID, existing agreements,
         and an indexer denylist.
+
+        Args:
+            target_size: The target number of indexers to assign to this deployment.
+                         Defaults to 3 for backwards compatibility.
         """
         # Initialize class variables with provided parameters
         self.data = pd.DataFrame(history)
@@ -103,6 +108,7 @@ class DataProcessor:
         self.declined_indexers = declined_indexers or {}
         self.indexer_denylist = indexer_denylist or []
         self.weights = {**DEFAULT_WEIGHTS, **(weights or {})}
+        self.target_size = target_size
 
         # Process the data, we can then call update_indexer_denylist_cancel_indexing_agreements,
         # or get_indexer_selections later after this constructor has finished running.
@@ -250,24 +256,24 @@ class DataProcessor:
         Use the methods _add_indexers_to_group and _replace_underperforming_indexers to
         assign indexers to the subgraph in question.
         """
-        # If the current indexer group has less than 3 indexers, call '_add_indexers_to_group'
-        if len(self.current_group) < 3:
+        # If the current indexer group has less than target_size indexers, call '_add_indexers_to_group'
+        if len(self.current_group) < self.target_size:
             self._add_indexers_to_group()
 
-        # If the current indexer group has more than 3 indexers, call '_remove_indexers_from_group'
-        if len(self.current_group) > 3:
+        # If the current indexer group has more than target_size indexers, call '_remove_indexers_from_group'
+        if len(self.current_group) > self.target_size:
             self._remove_indexers_from_group()
 
         # Otherwise, call '_replace_underperforming_indexers' which will search for a suitable replacement
-        if len(self.current_group) == 3:
+        if len(self.current_group) == self.target_size:
             self._replace_underperforming_indexers()
 
     def _add_indexers_to_group(self):
         """
         Add indexers to the group to meet the required number of indexers.
         """
-        # While the group has less than 3 indexers, select the best indexer to add using _find_best_replacement_or_select_best_indexer
-        while len(self.current_group) < 3:
+        # While the group has less than target_size indexers, select the best indexer to add
+        while len(self.current_group) < self.target_size:
             next_indexer = self._find_best_replacement_or_select_best_indexer()
 
             # Add the best indexer to the group
@@ -309,9 +315,9 @@ class DataProcessor:
 
     def _remove_indexers_from_group(self):
         """
-        Remove the worst indexers from the current group until the current group only has 3 indexers.
+        Remove the worst indexers from the current group until the current group only has target_size indexers.
         """
-        while len(self.current_group) > 3:
+        while len(self.current_group) > self.target_size:
             indexer_scores = []
             for indexer in self.current_group:
                 # Calculate each indexers score as if the indexer had 1 less indexing agreement
@@ -490,12 +496,17 @@ class DataProcessor:
         # Sort the candidates by weighted score, highest score first.
         candidates.sort_values(by="weighted_score", ascending=False, inplace=True)
 
-        # Iterate through the list of candidates, return the first (best) candidate that meets decentralization requirements
+        # Iterate through the list of candidates, prefer one that meets decentralization requirements
         for indexer in candidates["indexer"]:
             if self._meets_decentralization_requirements(indexer):
                 return indexer
 
-        return None
+        # Fallback: return best candidate even if it doesn't meet decentralization
+        # Decentralization is best-effort - if constraints cannot be met, still return an indexer
+        if not candidates.empty:
+            return candidates["indexer"].iloc[0]
+
+        return None  # Only when truly zero candidates available
 
     def _calculate_group_score(
         self, group, indexer_to_exclude=None, indexer_to_include=None

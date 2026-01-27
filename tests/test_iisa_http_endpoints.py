@@ -91,78 +91,79 @@ class TestSettings:
 class TestPydanticModels:
     """Tests for request/response model validation."""
 
-    def test_candidate_indexer_valid(self):
-        """Valid id and url fields."""
-        # Arrange & Act
-        from iisa.iisa_http_endpoints import CandidateIndexer
-
-        candidate = CandidateIndexer(id="0xABC123", url="https://indexer.example.com/")
-
-        # Assert
-        assert candidate.id == "0xABC123"
-        assert candidate.url == "https://indexer.example.com/"
-
-    def test_selection_request_all_optional(self):
-        """All fields optional except deployment_id."""
+    def test_selection_request_requires_num_candidates(self):
+        """num_candidates is required along with deployment_id."""
         # Arrange & Act
         from iisa.iisa_http_endpoints import SelectionRequest
 
-        request = SelectionRequest(deployment_id="Qm123")
+        request = SelectionRequest(deployment_id="Qm123", num_candidates=3)
 
         # Assert
         assert request.deployment_id == "Qm123"
-        assert request.candidates is None
+        assert request.num_candidates == 3
         assert request.existing_indexers is None
         assert request.pending_agreements is None
-        assert request.num_candidates is None
         assert request.blocklist is None
         assert request.declined_indexers is None
 
-    def test_selection_request_with_candidates(self):
-        """Verify candidates list serialization."""
+    def test_selection_request_with_all_fields(self):
+        """Verify all optional fields serialize correctly."""
         # Arrange & Act
-        from iisa.iisa_http_endpoints import CandidateIndexer, SelectionRequest
+        from iisa.iisa_http_endpoints import SelectionRequest
 
-        candidates = [
-            CandidateIndexer(id="0xABC", url="https://a.com/"),
-            CandidateIndexer(id="0xXYZ", url="https://b.com/"),
-        ]
         request = SelectionRequest(
             deployment_id="Qm123",
-            candidates=candidates,
             existing_indexers=["0x111"],
             num_candidates=2,
             blocklist=["0xBAD"],
+            pending_agreements={"Qm123": ["0xPEND"]},
+            declined_indexers={"Qm123": ["0xDEC"]},
         )
 
         # Assert
-        assert len(request.candidates) == 2
-        assert request.candidates[0].id == "0xABC"
         assert request.existing_indexers == ["0x111"]
+        assert request.num_candidates == 2
         assert request.blocklist == ["0xBAD"]
+        assert request.pending_agreements == {"Qm123": ["0xPEND"]}
+        assert request.declined_indexers == {"Qm123": ["0xDEC"]}
 
-    def test_single_selection_response(self):
-        """Optional indexer_id field."""
+    def test_selection_request_missing_num_candidates_raises(self):
+        """Verify ValidationError when num_candidates missing."""
+        # Arrange & Act & Assert
+        from pydantic import ValidationError as PydanticValidationError
+
+        from iisa.iisa_http_endpoints import SelectionRequest
+
+        with pytest.raises(PydanticValidationError) as exc_info:
+            SelectionRequest(deployment_id="Qm123")
+
+        assert "num_candidates" in str(exc_info.value)
+
+    def test_selection_response(self):
+        """deployment_id and indexers fields."""
         # Arrange & Act
-        from iisa.iisa_http_endpoints import SingleSelectionResponse
+        from iisa.iisa_http_endpoints import SelectionResponse
 
-        response_with_id = SingleSelectionResponse(indexer_id="0xABC")
-        response_without_id = SingleSelectionResponse()
+        response = SelectionResponse(
+            deployment_id="Qm123",
+            indexers=["0xABC", "0xXYZ", "0x123"],
+        )
 
         # Assert
-        assert response_with_id.indexer_id == "0xABC"
-        assert response_without_id.indexer_id is None
+        assert response.deployment_id == "Qm123"
+        assert response.indexers == ["0xABC", "0xXYZ", "0x123"]
+        assert len(response.indexers) == 3
 
-    def test_multi_selection_response(self):
-        """indexer_ids list field."""
+    def test_selection_response_empty_indexers(self):
+        """Verify empty indexers list is valid."""
         # Arrange & Act
-        from iisa.iisa_http_endpoints import MultiSelectionResponse
+        from iisa.iisa_http_endpoints import SelectionResponse
 
-        response = MultiSelectionResponse(indexer_ids=["0xABC", "0xXYZ", "0x123"])
+        response = SelectionResponse(deployment_id="Qm123", indexers=[])
 
         # Assert
-        assert response.indexer_ids == ["0xABC", "0xXYZ", "0x123"]
-        assert len(response.indexer_ids) == 3
+        assert response.deployment_id == "Qm123"
+        assert response.indexers == []
 
     def test_health_response(self):
         """status and data_loaded fields."""
@@ -504,21 +505,20 @@ class TestRefreshEndpoint:
         assert "Failed to refresh" in response.json()["detail"]
 
 
-class TestSelectOneEndpoint:
-    """Tests for POST /select-one endpoint."""
+class TestSelectIndexersEndpoint:
+    """Tests for POST /select-indexers endpoint."""
 
     @patch("iisa.iisa_http_endpoints.DataProcessor")
-    def test_select_one_intelligent_path(self, mock_processor_class, mock_history_df):
-        """With data loaded, mock DataProcessor, verify selection."""
+    def test_select_indexers_returns_deployment_id_and_indexers(
+        self, mock_processor_class, mock_history_df
+    ):
+        """With data loaded, mock DataProcessor, verify response structure."""
         # Arrange
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import app
 
         mock_processor = MagicMock()
-        mock_processor.get_indexer_selections.return_value = (
-            {"Qm123": ["0xABC"]},  # added
-            {},  # cancelled
-        )
+        mock_processor.current_group = ["0xABC", "0xXYZ", "0x123"]
         mock_processor_class.return_value = mock_processor
 
         iisa_http_endpoints._state._history = mock_history_df
@@ -528,22 +528,20 @@ class TestSelectOneEndpoint:
 
         # Act
         response = client.post(
-            "/select-one",
+            "/select-indexers",
             json={
                 "deployment_id": "Qm123",
-                "candidates": [
-                    {"id": "0xABC", "url": "https://a.com/"},
-                    {"id": "0xXYZ", "url": "https://b.com/"},
-                ],
+                "num_candidates": 3,
             },
         )
 
         # Assert
         assert response.status_code == 200
         data = response.json()
-        assert data["indexer_id"] == "0xABC"
+        assert data["deployment_id"] == "Qm123"
+        assert data["indexers"] == ["0xABC", "0xXYZ", "0x123"]
 
-    def test_select_one_no_data_returns_503(self):
+    def test_select_indexers_no_data_returns_503(self):
         """Without data loaded, verify 503 returned."""
         # Arrange
         from iisa import iisa_http_endpoints
@@ -556,13 +554,10 @@ class TestSelectOneEndpoint:
 
         # Act
         response = client.post(
-            "/select-one",
+            "/select-indexers",
             json={
                 "deployment_id": "Qm123",
-                "candidates": [
-                    {"id": "0xABC", "url": "https://a.com/"},
-                    {"id": "0xXYZ", "url": "https://b.com/"},
-                ],
+                "num_candidates": 3,
             },
         )
 
@@ -571,39 +566,7 @@ class TestSelectOneEndpoint:
         assert "IISA data not loaded" in response.json()["detail"]
 
     @patch("iisa.iisa_http_endpoints.DataProcessor")
-    def test_select_one_empty_result(self, mock_processor_class, mock_history_df):
-        """DataProcessor returns no selection, verify indexer_id=None."""
-        # Arrange
-        from iisa import iisa_http_endpoints
-        from iisa.iisa_http_endpoints import app
-
-        mock_processor = MagicMock()
-        mock_processor.get_indexer_selections.return_value = (
-            {},  # no added indexers
-            {},  # no cancelled
-        )
-        mock_processor_class.return_value = mock_processor
-
-        iisa_http_endpoints._state._history = mock_history_df
-        iisa_http_endpoints._state._initialized = True
-
-        client = TestClient(app, raise_server_exceptions=False)
-
-        # Act
-        response = client.post(
-            "/select-one",
-            json={
-                "deployment_id": "Qm123",
-            },
-        )
-
-        # Assert
-        assert response.status_code == 200
-        data = response.json()
-        assert data["indexer_id"] is None
-
-    @patch("iisa.iisa_http_endpoints.DataProcessor")
-    def test_select_one_processor_exception_returns_500(
+    def test_select_indexers_processor_exception_returns_500(
         self, mock_processor_class, mock_history_df
     ):
         """DataProcessor raises, verify 500 returned."""
@@ -620,9 +583,10 @@ class TestSelectOneEndpoint:
 
         # Act
         response = client.post(
-            "/select-one",
+            "/select-indexers",
             json={
                 "deployment_id": "Qm123",
+                "num_candidates": 3,
             },
         )
 
@@ -630,97 +594,8 @@ class TestSelectOneEndpoint:
         assert response.status_code == 500
         assert "Selection failed: Processing failed" in response.json()["detail"]
 
-
-class TestSelectManyEndpoint:
-    """Tests for POST /select-many endpoint."""
-
     @patch("iisa.iisa_http_endpoints.DataProcessor")
-    def test_select_many_intelligent_path(self, mock_processor_class, mock_history_df):
-        """With data loaded, mock DataProcessor, verify selections."""
-        # Arrange
-        from iisa import iisa_http_endpoints
-        from iisa.iisa_http_endpoints import app
-
-        mock_processor = MagicMock()
-        mock_processor.get_indexer_selections.return_value = (
-            {"Qm123": ["0xABC", "0xXYZ"]},  # added
-            {},  # cancelled
-        )
-        mock_processor_class.return_value = mock_processor
-
-        iisa_http_endpoints._state._history = mock_history_df
-        iisa_http_endpoints._state._initialized = True
-
-        client = TestClient(app, raise_server_exceptions=False)
-
-        # Act
-        response = client.post(
-            "/select-many",
-            json={
-                "deployment_id": "Qm123",
-                "candidates": [
-                    {"id": "0xABC", "url": "https://a.com/"},
-                    {"id": "0xXYZ", "url": "https://b.com/"},
-                    {"id": "0x123", "url": "https://c.com/"},
-                ],
-                "num_candidates": 2,
-            },
-        )
-
-        # Assert
-        assert response.status_code == 200
-        data = response.json()
-        assert data["indexer_ids"] == ["0xABC", "0xXYZ"]
-
-    def test_select_many_no_data_returns_503(self):
-        """Without data loaded, verify 503 returned."""
-        # Arrange
-        from iisa import iisa_http_endpoints
-        from iisa.iisa_http_endpoints import app
-
-        iisa_http_endpoints._state._history = None
-        iisa_http_endpoints._state._initialized = False
-
-        client = TestClient(app, raise_server_exceptions=False)
-
-        # Act
-        response = client.post(
-            "/select-many",
-            json={
-                "deployment_id": "Qm123",
-                "num_candidates": 2,
-            },
-        )
-
-        # Assert
-        assert response.status_code == 503
-        assert "IISA data not loaded" in response.json()["detail"]
-
-    def test_select_many_missing_num_candidates(self, mock_history_df):
-        """Verify 400 Bad Request when num_candidates missing."""
-        # Arrange
-        from iisa import iisa_http_endpoints
-        from iisa.iisa_http_endpoints import app
-
-        iisa_http_endpoints._state._history = mock_history_df
-        iisa_http_endpoints._state._initialized = True
-
-        client = TestClient(app, raise_server_exceptions=False)
-
-        # Act
-        response = client.post(
-            "/select-many",
-            json={
-                "deployment_id": "Qm123",
-            },
-        )
-
-        # Assert
-        assert response.status_code == 400
-        assert "num_candidates is required" in response.json()["detail"]
-
-    @patch("iisa.iisa_http_endpoints.DataProcessor")
-    def test_select_many_zero_num_candidates(self, mock_processor_class, mock_history_df):
+    def test_select_indexers_zero_num_candidates(self, mock_processor_class, mock_history_df):
         """Verify empty list returned when num_candidates is 0."""
         # Arrange
         from iisa import iisa_http_endpoints
@@ -733,7 +608,7 @@ class TestSelectManyEndpoint:
 
         # Act
         response = client.post(
-            "/select-many",
+            "/select-indexers",
             json={
                 "deployment_id": "Qm123",
                 "num_candidates": 0,
@@ -743,19 +618,20 @@ class TestSelectManyEndpoint:
         # Assert
         assert response.status_code == 200
         data = response.json()
-        assert data["indexer_ids"] == []
+        assert data["deployment_id"] == "Qm123"
+        assert data["indexers"] == []
         mock_processor_class.assert_not_called()
 
     @patch("iisa.iisa_http_endpoints.DataProcessor")
-    def test_select_many_processor_exception_returns_500(
-        self, mock_processor_class, mock_history_df
-    ):
-        """DataProcessor raises, verify 500 returned."""
+    def test_select_indexers_empty_result(self, mock_processor_class, mock_history_df):
+        """DataProcessor returns no selection, verify empty indexers list."""
         # Arrange
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import app
 
-        mock_processor_class.side_effect = Exception("Processing failed")
+        mock_processor = MagicMock()
+        mock_processor.current_group = []
+        mock_processor_class.return_value = mock_processor
 
         iisa_http_endpoints._state._history = mock_history_df
         iisa_http_endpoints._state._initialized = True
@@ -764,65 +640,102 @@ class TestSelectManyEndpoint:
 
         # Act
         response = client.post(
-            "/select-many",
+            "/select-indexers",
             json={
                 "deployment_id": "Qm123",
-                "num_candidates": 2,
+                "num_candidates": 3,
             },
         )
 
         # Assert
-        assert response.status_code == 500
-        assert "Selection failed: Processing failed" in response.json()["detail"]
+        assert response.status_code == 200
+        data = response.json()
+        assert data["deployment_id"] == "Qm123"
+        assert data["indexers"] == []
+
+    @patch("iisa.iisa_http_endpoints.DataProcessor")
+    def test_select_indexers_passes_target_size(self, mock_processor_class, mock_history_df):
+        """Verify num_candidates passed as target_size to DataProcessor."""
+        # Arrange
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        mock_processor = MagicMock()
+        mock_processor.current_group = ["0xABC"]
+        mock_processor_class.return_value = mock_processor
+
+        iisa_http_endpoints._state._history = mock_history_df
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Act
+        client.post(
+            "/select-indexers",
+            json={
+                "deployment_id": "Qm123",
+                "num_candidates": 5,
+            },
+        )
+
+        # Assert
+        call_kwargs = mock_processor_class.call_args[1]
+        assert call_kwargs["target_size"] == 5
 
 
 class TestSelectWithProcessor:
     """Tests for _select_with_processor helper."""
 
     @patch("iisa.iisa_http_endpoints.DataProcessor")
-    def test_select_with_processor_success(self, mock_processor_class, mock_history_df):
-        """Mock DataProcessor.get_indexer_selections(), verify result."""
+    def test_select_with_processor_returns_selection_response(
+        self, mock_processor_class, mock_history_df
+    ):
+        """Mock DataProcessor.current_group, verify SelectionResponse returned."""
         # Arrange
         from iisa import iisa_http_endpoints
-        from iisa.iisa_http_endpoints import SelectionRequest, _select_with_processor
+        from iisa.iisa_http_endpoints import (
+            SelectionRequest,
+            SelectionResponse,
+            _select_with_processor,
+        )
 
         mock_processor = MagicMock()
-        mock_processor.get_indexer_selections.return_value = (
-            {"Qm123": ["0xABC", "0xXYZ", "0x123"]},
-            {},
-        )
+        mock_processor.current_group = ["0xABC", "0xXYZ", "0x123"]
         mock_processor_class.return_value = mock_processor
 
         iisa_http_endpoints._state._history = mock_history_df
 
         request = SelectionRequest(
             deployment_id="Qm123",
-            candidates=[],
             existing_indexers=["0xEXIST"],
+            num_candidates=3,
         )
 
         # Act
-        result = _select_with_processor(request, num_to_select=2)
+        result = _select_with_processor(request)
 
         # Assert
-        assert result == ["0xABC", "0xXYZ"]
+        assert isinstance(result, SelectionResponse)
+        assert result.deployment_id == "Qm123"
+        assert result.indexers == ["0xABC", "0xXYZ", "0x123"]
         mock_processor_class.assert_called_once()
 
     def test_select_with_processor_no_history(self):
-        """_state.history=None, verify empty list."""
+        """_state.history=None, verify empty SelectionResponse."""
         # Arrange
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import SelectionRequest, _select_with_processor
 
         iisa_http_endpoints._state._history = None
 
-        request = SelectionRequest(deployment_id="Qm123")
+        request = SelectionRequest(deployment_id="Qm123", num_candidates=3)
 
         # Act
-        result = _select_with_processor(request, num_to_select=2)
+        result = _select_with_processor(request)
 
         # Assert
-        assert result == []
+        assert result.deployment_id == "Qm123"
+        assert result.indexers == []
 
     @patch("iisa.iisa_http_endpoints.DataProcessor")
     def test_select_with_processor_maps_blocklist(
@@ -834,7 +747,7 @@ class TestSelectWithProcessor:
         from iisa.iisa_http_endpoints import SelectionRequest, _select_with_processor
 
         mock_processor = MagicMock()
-        mock_processor.get_indexer_selections.return_value = ({"Qm123": []}, {})
+        mock_processor.current_group = []
         mock_processor_class.return_value = mock_processor
 
         iisa_http_endpoints._state._history = mock_history_df
@@ -842,10 +755,11 @@ class TestSelectWithProcessor:
         request = SelectionRequest(
             deployment_id="Qm123",
             blocklist=["0xBAD1", "0xBAD2"],
+            num_candidates=3,
         )
 
         # Act
-        _select_with_processor(request, num_to_select=1)
+        _select_with_processor(request)
 
         # Assert
         call_kwargs = mock_processor_class.call_args[1]
@@ -861,7 +775,7 @@ class TestSelectWithProcessor:
         from iisa.iisa_http_endpoints import SelectionRequest, _select_with_processor
 
         mock_processor = MagicMock()
-        mock_processor.get_indexer_selections.return_value = ({"Qm123": []}, {})
+        mock_processor.current_group = []
         mock_processor_class.return_value = mock_processor
 
         iisa_http_endpoints._state._history = mock_history_df
@@ -869,10 +783,11 @@ class TestSelectWithProcessor:
         request = SelectionRequest(
             deployment_id="Qm123",
             existing_indexers=["0xEXIST1", "0xEXIST2"],
+            num_candidates=3,
         )
 
         # Act
-        _select_with_processor(request, num_to_select=1)
+        _select_with_processor(request)
 
         # Assert
         call_kwargs = mock_processor_class.call_args[1]
@@ -888,7 +803,7 @@ class TestSelectWithProcessor:
         from iisa.iisa_http_endpoints import SelectionRequest, _select_with_processor
 
         mock_processor = MagicMock()
-        mock_processor.get_indexer_selections.return_value = ({"Qm123": []}, {})
+        mock_processor.current_group = []
         mock_processor_class.return_value = mock_processor
 
         iisa_http_endpoints._state._history = mock_history_df
@@ -897,10 +812,11 @@ class TestSelectWithProcessor:
         request = SelectionRequest(
             deployment_id="Qm123",
             pending_agreements=pending,
+            num_candidates=3,
         )
 
         # Act
-        _select_with_processor(request, num_to_select=1)
+        _select_with_processor(request)
 
         # Assert
         call_kwargs = mock_processor_class.call_args[1]
@@ -916,7 +832,7 @@ class TestSelectWithProcessor:
         from iisa.iisa_http_endpoints import SelectionRequest, _select_with_processor
 
         mock_processor = MagicMock()
-        mock_processor.get_indexer_selections.return_value = ({"Qm123": []}, {})
+        mock_processor.current_group = []
         mock_processor_class.return_value = mock_processor
 
         iisa_http_endpoints._state._history = mock_history_df
@@ -925,11 +841,39 @@ class TestSelectWithProcessor:
         request = SelectionRequest(
             deployment_id="Qm123",
             declined_indexers=declined,
+            num_candidates=3,
         )
 
         # Act
-        _select_with_processor(request, num_to_select=1)
+        _select_with_processor(request)
 
         # Assert
         call_kwargs = mock_processor_class.call_args[1]
         assert call_kwargs["declined_indexers"] == declined
+
+    @patch("iisa.iisa_http_endpoints.DataProcessor")
+    def test_select_with_processor_passes_target_size(
+        self, mock_processor_class, mock_history_df
+    ):
+        """Verify num_candidates passed as target_size to DataProcessor."""
+        # Arrange
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import SelectionRequest, _select_with_processor
+
+        mock_processor = MagicMock()
+        mock_processor.current_group = []
+        mock_processor_class.return_value = mock_processor
+
+        iisa_http_endpoints._state._history = mock_history_df
+
+        request = SelectionRequest(
+            deployment_id="Qm123",
+            num_candidates=5,
+        )
+
+        # Act
+        _select_with_processor(request)
+
+        # Assert
+        call_kwargs = mock_processor_class.call_args[1]
+        assert call_kwargs["target_size"] == 5
