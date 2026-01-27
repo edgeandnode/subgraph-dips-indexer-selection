@@ -1197,6 +1197,73 @@ class TestNormalizeMetrics:
         # Check that other values are ordered correctly
         assert results[0] > results[1] > results[4], "values not ordered correctly"
 
+    def test_optimistic_na_handling_latency(self):
+        """Test that NA values in latency get optimistic score (filled with 0 = best)."""
+        latencies = pd.Series([pd.NA, 1, 2, pd.NA, 4])
+        results = _normalize_indexing_agreement_acceptance_latency(latencies)
+
+        assert len(results) == 5
+        assert all(0 <= r <= 1 for r in results)
+        # NA values should get highest score (filled with 0 latency)
+        assert results.iloc[0] == results.max()
+        assert results.iloc[3] == results.max()
+
+    def test_all_na_latency(self):
+        """Test that all-NA latency column gets optimistic score 1.0."""
+        df = pd.DataFrame(
+            {
+                "indexing_agreement_acceptance_latency": [pd.NA, pd.NA, pd.NA],
+                "Latency Coefficient + Error Confidence Interval": [1, 2, 3],
+                "% up_x": [99, 100, 98],
+                "existing_dips_agreements": [1, 2, 3],
+                "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3],
+                "average_status": [99, 100, 98],
+                "avg_sync_duration": [100, 200, 300],
+            }
+        )
+        result = _normalize_metrics(df)
+        # All-NA column should result in optimistic score of 1.0
+        assert (result["norm_indexing_agreement_acceptance_latency"] == 1.0).all()
+
+    def test_all_na_avg_sync_duration(self):
+        """Test that all-NA avg_sync_duration column gets optimistic score 1.0."""
+        df = pd.DataFrame(
+            {
+                "avg_sync_duration": [pd.NA, pd.NA, pd.NA],
+                "Latency Coefficient + Error Confidence Interval": [1, 2, 3],
+                "% up_x": [99, 100, 98],
+                "existing_dips_agreements": [1, 2, 3],
+                "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3],
+                "average_status": [99, 100, 98],
+                "indexing_agreement_acceptance_latency": [0, 1, 2],
+            }
+        )
+        result = _normalize_metrics(df)
+        # All-NA column should result in optimistic score of 1.0
+        assert (result["norm_avg_sync_duration"] == 1.0).all()
+
+    def test_partial_na_avg_sync_duration(self):
+        """Test that partial NA values in avg_sync_duration get filled with 0 (best)."""
+        df = pd.DataFrame(
+            {
+                "avg_sync_duration": [pd.NA, 100, 200, pd.NA, 300],
+                "Latency Coefficient + Error Confidence Interval": [1, 2, 3, 4, 5],
+                "% up_x": [99, 100, 98, 97, 96],
+                "existing_dips_agreements": [1, 2, 3, 4, 5],
+                "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3, 0.4, 0.5],
+                "average_status": [99, 100, 98, 97, 96],
+                "indexing_agreement_acceptance_latency": [0, 1, 2, 3, 4],
+            }
+        )
+        result = _normalize_metrics(df)
+        # NA values (filled with 0) should get the highest score
+        assert result["norm_avg_sync_duration"].iloc[0] == result[
+            "norm_avg_sync_duration"
+        ].max()
+        assert result["norm_avg_sync_duration"].iloc[3] == result[
+            "norm_avg_sync_duration"
+        ].max()
+
 
 class TestCalculateWeightedScore:
     @pytest.fixture
