@@ -543,17 +543,11 @@ class TestSelectOneEndpoint:
         data = response.json()
         assert data["indexer_id"] == "0xABC"
 
-    @patch("iisa.iisa_http_endpoints.random")
-    def test_select_one_fallback_random(self, mock_random):
-        """Without data, verify random.choice called."""
+    def test_select_one_no_data_returns_503(self):
+        """Without data loaded, verify 503 returned."""
         # Arrange
         from iisa import iisa_http_endpoints
-        from iisa.iisa_http_endpoints import CandidateIndexer, app
-
-        # Create a mock candidate that will be returned by random.choice
-        mock_candidate = MagicMock()
-        mock_candidate.id = "0xXYZ"
-        mock_random.choice.return_value = mock_candidate
+        from iisa.iisa_http_endpoints import app
 
         iisa_http_endpoints._state._history = None
         iisa_http_endpoints._state._initialized = False
@@ -573,47 +567,22 @@ class TestSelectOneEndpoint:
         )
 
         # Assert
-        assert response.status_code == 200
-        data = response.json()
-        assert data["indexer_id"] == "0xXYZ"
-        mock_random.choice.assert_called_once()
-
-    def test_select_one_empty_candidates(self):
-        """Empty candidates list, verify indexer_id=None."""
-        # Arrange
-        from iisa.iisa_http_endpoints import app
-
-        client = TestClient(app, raise_server_exceptions=False)
-
-        # Act
-        response = client.post(
-            "/select-one",
-            json={
-                "deployment_id": "Qm123",
-                "candidates": [],
-            },
-        )
-
-        # Assert
-        assert response.status_code == 200
-        data = response.json()
-        assert data["indexer_id"] is None
+        assert response.status_code == 503
+        assert "IISA data not loaded" in response.json()["detail"]
 
     @patch("iisa.iisa_http_endpoints.DataProcessor")
-    @patch("iisa.iisa_http_endpoints.random")
-    def test_select_one_processor_exception(
-        self, mock_random, mock_processor_class, mock_history_df
-    ):
-        """DataProcessor raises, verify fallback to random."""
+    def test_select_one_empty_result(self, mock_processor_class, mock_history_df):
+        """DataProcessor returns no selection, verify indexer_id=None."""
         # Arrange
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import app
 
-        mock_processor_class.side_effect = Exception("Processing failed")
-
-        mock_candidate = MagicMock()
-        mock_candidate.id = "0xFALLBACK"
-        mock_random.choice.return_value = mock_candidate
+        mock_processor = MagicMock()
+        mock_processor.get_indexer_selections.return_value = (
+            {},  # no added indexers
+            {},  # no cancelled
+        )
+        mock_processor_class.return_value = mock_processor
 
         iisa_http_endpoints._state._history = mock_history_df
         iisa_http_endpoints._state._initialized = True
@@ -625,17 +594,41 @@ class TestSelectOneEndpoint:
             "/select-one",
             json={
                 "deployment_id": "Qm123",
-                "candidates": [
-                    {"id": "0xABC", "url": "https://a.com/"},
-                ],
             },
         )
 
         # Assert
         assert response.status_code == 200
         data = response.json()
-        assert data["indexer_id"] == "0xFALLBACK"
-        mock_random.choice.assert_called_once()
+        assert data["indexer_id"] is None
+
+    @patch("iisa.iisa_http_endpoints.DataProcessor")
+    def test_select_one_processor_exception_returns_500(
+        self, mock_processor_class, mock_history_df
+    ):
+        """DataProcessor raises, verify 500 returned."""
+        # Arrange
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        mock_processor_class.side_effect = Exception("Processing failed")
+
+        iisa_http_endpoints._state._history = mock_history_df
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Act
+        response = client.post(
+            "/select-one",
+            json={
+                "deployment_id": "Qm123",
+            },
+        )
+
+        # Assert
+        assert response.status_code == 500
+        assert "Selection failed: Processing failed" in response.json()["detail"]
 
 
 class TestSelectManyEndpoint:
@@ -679,15 +672,11 @@ class TestSelectManyEndpoint:
         data = response.json()
         assert data["indexer_ids"] == ["0xABC", "0xXYZ"]
 
-    @patch("iisa.iisa_http_endpoints.random")
-    def test_select_many_fallback_random(self, mock_random):
-        """Without data, verify random.sample called."""
+    def test_select_many_no_data_returns_503(self):
+        """Without data loaded, verify 503 returned."""
         # Arrange
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import app
-
-        mock_candidates = [MagicMock(id="0xABC"), MagicMock(id="0xXYZ")]
-        mock_random.sample.return_value = mock_candidates
 
         iisa_http_endpoints._state._history = None
         iisa_http_endpoints._state._initialized = False
@@ -699,114 +688,19 @@ class TestSelectManyEndpoint:
             "/select-many",
             json={
                 "deployment_id": "Qm123",
-                "candidates": [
-                    {"id": "0xABC", "url": "https://a.com/"},
-                    {"id": "0xXYZ", "url": "https://b.com/"},
-                    {"id": "0x123", "url": "https://c.com/"},
-                ],
                 "num_candidates": 2,
             },
         )
 
         # Assert
-        assert response.status_code == 200
-        data = response.json()
-        assert data["indexer_ids"] == ["0xABC", "0xXYZ"]
-        mock_random.sample.assert_called_once()
+        assert response.status_code == 503
+        assert "IISA data not loaded" in response.json()["detail"]
 
-    def test_select_many_missing_num_candidates(self):
-        """Verify 400 Bad Request."""
-        # Arrange
-        from iisa.iisa_http_endpoints import app
-
-        client = TestClient(app, raise_server_exceptions=False)
-
-        # Act
-        response = client.post(
-            "/select-many",
-            json={
-                "deployment_id": "Qm123",
-                "candidates": [
-                    {"id": "0xABC", "url": "https://a.com/"},
-                ],
-            },
-        )
-
-        # Assert
-        assert response.status_code == 400
-        assert "num_candidates is required" in response.json()["detail"]
-
-    def test_select_many_empty_candidates(self):
-        """Verify empty list returned."""
-        # Arrange
-        from iisa.iisa_http_endpoints import app
-
-        client = TestClient(app, raise_server_exceptions=False)
-
-        # Act
-        response = client.post(
-            "/select-many",
-            json={
-                "deployment_id": "Qm123",
-                "candidates": [],
-                "num_candidates": 2,
-            },
-        )
-
-        # Assert
-        assert response.status_code == 200
-        data = response.json()
-        assert data["indexer_ids"] == []
-
-    @patch("iisa.iisa_http_endpoints.random")
-    def test_select_many_num_exceeds_candidates(self, mock_random):
-        """Verify returns min(num, len(candidates))."""
+    def test_select_many_missing_num_candidates(self, mock_history_df):
+        """Verify 400 Bad Request when num_candidates missing."""
         # Arrange
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import app
-
-        # Return only 2 candidates when asked for more
-        mock_candidates = [MagicMock(id="0xABC"), MagicMock(id="0xXYZ")]
-        mock_random.sample.return_value = mock_candidates
-
-        iisa_http_endpoints._state._history = None
-        iisa_http_endpoints._state._initialized = False
-
-        client = TestClient(app, raise_server_exceptions=False)
-
-        # Act
-        response = client.post(
-            "/select-many",
-            json={
-                "deployment_id": "Qm123",
-                "candidates": [
-                    {"id": "0xABC", "url": "https://a.com/"},
-                    {"id": "0xXYZ", "url": "https://b.com/"},
-                ],
-                "num_candidates": 10,  # More than available
-            },
-        )
-
-        # Assert
-        assert response.status_code == 200
-        # random.sample should be called with k=2 (min of 10 and 2)
-        call_args = mock_random.sample.call_args
-        assert call_args[0][1] == 2  # k parameter
-
-    @patch("iisa.iisa_http_endpoints.DataProcessor")
-    @patch("iisa.iisa_http_endpoints.random")
-    def test_select_many_processor_exception(
-        self, mock_random, mock_processor_class, mock_history_df
-    ):
-        """DataProcessor raises, verify fallback to random."""
-        # Arrange
-        from iisa import iisa_http_endpoints
-        from iisa.iisa_http_endpoints import app
-
-        mock_processor_class.side_effect = Exception("Processing failed")
-
-        mock_candidates = [MagicMock(id="0xFALL1"), MagicMock(id="0xFALL2")]
-        mock_random.sample.return_value = mock_candidates
 
         iisa_http_endpoints._state._history = mock_history_df
         iisa_http_endpoints._state._initialized = True
@@ -818,19 +712,68 @@ class TestSelectManyEndpoint:
             "/select-many",
             json={
                 "deployment_id": "Qm123",
-                "candidates": [
-                    {"id": "0xABC", "url": "https://a.com/"},
-                    {"id": "0xXYZ", "url": "https://b.com/"},
-                ],
-                "num_candidates": 2,
+            },
+        )
+
+        # Assert
+        assert response.status_code == 400
+        assert "num_candidates is required" in response.json()["detail"]
+
+    @patch("iisa.iisa_http_endpoints.DataProcessor")
+    def test_select_many_zero_num_candidates(self, mock_processor_class, mock_history_df):
+        """Verify empty list returned when num_candidates is 0."""
+        # Arrange
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        iisa_http_endpoints._state._history = mock_history_df
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Act
+        response = client.post(
+            "/select-many",
+            json={
+                "deployment_id": "Qm123",
+                "num_candidates": 0,
             },
         )
 
         # Assert
         assert response.status_code == 200
         data = response.json()
-        assert data["indexer_ids"] == ["0xFALL1", "0xFALL2"]
-        mock_random.sample.assert_called_once()
+        assert data["indexer_ids"] == []
+        mock_processor_class.assert_not_called()
+
+    @patch("iisa.iisa_http_endpoints.DataProcessor")
+    def test_select_many_processor_exception_returns_500(
+        self, mock_processor_class, mock_history_df
+    ):
+        """DataProcessor raises, verify 500 returned."""
+        # Arrange
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        mock_processor_class.side_effect = Exception("Processing failed")
+
+        iisa_http_endpoints._state._history = mock_history_df
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Act
+        response = client.post(
+            "/select-many",
+            json={
+                "deployment_id": "Qm123",
+                "num_candidates": 2,
+            },
+        )
+
+        # Assert
+        assert response.status_code == 500
+        assert "Selection failed: Processing failed" in response.json()["detail"]
 
 
 class TestSelectWithProcessor:

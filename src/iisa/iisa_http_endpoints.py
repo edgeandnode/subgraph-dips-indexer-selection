@@ -12,7 +12,6 @@ Endpoints:
 """
 
 import logging
-import random
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Optional
@@ -255,17 +254,18 @@ async def lifespan(app: FastAPI):
     logger.info(f"GCP Project: {settings.gcp_project}")
     logger.info(f"GCP Location: {settings.gcp_location}")
 
-    # Initialize providers
-    if _state.initialize(settings):
-        # Try to fetch initial data (this can take several minutes)
-        # For now, we skip the initial fetch to allow fast startup
-        # Data can be refreshed via a separate endpoint or background task
-        logger.info(
-            "IISA initialized. Call /refresh to load data from BigQuery, "
-            "or service will use random selection until data is loaded."
-        )
-    else:
-        logger.warning("IISA initialization failed. Using random selection fallback.")
+    # Initialize providers and load data
+    if not _state.initialize(settings):
+        logger.error("IISA initialization failed - cannot start service")
+        raise RuntimeError("Failed to initialize IISA providers")
+
+    # Load data on startup - service won't accept requests until ready
+    logger.info("Loading indexer scores from BigQuery...")
+    if not _state.refresh_data():
+        logger.error("Failed to load indexer scores - cannot start service")
+        raise RuntimeError("Failed to load indexer scores from BigQuery")
+
+    logger.info("IISA service ready")
 
     yield
 
@@ -324,72 +324,45 @@ async def refresh_data():
 @app.post("/select-one", response_model=SingleSelectionResponse)
 async def select_one(request: SelectionRequest) -> SingleSelectionResponse:
     """
-    Select a single indexer for a deployment.
-
-    If IISA data is loaded, uses the weighted scoring algorithm.
-    Otherwise, falls back to random selection.
+    Select a single indexer for a deployment using weighted scoring algorithm.
     """
-    candidates = request.candidates or []
+    if not _state.is_ready or _state.history is None:
+        raise HTTPException(status_code=503, detail="IISA data not loaded")
 
-    if not candidates:
-        logger.warning(f"No candidates provided for deployment {request.deployment_id}")
-        return SingleSelectionResponse(indexer_id=None)
-
-    # If IISA data is ready, use DataProcessor for intelligent selection
-    if _state.is_ready and _state.history is not None:
-        try:
-            selected = _select_with_processor(request, num_to_select=1)
-            indexer_id = selected[0] if selected else None
-            logger.info(f"Selected indexer {indexer_id} for deployment {request.deployment_id}")
-            return SingleSelectionResponse(indexer_id=indexer_id)
-        except Exception:
-            logger.exception(f"DataProcessor selection failed for deployment {request.deployment_id}")
-
-    # Fallback: random selection (extract ID from CandidateIndexer)
-    if not _state.is_ready:
-        logger.warning(f"No IISA data loaded, using random selection for deployment {request.deployment_id}")
-    selected = random.choice(candidates)
-    logger.info(f"Random selection: indexer {selected.id} for deployment {request.deployment_id}")
-    return SingleSelectionResponse(indexer_id=selected.id)
+    try:
+        selected = _select_with_processor(request, num_to_select=1)
+        indexer_id = selected[0] if selected else None
+        logger.info(f"Selected indexer {indexer_id} for deployment {request.deployment_id}")
+        return SingleSelectionResponse(indexer_id=indexer_id)
+    except Exception as e:
+        logger.exception(f"Selection failed for deployment {request.deployment_id}")
+        raise HTTPException(status_code=500, detail=f"Selection failed: {e}")
 
 
 @app.post("/select-many", response_model=MultiSelectionResponse)
 async def select_many(request: SelectionRequest) -> MultiSelectionResponse:
     """
-    Select multiple indexers for a deployment.
-
-    If IISA data is loaded, uses the weighted scoring algorithm.
-    Otherwise, falls back to random selection.
+    Select multiple indexers for a deployment using weighted scoring algorithm.
     """
+    if not _state.is_ready or _state.history is None:
+        raise HTTPException(status_code=503, detail="IISA data not loaded")
+
     if request.num_candidates is None:
         raise HTTPException(
             status_code=400,
             detail="num_candidates is required for select-many",
         )
 
-    candidates = request.candidates or []
-
-    if not candidates or request.num_candidates <= 0:
-        logger.warning(f"No candidates or num_candidates<=0 for deployment {request.deployment_id}")
+    if request.num_candidates <= 0:
         return MultiSelectionResponse(indexer_ids=[])
 
-    # If IISA data is ready, use DataProcessor for intelligent selection
-    if _state.is_ready and _state.history is not None:
-        try:
-            selected = _select_with_processor(request, num_to_select=request.num_candidates)
-            logger.info(f"Selected {len(selected)} indexers for deployment {request.deployment_id}: {selected}")
-            return MultiSelectionResponse(indexer_ids=selected)
-        except Exception:
-            logger.exception(f"DataProcessor selection failed for deployment {request.deployment_id}")
-
-    # Fallback: random selection (extract IDs from CandidateIndexer objects)
-    if not _state.is_ready:
-        logger.warning(f"No IISA data loaded, using random selection for deployment {request.deployment_id}")
-    k = min(request.num_candidates, len(candidates))
-    selected = random.sample(candidates, k)
-    selected_ids = [c.id for c in selected]
-    logger.info(f"Random selection: {len(selected_ids)} indexers for deployment {request.deployment_id}: {selected_ids}")
-    return MultiSelectionResponse(indexer_ids=selected_ids)
+    try:
+        selected = _select_with_processor(request, num_to_select=request.num_candidates)
+        logger.info(f"Selected {len(selected)} indexers for deployment {request.deployment_id}: {selected}")
+        return MultiSelectionResponse(indexer_ids=selected)
+    except Exception as e:
+        logger.exception(f"Selection failed for deployment {request.deployment_id}")
+        raise HTTPException(status_code=500, detail=f"Selection failed: {e}")
 
 
 def _select_with_processor(request: SelectionRequest, num_to_select: int) -> list[str]:
