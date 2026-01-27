@@ -567,7 +567,9 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
     Note:
     - Each metric is normalized to a scale of 0 to 1, where 1 represents better performance.
     - Some metrics are inverted (1 - normalized value) if lower values are better (e.g., latency).
-    - The function handles missing data by assigning a neutral score of 0.5 to NaN values.
+    - Missing data uses optimistic initialization: NA values in time-based metrics
+      (avg_sync_duration, indexing_agreement_acceptance_latency) are filled with 0,
+      giving new indexers the best possible score to encourage exploration.
     - Different normalization techniques are used based on the nature of each metric:
         - Generic min-max normalization for most metrics
         - Special normalization for uptime and success rate to emphasize high performance
@@ -650,6 +652,10 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
     # Use pre-computed if available, otherwise compute
     if "norm_avg_sync_duration" not in merged.columns:
         if "avg_sync_duration" in merged.columns:
+            # Fill NA with 0 (optimistic: best sync duration) before normalization
+            merged["avg_sync_duration"] = pd.to_numeric(
+                merged["avg_sync_duration"], errors="coerce"
+            ).fillna(0.0)
             merged["norm_avg_sync_duration"] = 1 - _normalize_generic(
                 merged["avg_sync_duration"]
             )  # lower is better
@@ -664,7 +670,7 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
                 _normalize_indexing_agreement_acceptance_latency(
                     merged["indexing_agreement_acceptance_latency"]
                 )
-            )  # lower is better
+            )  # lower is better (NA filled with 0 = optimistic)
         else:
             merged["norm_indexing_agreement_acceptance_latency"] = np.nan
 
@@ -786,6 +792,9 @@ def _normalize_indexing_agreement_acceptance_latency(
         """
         return np.where(x <= x0, logistic(x), logistic(x0) + m * (x - x0))
 
+    # Fill NA with optimistic value (0 = fastest = best score)
+    latency_series = pd.to_numeric(latency_series, errors="coerce").fillna(0.0)
+
     # Replace negative values with 0 (as negative latency doesn't make sense)
     latency_series = latency_series.clip(lower=0)
 
@@ -796,8 +805,8 @@ def _normalize_indexing_agreement_acceptance_latency(
     # Apply the piecewise function to normalize acceptance latency
     normalized = pd.Series(piecewise_function(clipped_latency)).round(3)
 
-    # Handle NaN's
-    normalized = normalized.fillna(0)
+    # Handle any remaining NaN's with optimistic score
+    normalized = normalized.fillna(1.0)
 
     return normalized
 
