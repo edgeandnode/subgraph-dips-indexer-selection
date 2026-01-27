@@ -33,9 +33,13 @@ logger = logging.getLogger(__name__)
 
 NON_ZERO_UPTIME_SUCCESS_RATE_SCORE_THRESHOLD = 0.97
 
-# Minimum absolute improvement in group score required to replace an existing indexer.
-# A group with score >= (1.0 - REPLACEMENT_SCORE_THRESHOLD) effectively cannot be improved.
-REPLACEMENT_SCORE_THRESHOLD = 0.15
+# Indexers scoring below this threshold are candidates for replacement.
+# They will only be replaced if a significantly better candidate is available.
+MIN_INDEXER_SCORE = 0.15
+
+# Minimum score improvement required to justify replacing an underperforming indexer.
+# Candidate must score at least (current_score + REPLACEMENT_MARGIN) to replace.
+REPLACEMENT_MARGIN = 0.50
 
 
 class WeightsDict(TypedDict, total=False):
@@ -408,31 +412,41 @@ class DataProcessor:
 
     def _replace_underperforming_indexers(self):
         """
-        Replace underperforming indexers iteratively until the group is stable.
+        Replace indexers scoring below MIN_INDEXER_SCORE when a significantly better
+        candidate is available.
 
-        Continues replacing indexers as long as each replacement improves the group
-        score by at least REPLACEMENT_SCORE_THRESHOLD (absolute points). This allows
-        poorly performing groups to improve faster while high-quality groups (scoring
-        above 1.0 - REPLACEMENT_SCORE_THRESHOLD) remain stable.
+        Only considers indexers with weighted_score < MIN_INDEXER_SCORE for replacement.
+        A replacement occurs only if the candidate scores at least REPLACEMENT_MARGIN
+        higher than the current indexer (e.g., current=0.10, candidate must be >0.60).
 
-        Newly added indexers are not eligible for replacement in the same call since
-        they were just selected as the best available candidates. This prevents
-        thrashing and ensures each replacement is meaningful.
+        This approach:
+        - Keeps indexers performing adequately (>= MIN_INDEXER_SCORE) stable
+        - Only replaces poor performers when there's a meaningfully better option
+        - Avoids churn from marginal improvements
+        - Never leaves gaps (keeps bad indexer if no good replacement exists)
 
-        The iteration naturally stops when:
-        - No remaining swap meets the improvement threshold, or
-        - No candidates are available (all blocked, pending, declined, etc.)
+        Iterates until no more beneficial replacements are found.
         """
         # Track indexers added in this call - don't replace them
         added_this_call: set[IndexerId] = set()
 
         while True:
-            best_swap: Optional[tuple[IndexerId, IndexerId]] = None
-            best_improvement = 0.0
+            best_swap: Optional[tuple[IndexerId, IndexerId, float]] = None
 
             for existing_indexer in self.current_group:
                 # Don't replace indexers we just added in this call
                 if existing_indexer in added_this_call:
+                    continue
+
+                # Get current indexer's score
+                indexer_data = self.data[self.data["indexer"] == existing_indexer]
+                if indexer_data.empty:
+                    continue
+
+                current_score = indexer_data["weighted_score"].iloc[0]
+
+                # Only consider replacing indexers below the minimum threshold
+                if current_score >= MIN_INDEXER_SCORE:
                     continue
 
                 # Find best candidate for replacing this specific indexer
@@ -443,34 +457,26 @@ class DataProcessor:
                 if not candidate:
                     continue
 
-                # Calculate group score before (with existing indexer losing an agreement)
-                score_before = self._calculate_group_score(
-                    self.current_group, indexer_to_exclude=existing_indexer
-                )
+                # Get candidate's score
+                candidate_data = self.data[self.data["indexer"] == candidate]
+                if candidate_data.empty:
+                    continue
 
-                # Build temp group with the swap applied
-                temp_group = [i for i in self.current_group if i != existing_indexer]
-                temp_group.append(candidate)
+                candidate_score = candidate_data["weighted_score"].iloc[0]
 
-                # Calculate group score after (with new indexer gaining an agreement)
-                score_after = self._calculate_group_score(
-                    temp_group, indexer_to_include=candidate
-                )
-
-                improvement = score_after - score_before
-
-                # Only consider if improvement meets absolute threshold
-                if improvement >= REPLACEMENT_SCORE_THRESHOLD and improvement > best_improvement:
-                    best_swap = (existing_indexer, candidate)
-                    best_improvement = improvement
+                # Only replace if candidate is significantly better
+                if candidate_score > current_score + REPLACEMENT_MARGIN:
+                    improvement = candidate_score - current_score
+                    if best_swap is None or improvement > best_swap[2]:
+                        best_swap = (existing_indexer, candidate, improvement)
 
             if best_swap:
-                old_indexer, new_indexer = best_swap
+                old_indexer, new_indexer, _ = best_swap
                 self.current_group.remove(old_indexer)
                 self.current_group.append(new_indexer)
                 added_this_call.add(new_indexer)
             else:
-                break  # No more beneficial swaps available
+                break  # No more beneficial replacements available
 
     def _find_best_replacement_or_select_best_indexer(
         self, replacing_indexer: Optional[IndexerId] = None
