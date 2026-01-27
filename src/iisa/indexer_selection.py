@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 
 NON_ZERO_UPTIME_SUCCESS_RATE_SCORE_THRESHOLD = 0.97
 
+# Minimum absolute improvement in group score required to replace an existing indexer.
+# A group with score >= (1.0 - REPLACEMENT_SCORE_THRESHOLD) effectively cannot be improved.
+REPLACEMENT_SCORE_THRESHOLD = 0.15
+
 
 class WeightsDict(TypedDict, total=False):
     """
@@ -284,34 +288,47 @@ class DataProcessor:
             else:
                 break
 
-    def _meets_decentralization_requirements(self, new_indexer):
+    def _meets_decentralization_requirements(
+        self, new_indexer: IndexerId, replacing_indexer: Optional[IndexerId] = None
+    ) -> bool:
         """
-        Check if adding the new indexer meets decentralisation requirements.
+        Check if adding/replacing an indexer meets decentralisation requirements.
 
-        This method is called either when adding indexers to a group with less than 3 indexers,
-        or when finding a replacement for an existing indexer in a group of 3 or more.
+        When adding: checks if current_group + [new_indexer] meets requirements.
+        When replacing: checks if (current_group - replacing_indexer) + [new_indexer] meets requirements.
 
-        The final group must have at least 2 unique organizations and 2 unique locations.
+        The resulting group must have at least 2 unique organizations and 2 unique locations.
+        This check applies when the resulting group would have 2+ indexers.
+
+        Args:
+            new_indexer: The indexer being added or used as replacement.
+            replacing_indexer: If provided, the indexer being replaced (for swap scenarios).
+
+        Returns:
+            True if decentralization requirements are met, False otherwise.
         """
-        # If the current group has fewer than 2 indexers, no decentralisation check is needed.
-        if len(self.current_group) < 2:
+        # Build the resulting group
+        if replacing_indexer:
+            # Replacement scenario: remove old, add new
+            new_group = [i for i in self.current_group if i != replacing_indexer] + [
+                new_indexer
+            ]
+        else:
+            # Addition scenario: just add new
+            new_group = self.current_group + [new_indexer]
+
+        # If resulting group has fewer than 2 indexers, no decentralisation check needed
+        if len(new_group) < 2:
             return True
 
-        # Create a new group including the new indexer
-        new_group = self.current_group + [new_indexer]
-
-        # Get unique locations and organizations for the new group
+        # Get unique locations and organizations for the resulting group
         locations = self.data[self.data["indexer"].isin(new_group)][
             "destination_loc"
         ].unique()
         orgs = self.data[self.data["indexer"].isin(new_group)]["org"].unique()
 
-        # Return 'True' if decentralisation requirements are hit
-        if len(locations) >= 2 and len(orgs) >= 2:
-            return True
-
-        # Otherwise 'False'
-        return False
+        # Return True if decentralisation requirements are met
+        return len(locations) >= 2 and len(orgs) >= 2
 
     def _remove_indexers_from_group(self):
         """
@@ -391,92 +408,95 @@ class DataProcessor:
 
     def _replace_underperforming_indexers(self):
         """
-        Replace underperforming indexers if the group score can be improved by more than 10%.
-        This method updates the current_group but does not modify the DataFrame, as the
-        DataProcessor instance is short-lived and the DataFrame state isn't used after processing.
+        Replace underperforming indexers iteratively until the group is stable.
+
+        Continues replacing indexers as long as each replacement improves the group
+        score by at least REPLACEMENT_SCORE_THRESHOLD (absolute points). This allows
+        poorly performing groups to improve faster while high-quality groups (scoring
+        above 1.0 - REPLACEMENT_SCORE_THRESHOLD) remain stable.
+
+        Newly added indexers are not eligible for replacement in the same call since
+        they were just selected as the best available candidates. This prevents
+        thrashing and ensures each replacement is meaningful.
+
+        The iteration naturally stops when:
+        - No remaining swap meets the improvement threshold, or
+        - No candidates are available (all blocked, pending, declined, etc.)
         """
-        worst_indexer = None
-        worst_score_improvement = None
-        best_replacement = None
+        # Track indexers added in this call - don't replace them
+        added_this_call: set[IndexerId] = set()
 
-        # For each indexer in the current group
-        for indexer in self.current_group:
-            # Check the most appropriate replacement indexer to replace the indexer in question.
-            new_indexer = self._find_best_replacement_or_select_best_indexer()
+        while True:
+            best_swap: Optional[tuple[IndexerId, IndexerId]] = None
+            best_improvement = 0.0
 
-            if new_indexer:
-                # Create a temp copy of the current group, remove the old indexer from it, add the new indexer.
-                temp_group = self.current_group.copy()
-                temp_group.remove(indexer)
-                temp_group.append(new_indexer)
+            for existing_indexer in self.current_group:
+                # Don't replace indexers we just added in this call
+                if existing_indexer in added_this_call:
+                    continue
 
-                # Calculate group score of old group as if the removed indexer had 1 less indexing agreement.
-                group_score_before = self._calculate_group_score(
-                    self.current_group, indexer_to_exclude=indexer
+                # Find best candidate for replacing this specific indexer
+                candidate = self._find_best_replacement_or_select_best_indexer(
+                    replacing_indexer=existing_indexer
                 )
 
-                # Calculate group score of new group as if the replacement indexer had 1 more indexing agreement.
-                group_score_after = self._calculate_group_score(
-                    temp_group, indexer_to_include=new_indexer
+                if not candidate:
+                    continue
+
+                # Calculate group score before (with existing indexer losing an agreement)
+                score_before = self._calculate_group_score(
+                    self.current_group, indexer_to_exclude=existing_indexer
                 )
 
-                # Calculate how much better the new group is than the old group.
-                score_improvement = group_score_after - group_score_before
+                # Build temp group with the swap applied
+                temp_group = [i for i in self.current_group if i != existing_indexer]
+                temp_group.append(candidate)
 
-                # If new group is >= 10% better than old group
-                if score_improvement >= group_score_before * 0.1:
-                    # And score improvement is the best available, take note of the indexer to be replaced
-                    # and the indexer to do the replacement.
-                    if (
-                        worst_score_improvement is None
-                        or score_improvement > worst_score_improvement
-                    ):
-                        worst_score_improvement = score_improvement
-                        worst_indexer = indexer
-                        best_replacement = new_indexer
+                # Calculate group score after (with new indexer gaining an agreement)
+                score_after = self._calculate_group_score(
+                    temp_group, indexer_to_include=candidate
+                )
 
-        # Once the best replacement has been found, remove old indexer from group & add new indexer to group.
-        if best_replacement and worst_indexer:
-            self.current_group.remove(worst_indexer)
-            self.current_group.append(best_replacement)
+                improvement = score_after - score_before
 
-    def _find_best_replacement_or_select_best_indexer(self):
+                # Only consider if improvement meets absolute threshold
+                if improvement >= REPLACEMENT_SCORE_THRESHOLD and improvement > best_improvement:
+                    best_swap = (existing_indexer, candidate)
+                    best_improvement = improvement
+
+            if best_swap:
+                old_indexer, new_indexer = best_swap
+                self.current_group.remove(old_indexer)
+                self.current_group.append(new_indexer)
+                added_this_call.add(new_indexer)
+            else:
+                break  # No more beneficial swaps available
+
+    def _find_best_replacement_or_select_best_indexer(
+        self, replacing_indexer: Optional[IndexerId] = None
+    ) -> Optional[IndexerId]:
         """
-        This function is used when either:
+        Find the best indexer to add to or replace in the current group.
 
-            - Finding the best replacement for an indexer in the current group.
-              (assuming the group has reached capacity)
+        Used for both:
+        - Adding an indexer when group is below target_size (replacing_indexer=None)
+        - Finding a replacement for a specific indexer (replacing_indexer=<indexer_id>)
 
-            - Selecting the best indexer to add to the current group.
-              (assuming the group capacity has not yet been reached)
+        Will not select an indexer if:
+        1. Already in the current group
+        2. On the denylist
+        3. Has pending agreements not yet accepted
+        4. Previously declined an agreement for this subgraph
 
-        Will not attempt to assign an indexing agreement to an indexer under the following conditions:
-        1. The indexer is already in the current group.
-        2. The indexer is blocked.
-        3. The indexer has pending agreements that they have not yet accepted.
-        4. The indexer has previously declined an indexing agreement for this subgraph.
+        Args:
+            replacing_indexer: If provided, the indexer being considered for replacement.
+                              This affects the decentralization check (simulates the swap).
 
-        Note:
-        - declined_indexers is intended to contain only those indexers that declined within the last
-        x days (x=10 seems like a good starting point) and which subgraph they declined.
-
-        Example of declined_indexers structure:
-        {
-            "subgraph1": ["indexer1", "indexer2"],
-            "subgraph2": ["indexer1"]
-        }
-        In the example above we would not attempt to offer an indexing agreement to:
-            - indexer1 for either subgraph1 or subgraph2.
-            - indexer2 for subgraph1
-
-        :return: The best indexer, or None if no suitable candidate is found.
+        Returns:
+            The best indexer ID, or None if no suitable candidate exists.
         """
 
         def flatten_list_of_lists(list_of_lists):
-            """
-            In the context being used here:
-            - This function returns a list of indexers that have pending agreements.
-            """
             flattened_list = []
             for sublist in list_of_lists:
                 for item in sublist:
@@ -493,12 +513,14 @@ class DataProcessor:
         # The candidates we could select are those that are not unpickable
         candidates = self.data[~self.data["indexer"].isin(unpickable_indexers)].copy()
 
-        # Sort the candidates by weighted score, highest score first.
+        # Sort the candidates by weighted score, highest score first
         candidates.sort_values(by="weighted_score", ascending=False, inplace=True)
 
-        # Iterate through the list of candidates, prefer one that meets decentralization requirements
+        # Iterate through candidates, prefer one that meets decentralization requirements
         for indexer in candidates["indexer"]:
-            if self._meets_decentralization_requirements(indexer):
+            if self._meets_decentralization_requirements(
+                indexer, replacing_indexer=replacing_indexer
+            ):
                 return indexer
 
         # Fallback: return best candidate even if it doesn't meet decentralization

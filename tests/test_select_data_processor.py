@@ -693,12 +693,12 @@ class TestDataProcessor:
         Test the _meets_decentralization_requirements method of DataProcessor.
 
         This test verifies:
-        1. The method returns True when there are fewer than 2 indexers in the current group.
-        2. The method correctly evaluates decentralization based on locations and organizations.
-        3. A group that does not _meets_decentralization_requirements will not be marked as true.
+        1. Resulting group with < 2 indexers always passes (no check needed).
+        2. Resulting group with 2+ indexers needs 2+ unique locations AND 2+ unique orgs.
+        3. The replacing_indexer parameter correctly simulates swap scenarios.
 
         Note:
-        _meets_decentralization_requirements accepts new_indexer as an input parameter.
+        _meets_decentralization_requirements accepts new_indexer and optional replacing_indexer.
         """
         processor = DataProcessor(
             history=pd.DataFrame(
@@ -711,23 +711,38 @@ class TestDataProcessor:
             deployment_id=DeploymentId("test_subgraph"),
         )
 
-        # Test with fewer than 2 indexers
+        # Test adding first indexer (resulting group has 1 indexer - no check needed)
+        processor.current_group = []
+        assert processor._meets_decentralization_requirements("A")
+
+        # Test adding second indexer - same location and org (fails decentralization)
         processor.current_group = ["A"]
-        assert processor._meets_decentralization_requirements("B")
+        assert not processor._meets_decentralization_requirements("B")  # A,B both loc1/org1
 
-        # Test with 2 indexers, same location and org
+        # Test adding second indexer - different location and org (passes)
+        processor.current_group = ["A"]
+        assert processor._meets_decentralization_requirements("C")  # A=loc1/org1, C=loc2/org2
+
+        # Test with 2 indexers, adding third with different location and org
         processor.current_group = ["A", "B"]
-        assert processor._meets_decentralization_requirements("C")
+        assert processor._meets_decentralization_requirements("C")  # C adds loc2 and org2
 
-        # Test with 2 indexers, different location and org
+        # Test with 2 indexers that already meet requirements, adding any third is fine
         processor.current_group = ["A", "C"]
-        assert processor._meets_decentralization_requirements("D")
+        assert processor._meets_decentralization_requirements("D")  # Adds loc3 and org3
+        assert processor._meets_decentralization_requirements("B")  # Already have 2 locs/orgs
 
-        # Test with 2 indexers, adding one with same location and org
+        # Test replacement scenario: replacing A (loc1/org1) with C (loc2/org2) in group [A, B]
+        # Results in [B, C] = loc1/org1 + loc2/org2 = 2 locs, 2 orgs (passes)
+        processor.current_group = ["A", "B"]
+        assert processor._meets_decentralization_requirements("C", replacing_indexer="A")
+
+        # Test replacement scenario: replacing C (loc2/org2) with B (loc1/org1) in group [A, C]
+        # Results in [A, B] = loc1/org1 + loc1/org1 = 1 loc, 1 org (fails)
         processor.current_group = ["A", "C"]
-        assert processor._meets_decentralization_requirements("B")
+        assert not processor._meets_decentralization_requirements("B", replacing_indexer="C")
 
-        # Test with 3 of the same indexer.
+        # Test with duplicate indexer (edge case)
         processor.current_group = ["A", "A"]
         assert not processor._meets_decentralization_requirements("A")
 
@@ -748,30 +763,40 @@ class TestDataProcessor:
             deployment_id=DeploymentId("test_subgraph"),
         )
 
-        # Test with empty current group
+        # Test with empty current group (adding first indexer)
+        processor.current_group = []
         assert processor._meets_decentralization_requirements("A")
 
-        # Test with indexer 'A' selected twice due to some error
-        processor.current_group = ["A", "A"]
-        assert processor._meets_decentralization_requirements("E")
+        # Test adding second indexer with different org (A=loc1/org1, B=loc1/org2)
+        # Same location but different org - fails (needs 2 locs AND 2 orgs)
+        processor.current_group = ["A"]
+        assert not processor._meets_decentralization_requirements("B")  # Same loc
 
-        # Test with many indexers
+        # Test adding second indexer with different location and org
+        processor.current_group = ["A"]
+        assert processor._meets_decentralization_requirements("D")  # A=loc1/org1, D=loc2/org2
+
+        # Test with indexer 'A' selected twice due to some error, adding diverse indexer
+        processor.current_group = ["A", "A"]
+        assert processor._meets_decentralization_requirements("D")  # D=loc2/org2 adds diversity
+
+        # Test with many indexers already in group (decentralization already met)
         processor.current_group = ["A", "B", "C", "D", "E", "F"]
         assert processor._meets_decentralization_requirements("F")
 
-        # Additional test: Check that it returns False when decentralization requirements are not met
-        processor.current_group = ["A", "B"]
+        # Test adding same indexer that's already in group (fails - duplicates don't add diversity)
+        processor.current_group = ["A", "B"]  # loc1/org1 + loc1/org2 = 1 loc, 2 orgs (fails)
         assert not processor._meets_decentralization_requirements("A")
 
-    def test_replace_underperforming_indexers(
+        # Test that two diverse indexers pass
+        processor.current_group = ["A", "D"]  # loc1/org1 + loc2/org2 = 2 locs, 2 orgs
+        assert processor._meets_decentralization_requirements("E")  # Adds more diversity
+
+    def test_replace_underperforming_indexers_single_swap(
         self, sample_data, mock__bigquery_provider
     ):
         """
-        Test the _replace_underperforming_indexers method of DataProcessor.
-
-        This test verifies:
-        1. The method replaces an indexer when a better replacement is found.
-        2. The method does not replace any indexer when no better replacement is found.
+        Test single replacement when only one swap meets the threshold.
         """
         processor = DataProcessor(
             history=sample_data,
@@ -786,16 +811,124 @@ class TestDataProcessor:
                 "iisa.indexer_selection.DataProcessor._calculate_group_score"
             ) as mock_score,
         ):
-            mock_find.side_effect = ["D", None, None]
-            mock_score.side_effect = [0.7, 0.8, 0.7, 0.7]
+            # First iteration: D found for A, improvement meets threshold
+            # Second iteration: no candidates available (iteration stops)
+            mock_find.side_effect = ["D", None, None, None, None]
+            mock_score.side_effect = [0.70, 0.85]  # before=0.70, after=0.85, improvement=0.15
 
             processor.current_group = ["A", "B", "C"]
             processor._replace_underperforming_indexers()
 
-            # Verify that the worst indexer in the current group has been replaced with the best available indexer
+            # A was replaced with D
             assert processor.current_group == ["B", "C", "D"]
-            assert mock_find.call_count == 3
-            assert mock_score.call_count == 2
+
+    def test_replace_underperforming_indexers_multiple_swaps(
+        self, sample_data, mock__bigquery_provider
+    ):
+        """
+        Test iterative replacement when multiple swaps are beneficial.
+
+        After replacing A with D, the method re-evaluates and finds B can be
+        replaced with E for another improvement.
+        """
+        processor = DataProcessor(
+            history=sample_data,
+            deployment_id=DeploymentId("test_subgraph"),
+        )
+
+        with (
+            patch(
+                "iisa.indexer_selection.DataProcessor._find_best_replacement_or_select_best_indexer"
+            ) as mock_find,
+            patch(
+                "iisa.indexer_selection.DataProcessor._calculate_group_score"
+            ) as mock_score,
+        ):
+            # Iteration 1: evaluating A, B, C -> D is best for A
+            # Iteration 2: evaluating B, C (D skipped - just added) -> E is best for B
+            # Iteration 3: evaluating C (D, E skipped) -> no candidate meets threshold
+            mock_find.side_effect = [
+                "D", None, None,  # Iter 1: A->D, B->None, C->None
+                "E", None,       # Iter 2: B->E, C->None (D skipped)
+                None,            # Iter 3: C->None (D, E skipped)
+            ]
+            mock_score.side_effect = [
+                0.50, 0.70,  # Iter 1: before=0.50, after=0.70, improvement=0.20
+                0.70, 0.90,  # Iter 2: before=0.70, after=0.90, improvement=0.20
+            ]
+
+            processor.current_group = ["A", "B", "C"]
+            processor._replace_underperforming_indexers()
+
+            # Both A and B were replaced
+            assert "D" in processor.current_group
+            assert "E" in processor.current_group
+            assert "C" in processor.current_group
+            assert len(processor.current_group) == 3
+
+    def test_replace_underperforming_indexers_below_threshold(
+        self, sample_data, mock__bigquery_provider
+    ):
+        """
+        Test that no replacement occurs when improvement is below threshold.
+        """
+        processor = DataProcessor(
+            history=sample_data,
+            deployment_id=DeploymentId("test_subgraph"),
+        )
+
+        with (
+            patch(
+                "iisa.indexer_selection.DataProcessor._find_best_replacement_or_select_best_indexer"
+            ) as mock_find,
+            patch(
+                "iisa.indexer_selection.DataProcessor._calculate_group_score"
+            ) as mock_score,
+        ):
+            # Score improvement: 0.80 - 0.70 = 0.10 (below 0.15 threshold)
+            mock_find.side_effect = ["D", None, None]
+            mock_score.side_effect = [0.70, 0.80]
+
+            processor.current_group = ["A", "B", "C"]
+            processor._replace_underperforming_indexers()
+
+            # No replacement should occur
+            assert processor.current_group == ["A", "B", "C"]
+
+    def test_replace_underperforming_indexers_skips_newly_added(
+        self, sample_data, mock__bigquery_provider
+    ):
+        """
+        Test that newly added indexers are not eligible for replacement in the same call.
+        """
+        processor = DataProcessor(
+            history=sample_data,
+            deployment_id=DeploymentId("test_subgraph"),
+        )
+
+        with (
+            patch(
+                "iisa.indexer_selection.DataProcessor._find_best_replacement_or_select_best_indexer"
+            ) as mock_find,
+            patch(
+                "iisa.indexer_selection.DataProcessor._calculate_group_score"
+            ) as mock_score,
+        ):
+            # Iteration 1: D replaces A
+            # Iteration 2: D is skipped (just added), B and C evaluated
+            mock_find.side_effect = [
+                "D", None, None,  # Iter 1: A->D, B->None, C->None
+                None, None,       # Iter 2: B->None, C->None (D is skipped)
+            ]
+            mock_score.side_effect = [0.50, 0.70]
+
+            processor.current_group = ["A", "B", "C"]
+            processor._replace_underperforming_indexers()
+
+            # Only A replaced, D not re-evaluated
+            assert processor.current_group == ["B", "C", "D"]
+            # D should only appear once in the group
+            assert processor.current_group.count("D") == 1
 
     def test_find_best_replacement_or_select_best_indexer(
         self, mock__bigquery_provider
