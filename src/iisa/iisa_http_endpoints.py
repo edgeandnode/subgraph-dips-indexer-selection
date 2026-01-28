@@ -334,7 +334,9 @@ async def get_score(request: ScoreRequest) -> ScoreResponse:
     if not _state.is_ready or _state.history is None:
         raise HTTPException(status_code=503, detail="IISA data not loaded")
 
-    indexer_data = _state.history[_state.history["indexer"] == request.indexer_id]
+    # Normalize to lowercase for case-insensitive matching
+    indexer_id = request.indexer_id.lower()
+    indexer_data = _state.history[_state.history["indexer"] == indexer_id]
 
     if indexer_data.empty:
         return ScoreResponse(
