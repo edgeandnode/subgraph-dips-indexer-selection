@@ -1160,8 +1160,6 @@ class TestMergeAndPrepareDataframes:
         assert all(result["existing_dips_agreements"] == 0)
         assert "avg_sync_duration" in result.columns
         assert all(pd.isna(result["avg_sync_duration"]))
-        assert "indexing_agreement_acceptance_latency" in result.columns
-        assert all(pd.isna(result["indexing_agreement_acceptance_latency"]))
 
         # Dropped columns not present
         assert "% up_y" not in result.columns
@@ -1294,7 +1292,6 @@ class TestSchemaValidation:
             "query_count": [1000, 2000],
             "existing_dips_agreements": [0, 0],
             "avg_sync_duration": [None, None],
-            "indexing_agreement_acceptance_latency": [None, None],
         })
 
     def test_output_columns_match_bigquery_schema(self, sql_schema_path, sample_merged_df):
@@ -1334,5 +1331,5 @@ class TestSchemaValidation:
         assert "computed_at" in columns
         assert "query_count" in columns
 
-        # Should have 23 columns total
-        assert len(columns) == 23, f"Expected 23 columns, got {len(columns)}: {columns}"
+        # Should have 22 columns total
+        assert len(columns) == 22, f"Expected 22 columns, got {len(columns)}: {columns}"

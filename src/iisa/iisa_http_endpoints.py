@@ -7,8 +7,7 @@ contract expected by the Rust HTTP client in dipper-iisa.
 Endpoints:
 - GET /health - Health check, reports if data is loaded
 - POST /refresh - Reload scores from BigQuery
-- POST /select-one - Select single best indexer for a deployment
-- POST /select-many - Select multiple indexers for a deployment
+- POST /select-indexers - Select optimal indexers for a deployment
 """
 
 import logging
@@ -72,51 +71,32 @@ def get_settings() -> Settings:
 # =============================================================================
 
 
-class CandidateIndexer(BaseModel):
-    """
-    A candidate indexer with ID and URL.
-
-    The URL is used for GeoIP resolution to determine geographic diversity.
-    """
-
-    id: str
-    url: str
-
-
 class SelectionRequest(BaseModel):
     """
-    Request body for indexer selection endpoints.
+    Request body for indexer selection endpoint.
 
     Matches the SelectionRequest struct in the Rust HTTP client.
     """
 
     deployment_id: str
-    candidates: Optional[list[CandidateIndexer]] = None
     existing_indexers: Optional[list[str]] = None
     pending_agreements: Optional[dict[str, list[str]]] = None
-    num_candidates: Optional[int] = None
+    num_candidates: int  # Target group size (required)
     blocklist: Optional[list[str]] = None
     declined_indexers: Optional[dict[str, list[str]]] = None
 
 
-class SingleSelectionResponse(BaseModel):
+class SelectionResponse(BaseModel):
     """
-    Response for the /select-one endpoint.
+    Response for the /select-indexers endpoint.
 
-    Returns a single selected indexer ID or None if no selection was made.
-    """
-
-    indexer_id: Optional[str] = None
-
-
-class MultiSelectionResponse(BaseModel):
-    """
-    Response for the /select-many endpoint.
-
-    Returns a list of selected indexer IDs.
+    Returns the optimal set of indexers that SHOULD be assigned to the deployment.
+    This is idempotent - replaying the same request yields the same response.
+    The caller diffs against its actual current state to determine adds/cancels.
     """
 
-    indexer_ids: list[str]
+    deployment_id: str
+    indexers: list[str]
 
 
 class HealthResponse(BaseModel):
@@ -126,6 +106,27 @@ class HealthResponse(BaseModel):
 
     status: str
     data_loaded: bool
+
+
+class ScoreRequest(BaseModel):
+    """
+    Request body for the /get-score endpoint.
+    """
+
+    indexer_id: str
+
+
+class ScoreResponse(BaseModel):
+    """
+    Response for the /get-score endpoint.
+
+    Returns the weighted score and component scores for an indexer.
+    """
+
+    indexer_id: str
+    weighted_score: Optional[float] = None
+    components: Optional[dict[str, float]] = None
+    found: bool
 
 
 # =============================================================================
@@ -321,51 +322,99 @@ async def refresh_data():
         raise HTTPException(status_code=500, detail="Failed to refresh data from BigQuery")
 
 
-@app.post("/select-one", response_model=SingleSelectionResponse)
-async def select_one(request: SelectionRequest) -> SingleSelectionResponse:
+@app.post("/get-score", response_model=ScoreResponse)
+async def get_score(request: ScoreRequest) -> ScoreResponse:
     """
-    Select a single indexer for a deployment using weighted scoring algorithm.
-    """
-    if not _state.is_ready or _state.history is None:
-        raise HTTPException(status_code=503, detail="IISA data not loaded")
+    Get the weighted score and component scores for an indexer.
 
-    try:
-        selected = _select_with_processor(request, num_to_select=1)
-        indexer_id = selected[0] if selected else None
-        logger.info(f"Selected indexer {indexer_id} for deployment {request.deployment_id}")
-        return SingleSelectionResponse(indexer_id=indexer_id)
-    except Exception as e:
-        logger.exception(f"Selection failed for deployment {request.deployment_id}")
-        raise HTTPException(status_code=500, detail=f"Selection failed: {e}")
-
-
-@app.post("/select-many", response_model=MultiSelectionResponse)
-async def select_many(request: SelectionRequest) -> MultiSelectionResponse:
-    """
-    Select multiple indexers for a deployment using weighted scoring algorithm.
+    Returns the indexer's current weighted score along with the individual
+    component scores that contribute to it. Useful for debugging selection
+    decisions and monitoring indexer performance.
     """
     if not _state.is_ready or _state.history is None:
         raise HTTPException(status_code=503, detail="IISA data not loaded")
 
-    if request.num_candidates is None:
-        raise HTTPException(
-            status_code=400,
-            detail="num_candidates is required for select-many",
+    # Normalize to lowercase for case-insensitive matching
+    indexer_id = request.indexer_id.lower()
+    indexer_data = _state.history[_state.history["indexer"] == indexer_id]
+
+    if indexer_data.empty:
+        return ScoreResponse(
+            indexer_id=request.indexer_id,
+            found=False,
         )
 
+    row = indexer_data.iloc[0]
+
+    # Extract component scores (norm_ prefixed columns)
+    components = {}
+    component_keys = [
+        ("norm_lat_lin_reg_coefficient", "latency"),
+        ("norm_uptime_score", "uptime"),
+        ("norm_success_rate", "success_rate"),
+        ("norm_stake_to_fees_iqr_deviation", "stake_to_fees"),
+        ("norm_avg_sync_duration", "sync_duration"),
+    ]
+
+    for col, name in component_keys:
+        if col in row.index and pd.notna(row[col]):
+            components[name] = float(row[col])
+
+    # Calculate weighted score using DataProcessor logic
+    from .indexer_selection import _normalize_metrics, _calculate_weighted_score, DEFAULT_WEIGHTS
+
+    # Normalize and calculate score for this single indexer
+    normalized = _normalize_metrics(indexer_data.copy())
+    if not normalized.empty:
+        weighted_score = float(_calculate_weighted_score(normalized.iloc[0], DEFAULT_WEIGHTS))
+    else:
+        weighted_score = None
+
+    return ScoreResponse(
+        indexer_id=request.indexer_id,
+        weighted_score=weighted_score,
+        components=components,
+        found=True,
+    )
+
+
+@app.post("/select-indexers", response_model=SelectionResponse)
+async def select_indexers(request: SelectionRequest) -> SelectionResponse:
+    """
+    Select optimal indexers for a deployment using weighted scoring algorithm.
+
+    Returns the target state - the set of indexers that SHOULD be assigned.
+    This is idempotent: replaying the same request yields the same response.
+    The caller diffs against its actual current state to determine adds/cancels.
+
+    The num_candidates field specifies the target group size - how many indexers
+    should be assigned to this deployment. IISA selects the top N indexers by
+    weighted aggregate score, preferring groups with >1 unique org and >1 unique
+    location when N > 1. These decentralization constraints are best-effort.
+
+    Note on existing_indexers: This tells DataProcessor which indexers are currently
+    assigned, allowing it to decide whether to add, remove, or replace indexers.
+    To get a fresh selection ignoring current assignments, pass existing_indexers: [].
+    """
+    if not _state.is_ready or _state.history is None:
+        raise HTTPException(status_code=503, detail="IISA data not loaded")
+
     if request.num_candidates <= 0:
-        return MultiSelectionResponse(indexer_ids=[])
+        return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
 
     try:
-        selected = _select_with_processor(request, num_to_select=request.num_candidates)
-        logger.info(f"Selected {len(selected)} indexers for deployment {request.deployment_id}: {selected}")
-        return MultiSelectionResponse(indexer_ids=selected)
+        response = _select_with_processor(request)
+        logger.info(
+            f"Selected {len(response.indexers)} indexers for deployment "
+            f"{request.deployment_id}: {response.indexers}"
+        )
+        return response
     except Exception as e:
         logger.exception(f"Selection failed for deployment {request.deployment_id}")
         raise HTTPException(status_code=500, detail=f"Selection failed: {e}")
 
 
-def _select_with_processor(request: SelectionRequest, num_to_select: int) -> list[str]:
+def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     """
     Use DataProcessor for intelligent indexer selection.
 
@@ -377,9 +426,11 @@ def _select_with_processor(request: SelectionRequest, num_to_select: int) -> lis
     - Success rate
     - Sync duration
     - Agreement acceptance latency
+
+    Returns a SelectionResponse with the optimal set of indexers for the deployment.
     """
     if _state.history is None:
-        return []
+        return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
 
     # Build existing_agreements dict from request
     existing_agreements: dict[str, list[str]] = {}
@@ -389,7 +440,7 @@ def _select_with_processor(request: SelectionRequest, num_to_select: int) -> lis
     # Build pending_agreements dict - convert to expected format
     pending_agreements: dict[str, list[str]] = request.pending_agreements or {}
 
-    # Create DataProcessor instance
+    # Create DataProcessor instance with target_size from num_candidates
     # Note: DataProcessor does its own filtering of candidates based on
     # indexer_denylist, pending agreements, etc.
     processor = DataProcessor(
@@ -399,17 +450,14 @@ def _select_with_processor(request: SelectionRequest, num_to_select: int) -> lis
         pending_agreements=pending_agreements,
         declined_indexers=request.declined_indexers or {},
         indexer_denylist=request.blocklist or [],
+        target_size=request.num_candidates,
     )
 
-    # Get selections
-    added, _cancelled = processor.get_indexer_selections()
-
-    # Return the selected indexers for this deployment
-    selected = added.get(request.deployment_id, [])
-
-    # DataProcessor returns at most 3 - (existing count) indexers
-    # If we need more, we may need multiple calls or a different approach
-    return selected[:num_to_select]
+    # Return the final group of indexers (caller diffs with existing to find cancellations)
+    return SelectionResponse(
+        deployment_id=request.deployment_id,
+        indexers=list(processor.current_group),
+    )
 
 
 if __name__ == "__main__":

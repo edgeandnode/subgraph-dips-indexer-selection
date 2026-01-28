@@ -33,6 +33,14 @@ logger = logging.getLogger(__name__)
 
 NON_ZERO_UPTIME_SUCCESS_RATE_SCORE_THRESHOLD = 0.97
 
+# Indexers scoring below this threshold are candidates for replacement.
+# They will only be replaced if a significantly better candidate is available.
+MIN_INDEXER_SCORE = 0.15
+
+# Minimum score improvement required to justify replacing an underperforming indexer.
+# Candidate must score at least (current_score + REPLACEMENT_MARGIN) to replace.
+REPLACEMENT_MARGIN = 0.50
+
 
 class WeightsDict(TypedDict, total=False):
     """
@@ -45,20 +53,18 @@ class WeightsDict(TypedDict, total=False):
     stake_to_fees_iqr_deviation: float
     success_rate: float
     avg_sync_duration: float
-    indexing_agreement_acceptance_latency: float
 
 
 DEFAULT_WEIGHTS = cast(
     WeightsDict,
     MappingProxyType(
         {
-            "lat_lin_reg_coefficient": 0.2424,
-            "uptime_score": 0.1667,
-            "existing_dips_agreements": 0.1212,
-            "stake_to_fees_iqr_deviation": 0.1023,
-            "success_rate": 0.0625,
-            "avg_sync_duration": 0.0625,
-            "indexing_agreement_acceptance_latency": 0.2424,
+            "lat_lin_reg_coefficient": 0.32,
+            "uptime_score": 0.22,
+            "existing_dips_agreements": 0.16,
+            "stake_to_fees_iqr_deviation": 0.135,
+            "success_rate": 0.0825,
+            "avg_sync_duration": 0.0825,
         }
     ),
 )
@@ -90,10 +96,14 @@ class DataProcessor:
         declined_indexers: Optional[dict[DeploymentId, IndexerId]] = None,
         indexer_denylist: Optional[list[IndexerId]] = None,
         weights: Optional[WeightsDict] = None,
+        target_size: int = 3,
     ):
         """
         Initialize the DataProcessor class with data, deployment ID, existing agreements,
         and an indexer denylist.
+
+        Args:
+            target_size: The target number of indexers to assign to this deployment.
         """
         # Initialize class variables with provided parameters
         self.data = pd.DataFrame(history)
@@ -103,6 +113,7 @@ class DataProcessor:
         self.declined_indexers = declined_indexers or {}
         self.indexer_denylist = indexer_denylist or []
         self.weights = {**DEFAULT_WEIGHTS, **(weights or {})}
+        self.target_size = target_size
 
         # Process the data, we can then call update_indexer_denylist_cancel_indexing_agreements,
         # or get_indexer_selections later after this constructor has finished running.
@@ -250,24 +261,24 @@ class DataProcessor:
         Use the methods _add_indexers_to_group and _replace_underperforming_indexers to
         assign indexers to the subgraph in question.
         """
-        # If the current indexer group has less than 3 indexers, call '_add_indexers_to_group'
-        if len(self.current_group) < 3:
+        # If the current indexer group has less than target_size indexers, call '_add_indexers_to_group'
+        if len(self.current_group) < self.target_size:
             self._add_indexers_to_group()
 
-        # If the current indexer group has more than 3 indexers, call '_remove_indexers_from_group'
-        if len(self.current_group) > 3:
+        # If the current indexer group has more than target_size indexers, call '_remove_indexers_from_group'
+        if len(self.current_group) > self.target_size:
             self._remove_indexers_from_group()
 
         # Otherwise, call '_replace_underperforming_indexers' which will search for a suitable replacement
-        if len(self.current_group) == 3:
+        if len(self.current_group) == self.target_size:
             self._replace_underperforming_indexers()
 
     def _add_indexers_to_group(self):
         """
         Add indexers to the group to meet the required number of indexers.
         """
-        # While the group has less than 3 indexers, select the best indexer to add using _find_best_replacement_or_select_best_indexer
-        while len(self.current_group) < 3:
+        # While the group has less than target_size indexers, select the best indexer to add
+        while len(self.current_group) < self.target_size:
             next_indexer = self._find_best_replacement_or_select_best_indexer()
 
             # Add the best indexer to the group
@@ -278,40 +289,53 @@ class DataProcessor:
             else:
                 break
 
-    def _meets_decentralization_requirements(self, new_indexer):
+    def _meets_decentralization_requirements(
+        self, new_indexer: IndexerId, replacing_indexer: Optional[IndexerId] = None
+    ) -> bool:
         """
-        Check if adding the new indexer meets decentralisation requirements.
+        Check if adding/replacing an indexer meets decentralisation requirements.
 
-        This method is called either when adding indexers to a group with less than 3 indexers,
-        or when finding a replacement for an existing indexer in a group of 3 or more.
+        When adding: checks if current_group + [new_indexer] meets requirements.
+        When replacing: checks if (current_group - replacing_indexer) + [new_indexer] meets requirements.
 
-        The final group must have at least 2 unique organizations and 2 unique locations.
+        The resulting group must have at least 2 unique organizations and 2 unique locations.
+        This check applies when the resulting group would have 2+ indexers.
+
+        Args:
+            new_indexer: The indexer being added or used as replacement.
+            replacing_indexer: If provided, the indexer being replaced (for swap scenarios).
+
+        Returns:
+            True if decentralization requirements are met, False otherwise.
         """
-        # If the current group has fewer than 2 indexers, no decentralisation check is needed.
-        if len(self.current_group) < 2:
+        # Build the resulting group
+        if replacing_indexer:
+            # Replacement scenario: remove old, add new
+            new_group = [i for i in self.current_group if i != replacing_indexer] + [
+                new_indexer
+            ]
+        else:
+            # Addition scenario: just add new
+            new_group = self.current_group + [new_indexer]
+
+        # If resulting group has fewer than 2 indexers, no decentralisation check needed
+        if len(new_group) < 2:
             return True
 
-        # Create a new group including the new indexer
-        new_group = self.current_group + [new_indexer]
-
-        # Get unique locations and organizations for the new group
+        # Get unique locations and organizations for the resulting group
         locations = self.data[self.data["indexer"].isin(new_group)][
             "destination_loc"
         ].unique()
         orgs = self.data[self.data["indexer"].isin(new_group)]["org"].unique()
 
-        # Return 'True' if decentralisation requirements are hit
-        if len(locations) >= 2 and len(orgs) >= 2:
-            return True
-
-        # Otherwise 'False'
-        return False
+        # Return True if decentralisation requirements are met
+        return len(locations) >= 2 and len(orgs) >= 2
 
     def _remove_indexers_from_group(self):
         """
-        Remove the worst indexers from the current group until the current group only has 3 indexers.
+        Remove the worst indexers from the current group until the current group only has target_size indexers.
         """
-        while len(self.current_group) > 3:
+        while len(self.current_group) > self.target_size:
             indexer_scores = []
             for indexer in self.current_group:
                 # Calculate each indexers score as if the indexer had 1 less indexing agreement
@@ -385,92 +409,97 @@ class DataProcessor:
 
     def _replace_underperforming_indexers(self):
         """
-        Replace underperforming indexers if the group score can be improved by more than 10%.
-        This method updates the current_group but does not modify the DataFrame, as the
-        DataProcessor instance is short-lived and the DataFrame state isn't used after processing.
+        Replace indexers scoring below MIN_INDEXER_SCORE when a significantly better
+        candidate is available.
+
+        Only considers indexers with weighted_score < MIN_INDEXER_SCORE for replacement.
+        A replacement occurs only if the candidate scores at least REPLACEMENT_MARGIN
+        higher than the current indexer (e.g., current=0.10, candidate must be >0.60).
+
+        This approach:
+        - Keeps indexers performing adequately (>= MIN_INDEXER_SCORE) stable
+        - Only replaces poor performers when there's a meaningfully better option
+        - Avoids churn from marginal improvements
+        - Never leaves gaps (keeps bad indexer if no good replacement exists)
+
+        Iterates until no more beneficial replacements are found.
         """
-        worst_indexer = None
-        worst_score_improvement = None
-        best_replacement = None
+        # Track indexers added in this call - don't replace them
+        added_this_call: set[IndexerId] = set()
 
-        # For each indexer in the current group
-        for indexer in self.current_group:
-            # Check the most appropriate replacement indexer to replace the indexer in question.
-            new_indexer = self._find_best_replacement_or_select_best_indexer()
+        while True:
+            best_swap: Optional[tuple[IndexerId, IndexerId, float]] = None
 
-            if new_indexer:
-                # Create a temp copy of the current group, remove the old indexer from it, add the new indexer.
-                temp_group = self.current_group.copy()
-                temp_group.remove(indexer)
-                temp_group.append(new_indexer)
+            for existing_indexer in self.current_group:
+                # Don't replace indexers we just added in this call
+                if existing_indexer in added_this_call:
+                    continue
 
-                # Calculate group score of old group as if the removed indexer had 1 less indexing agreement.
-                group_score_before = self._calculate_group_score(
-                    self.current_group, indexer_to_exclude=indexer
+                # Get current indexer's score
+                indexer_data = self.data[self.data["indexer"] == existing_indexer]
+                if indexer_data.empty:
+                    continue
+
+                current_score = indexer_data["weighted_score"].iloc[0]
+
+                # Only consider replacing indexers below the minimum threshold
+                if current_score >= MIN_INDEXER_SCORE:
+                    continue
+
+                # Find best candidate for replacing this specific indexer
+                candidate = self._find_best_replacement_or_select_best_indexer(
+                    replacing_indexer=existing_indexer
                 )
 
-                # Calculate group score of new group as if the replacement indexer had 1 more indexing agreement.
-                group_score_after = self._calculate_group_score(
-                    temp_group, indexer_to_include=new_indexer
-                )
+                if not candidate:
+                    continue
 
-                # Calculate how much better the new group is than the old group.
-                score_improvement = group_score_after - group_score_before
+                # Get candidate's score
+                candidate_data = self.data[self.data["indexer"] == candidate]
+                if candidate_data.empty:
+                    continue
 
-                # If new group is >= 10% better than old group
-                if score_improvement >= group_score_before * 0.1:
-                    # And score improvement is the best available, take note of the indexer to be replaced
-                    # and the indexer to do the replacement.
-                    if (
-                        worst_score_improvement is None
-                        or score_improvement > worst_score_improvement
-                    ):
-                        worst_score_improvement = score_improvement
-                        worst_indexer = indexer
-                        best_replacement = new_indexer
+                candidate_score = candidate_data["weighted_score"].iloc[0]
 
-        # Once the best replacement has been found, remove old indexer from group & add new indexer to group.
-        if best_replacement and worst_indexer:
-            self.current_group.remove(worst_indexer)
-            self.current_group.append(best_replacement)
+                # Only replace if candidate is significantly better
+                if candidate_score > current_score + REPLACEMENT_MARGIN:
+                    improvement = candidate_score - current_score
+                    if best_swap is None or improvement > best_swap[2]:
+                        best_swap = (existing_indexer, candidate, improvement)
 
-    def _find_best_replacement_or_select_best_indexer(self):
+            if best_swap:
+                old_indexer, new_indexer, _ = best_swap
+                self.current_group.remove(old_indexer)
+                self.current_group.append(new_indexer)
+                added_this_call.add(new_indexer)
+            else:
+                break  # No more beneficial replacements available
+
+    def _find_best_replacement_or_select_best_indexer(
+        self, replacing_indexer: Optional[IndexerId] = None
+    ) -> Optional[IndexerId]:
         """
-        This function is used when either:
+        Find the best indexer to add to or replace in the current group.
 
-            - Finding the best replacement for an indexer in the current group.
-              (assuming the group has reached capacity)
+        Used for both:
+        - Adding an indexer when group is below target_size (replacing_indexer=None)
+        - Finding a replacement for a specific indexer (replacing_indexer=<indexer_id>)
 
-            - Selecting the best indexer to add to the current group.
-              (assuming the group capacity has not yet been reached)
+        Will not select an indexer if:
+        1. Already in the current group
+        2. On the denylist
+        3. Has pending agreements not yet accepted
+        4. Previously declined an agreement for this subgraph
 
-        Will not attempt to assign an indexing agreement to an indexer under the following conditions:
-        1. The indexer is already in the current group.
-        2. The indexer is blocked.
-        3. The indexer has pending agreements that they have not yet accepted.
-        4. The indexer has previously declined an indexing agreement for this subgraph.
+        Args:
+            replacing_indexer: If provided, the indexer being considered for replacement.
+                              This affects the decentralization check (simulates the swap).
 
-        Note:
-        - declined_indexers is intended to contain only those indexers that declined within the last
-        x days (x=10 seems like a good starting point) and which subgraph they declined.
-
-        Example of declined_indexers structure:
-        {
-            "subgraph1": ["indexer1", "indexer2"],
-            "subgraph2": ["indexer1"]
-        }
-        In the example above we would not attempt to offer an indexing agreement to:
-            - indexer1 for either subgraph1 or subgraph2.
-            - indexer2 for subgraph1
-
-        :return: The best indexer, or None if no suitable candidate is found.
+        Returns:
+            The best indexer ID, or None if no suitable candidate exists.
         """
 
         def flatten_list_of_lists(list_of_lists):
-            """
-            In the context being used here:
-            - This function returns a list of indexers that have pending agreements.
-            """
             flattened_list = []
             for sublist in list_of_lists:
                 for item in sublist:
@@ -487,15 +516,22 @@ class DataProcessor:
         # The candidates we could select are those that are not unpickable
         candidates = self.data[~self.data["indexer"].isin(unpickable_indexers)].copy()
 
-        # Sort the candidates by weighted score, highest score first.
+        # Sort the candidates by weighted score, highest score first
         candidates.sort_values(by="weighted_score", ascending=False, inplace=True)
 
-        # Iterate through the list of candidates, return the first (best) candidate that meets decentralization requirements
+        # Iterate through candidates, prefer one that meets decentralization requirements
         for indexer in candidates["indexer"]:
-            if self._meets_decentralization_requirements(indexer):
+            if self._meets_decentralization_requirements(
+                indexer, replacing_indexer=replacing_indexer
+            ):
                 return indexer
 
-        return None
+        # Fallback: return best candidate even if it doesn't meet decentralization
+        # Decentralization is best-effort - if constraints cannot be met, still return an indexer
+        if not candidates.empty:
+            return candidates["indexer"].iloc[0]
+
+        return None  # Only when truly zero candidates available
 
     def _calculate_group_score(
         self, group, indexer_to_exclude=None, indexer_to_include=None
@@ -568,12 +604,11 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
     - Each metric is normalized to a scale of 0 to 1, where 1 represents better performance.
     - Some metrics are inverted (1 - normalized value) if lower values are better (e.g., latency).
     - Missing data uses optimistic initialization: NA values in time-based metrics
-      (avg_sync_duration, indexing_agreement_acceptance_latency) are filled with 0,
-      giving new indexers the best possible score to encourage exploration.
+      (avg_sync_duration) are filled with 0, giving new indexers the best possible score
+      to encourage exploration.
     - Different normalization techniques are used based on the nature of each metric:
         - Generic min-max normalization for most metrics
         - Special normalization for uptime and success rate to emphasize high performance
-        - Logistic function for acceptance latency
 
     :param merged: The input DataFrame containing various indexer metrics.
     :return: The input DataFrame with additional columns for normalized metrics:
@@ -583,7 +618,6 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
         - 'norm_stake_to_fees_iqr_deviation': Normalized stake-to-fees ratio deviation
         - 'norm_success_rate': Normalized success rate
         - 'norm_avg_sync_duration': Normalized average sync duration
-        - 'norm_indexing_agreement_acceptance_latency': Normalized acceptance latency
     """
     if merged.empty:
         new_columns = [
@@ -593,7 +627,6 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
             "norm_stake_to_fees_iqr_deviation",
             "norm_success_rate",
             "norm_avg_sync_duration",
-            "norm_indexing_agreement_acceptance_latency",
         ]
         for col in new_columns:
             merged[col] = pd.Series(dtype=float)
@@ -662,25 +695,8 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
         else:
             merged["norm_avg_sync_duration"] = np.nan
 
-    # Normalize indexing_agreement_acceptance_latency
-    # Use pre-computed if available, otherwise compute
-    if "norm_indexing_agreement_acceptance_latency" not in merged.columns:
-        if "indexing_agreement_acceptance_latency" in merged.columns:
-            merged["norm_indexing_agreement_acceptance_latency"] = (
-                _normalize_indexing_agreement_acceptance_latency(
-                    merged["indexing_agreement_acceptance_latency"]
-                )
-            )  # lower is better (NA filled with 0 = optimistic)
-        else:
-            merged["norm_indexing_agreement_acceptance_latency"] = np.nan
-
-    # Fill NaN values with 0 for all norm_ columns except norm_indexing_agreement_acceptance_latency
-    norm_columns = [
-        col
-        for col in merged.columns
-        if col.startswith("norm_")
-        and col != "norm_indexing_agreement_acceptance_latency"
-    ]
+    # Fill NaN values with 0 for all norm_ columns
+    norm_columns = [col for col in merged.columns if col.startswith("norm_")]
     merged[norm_columns] = merged[norm_columns].fillna(0)
 
     return merged
@@ -740,73 +756,6 @@ def _normalize_uptime_and_success_rate(series: pd.Series) -> pd.Series:
 
     # Reindex and fill NaN's with 0.
     normalized = normalized.reindex(series.index).fillna(0)
-
-    return normalized
-
-
-def _normalize_indexing_agreement_acceptance_latency(
-    latency_series: pd.Series,
-    l: float = 1.002,  # noqa: E741
-    k: float = 1,
-    x0: float = 6,
-) -> pd.Series:
-    """
-    Normalize indexing agreement acceptance latency using a piecewise function:
-    logistic for x <= x0, linear for x > x0.
-
-    Note:
-    - Indexing agreement acceptance latency should be measured in hours to 2 d.p, not minutes or seconds.
-    - Lower latency results in higher normalized values.
-    - Negative latency values are clipped to 0 before normalization.
-    - Large latency values are clipped to a maximum of 8 hours, after this the score is 0 anyway.
-
-    :param latency_series: The input series containing latency data in hours.
-    :param l: The logistic function's maximum value. Defaults to 1.002.
-    :param k: The steepness of the curve. Defaults to 1.
-    :param x0: The x-value of the sigmoid's midpoint. Defaults to 6 hours.
-    :return: A new series with normalized values between 0 and 1.
-    """
-
-    def logistic(x):
-        """
-        This function creates the smooth transition from high scores
-        for low latencies to low scores for high latencies.
-
-        x: time in hours
-        """
-        return l / (1 + np.exp(k * (x - x0)))
-
-    # x0 is the midpoint of the logistic function, we need to find the gradient of the slope through that point
-    def slope_at_x0():
-        """
-        Calculate the slope of the logistic function at x0.
-        """
-        h = 1e-6
-        return (logistic(x0 + h) - logistic(x0 - h)) / (2 * h)
-
-    m = slope_at_x0()
-
-    def piecewise_function(x):
-        """
-        Apply a piecewise function: logistic for x <= x0, linear for x > x0.
-        """
-        return np.where(x <= x0, logistic(x), logistic(x0) + m * (x - x0))
-
-    # Fill NA with optimistic value (0 = fastest = best score)
-    latency_series = pd.to_numeric(latency_series, errors="coerce").fillna(0.0)
-
-    # Replace negative values with 0 (as negative latency doesn't make sense)
-    latency_series = latency_series.clip(lower=0)
-
-    # Configure max input latency and clip the series so all values are <= the max value.
-    max_latency = 8
-    clipped_latency = np.clip(latency_series, 0, max_latency)
-
-    # Apply the piecewise function to normalize acceptance latency
-    normalized = pd.Series(piecewise_function(clipped_latency)).round(3)
-
-    # Handle any remaining NaN's with optimistic score
-    normalized = normalized.fillna(1.0)
 
     return normalized
 

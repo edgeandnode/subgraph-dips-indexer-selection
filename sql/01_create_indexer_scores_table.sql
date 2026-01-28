@@ -38,10 +38,8 @@ CREATE TABLE IF NOT EXISTS `graph-mainnet.iisa_data_for_dips.indexer_scores` (
   -- DIP agreement metrics
   -- existing_dips_agreements: Updated at runtime when agreements are made (default 0)
   -- avg_sync_duration: Not yet populated from data source (see GitHub issue)
-  -- indexing_agreement_acceptance_latency: Not yet populated from data source (see GitHub issue)
   existing_dips_agreements INT64 DEFAULT 0,
   avg_sync_duration FLOAT64,
-  indexing_agreement_acceptance_latency FLOAT64,
 
   -- Organization/location for decentralization checks
   -- Lat/lon are rounded to nearest 20 degrees for privacy bucketing

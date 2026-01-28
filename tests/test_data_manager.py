@@ -35,7 +35,6 @@ class TestDataManager:
             "dst_lon": [10.0, -74.0, 139.0],
             "existing_dips_agreements": [2, 1, 0],
             "avg_sync_duration": [np.nan, np.nan, np.nan],
-            "indexing_agreement_acceptance_latency": [np.nan, np.nan, np.nan],
             "computed_at": [datetime(2024, 1, 15, 12, 0)] * 3,
             "query_count": [10000, 8000, 12000],
             "num_days": [28, 28, 28],
