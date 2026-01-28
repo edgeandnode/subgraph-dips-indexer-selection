@@ -108,6 +108,27 @@ class HealthResponse(BaseModel):
     data_loaded: bool
 
 
+class ScoreRequest(BaseModel):
+    """
+    Request body for the /get-score endpoint.
+    """
+
+    indexer_id: str
+
+
+class ScoreResponse(BaseModel):
+    """
+    Response for the /get-score endpoint.
+
+    Returns the weighted score and component scores for an indexer.
+    """
+
+    indexer_id: str
+    weighted_score: Optional[float] = None
+    components: Optional[dict[str, float]] = None
+    found: bool
+
+
 # =============================================================================
 # Service State
 # =============================================================================
@@ -299,6 +320,61 @@ async def refresh_data():
         return {"status": "success", "rows": row_count}
     else:
         raise HTTPException(status_code=500, detail="Failed to refresh data from BigQuery")
+
+
+@app.post("/get-score", response_model=ScoreResponse)
+async def get_score(request: ScoreRequest) -> ScoreResponse:
+    """
+    Get the weighted score and component scores for an indexer.
+
+    Returns the indexer's current weighted score along with the individual
+    component scores that contribute to it. Useful for debugging selection
+    decisions and monitoring indexer performance.
+    """
+    if not _state.is_ready or _state.history is None:
+        raise HTTPException(status_code=503, detail="IISA data not loaded")
+
+    indexer_data = _state.history[_state.history["indexer"] == request.indexer_id]
+
+    if indexer_data.empty:
+        return ScoreResponse(
+            indexer_id=request.indexer_id,
+            found=False,
+        )
+
+    row = indexer_data.iloc[0]
+
+    # Extract component scores (norm_ prefixed columns)
+    components = {}
+    component_keys = [
+        ("norm_lat_lin_reg_coefficient", "latency"),
+        ("norm_uptime_score", "uptime"),
+        ("norm_success_rate", "success_rate"),
+        ("norm_stake_to_fees_iqr_deviation", "stake_to_fees"),
+        ("norm_avg_sync_duration", "sync_duration"),
+        ("norm_indexing_agreement_acceptance_latency", "acceptance_latency"),
+    ]
+
+    for col, name in component_keys:
+        if col in row.index and pd.notna(row[col]):
+            components[name] = float(row[col])
+
+    # Calculate weighted score using DataProcessor logic
+    from .indexer_selection import _normalize_metrics, _calculate_weighted_score, DEFAULT_WEIGHTS
+
+    # Normalize and calculate score for this single indexer
+    normalized = _normalize_metrics(indexer_data.copy())
+    if not normalized.empty:
+        weighted_score = float(_calculate_weighted_score(normalized.iloc[0], DEFAULT_WEIGHTS))
+    else:
+        weighted_score = None
+
+    return ScoreResponse(
+        indexer_id=request.indexer_id,
+        weighted_score=weighted_score,
+        components=components,
+        found=True,
+    )
 
 
 @app.post("/select-indexers", response_model=SelectionResponse)

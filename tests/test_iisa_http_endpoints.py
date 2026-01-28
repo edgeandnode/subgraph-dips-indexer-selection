@@ -505,6 +505,88 @@ class TestRefreshEndpoint:
         assert "Failed to refresh" in response.json()["detail"]
 
 
+class TestGetScoreEndpoint:
+    """Tests for POST /get-score endpoint."""
+
+    @patch("iisa.iisa_http_endpoints.DataManager")
+    @patch("iisa.iisa_http_endpoints.BigQueryProvider")
+    def test_get_score_found(self, mock_bq_class, mock_dm_class, mock_history_df):
+        """Verify returns score and components for existing indexer."""
+        # Arrange
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.load_scores.return_value = True
+        mock_dm_instance.get_data.return_value = mock_history_df
+        mock_dm_class.return_value = mock_dm_instance
+
+        with patch.dict(os.environ, {"IISA_GCP_PROJECT": "test-project"}):
+            settings = Settings()
+            iisa_http_endpoints._state.initialize(settings)
+            iisa_http_endpoints._state.refresh_data()
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Act
+        response = client.post("/get-score", json={"indexer_id": "0xABC"})
+
+        # Assert
+        assert response.status_code == 200
+        data = response.json()
+        assert data["indexer_id"] == "0xABC"
+        assert data["found"] is True
+        assert data["weighted_score"] is not None
+        assert isinstance(data["components"], dict)
+
+    @patch("iisa.iisa_http_endpoints.DataManager")
+    @patch("iisa.iisa_http_endpoints.BigQueryProvider")
+    def test_get_score_not_found(self, mock_bq_class, mock_dm_class, mock_history_df):
+        """Verify returns found=false for non-existent indexer."""
+        # Arrange
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.load_scores.return_value = True
+        mock_dm_instance.get_data.return_value = mock_history_df
+        mock_dm_class.return_value = mock_dm_instance
+
+        with patch.dict(os.environ, {"IISA_GCP_PROJECT": "test-project"}):
+            settings = Settings()
+            iisa_http_endpoints._state.initialize(settings)
+            iisa_http_endpoints._state.refresh_data()
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Act
+        response = client.post("/get-score", json={"indexer_id": "0xNONEXISTENT"})
+
+        # Assert
+        assert response.status_code == 200
+        data = response.json()
+        assert data["indexer_id"] == "0xNONEXISTENT"
+        assert data["found"] is False
+        assert data["weighted_score"] is None
+        assert data["components"] is None
+
+    def test_get_score_no_data(self):
+        """Verify 503 when data not loaded."""
+        # Arrange
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        iisa_http_endpoints._state._history = None
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Act
+        response = client.post("/get-score", json={"indexer_id": "A"})
+
+        # Assert
+        assert response.status_code == 503
+
+
 class TestSelectIndexersEndpoint:
     """Tests for POST /select-indexers endpoint."""
 
