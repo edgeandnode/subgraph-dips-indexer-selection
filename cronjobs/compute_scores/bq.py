@@ -461,7 +461,12 @@ class BigQueryClient:
         return df
 
     def write_scores(self, scores_df: pd.DataFrame) -> None:
-        """Write computed scores to the indexer_scores table."""
+        """Write computed scores to the indexer_scores table.
+
+        Uses if_exists="replace" which atomically replaces the entire table.
+        This ensures each indexer has exactly one row and readers see either
+        all old data or all new data, never partial updates.
+        """
         memory_mb = scores_df.memory_usage(deep=True).sum() / (1024 * 1024)
         logger.info(f"Writing {len(scores_df)} scores ({memory_mb:.2f} MB) to {self.scores_table}")
 
@@ -477,9 +482,9 @@ class BigQueryClient:
             if col in scores_df.columns:
                 scores_df[col] = scores_df[col].astype("float64")
 
-        # Convert to bigframes and write
+        # Atomically replace entire table
         bf_df = self._bpd.DataFrame(scores_df)
-        bf_df.to_gbq(self.scores_table, if_exists="append")
+        bf_df.to_gbq(self.scores_table, if_exists="replace")
 
         logger.info("Successfully wrote scores to BigQuery")
 
