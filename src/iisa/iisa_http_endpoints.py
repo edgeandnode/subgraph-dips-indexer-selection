@@ -354,7 +354,6 @@ async def get_score(request: ScoreRequest) -> ScoreResponse:
         ("norm_success_rate", "success_rate"),
         ("norm_stake_to_fees_iqr_deviation", "stake_to_fees"),
         ("norm_avg_sync_duration", "sync_duration"),
-        ("norm_indexing_agreement_acceptance_latency", "acceptance_latency"),
     ]
 
     for col, name in component_keys:

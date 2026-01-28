@@ -386,12 +386,13 @@ def reset_state():
 def mock_history_df():
     """Create a mock DataFrame simulating loaded history data."""
     return pd.DataFrame({
-        "indexer": ["0xABC", "0xXYZ", "0x123"],
+        "indexer": ["0xabc", "0xxyz", "0x123"],  # lowercase for case-insensitive matching
         "url": ["https://a.com/", "https://b.com/", "https://c.com/"],
         "norm_lat_lin_reg_coefficient": [0.8, 0.9, 0.6],
         "norm_uptime_score": [0.9, 0.7, 0.95],
         "norm_success_rate": [0.85, 0.6, 0.9],
         "norm_stake_to_fees_iqr_deviation": [0.5, 0.8, 0.65],
+        "norm_avg_sync_duration": [0.7, 0.8, 0.9],
         "existing_dips_agreements": [2, 1, 0],
     })
 

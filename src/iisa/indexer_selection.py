@@ -53,20 +53,18 @@ class WeightsDict(TypedDict, total=False):
     stake_to_fees_iqr_deviation: float
     success_rate: float
     avg_sync_duration: float
-    indexing_agreement_acceptance_latency: float
 
 
 DEFAULT_WEIGHTS = cast(
     WeightsDict,
     MappingProxyType(
         {
-            "lat_lin_reg_coefficient": 0.2424,
-            "uptime_score": 0.1667,
-            "existing_dips_agreements": 0.1212,
-            "stake_to_fees_iqr_deviation": 0.1023,
-            "success_rate": 0.0625,
-            "avg_sync_duration": 0.0625,
-            "indexing_agreement_acceptance_latency": 0.2424,
+            "lat_lin_reg_coefficient": 0.3199,
+            "uptime_score": 0.2200,
+            "existing_dips_agreements": 0.1600,
+            "stake_to_fees_iqr_deviation": 0.1350,
+            "success_rate": 0.0825,
+            "avg_sync_duration": 0.0826,
         }
     ),
 )
@@ -607,12 +605,11 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
     - Each metric is normalized to a scale of 0 to 1, where 1 represents better performance.
     - Some metrics are inverted (1 - normalized value) if lower values are better (e.g., latency).
     - Missing data uses optimistic initialization: NA values in time-based metrics
-      (avg_sync_duration, indexing_agreement_acceptance_latency) are filled with 0,
-      giving new indexers the best possible score to encourage exploration.
+      (avg_sync_duration) are filled with 0, giving new indexers the best possible score
+      to encourage exploration.
     - Different normalization techniques are used based on the nature of each metric:
         - Generic min-max normalization for most metrics
         - Special normalization for uptime and success rate to emphasize high performance
-        - Logistic function for acceptance latency
 
     :param merged: The input DataFrame containing various indexer metrics.
     :return: The input DataFrame with additional columns for normalized metrics:
@@ -622,7 +619,6 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
         - 'norm_stake_to_fees_iqr_deviation': Normalized stake-to-fees ratio deviation
         - 'norm_success_rate': Normalized success rate
         - 'norm_avg_sync_duration': Normalized average sync duration
-        - 'norm_indexing_agreement_acceptance_latency': Normalized acceptance latency
     """
     if merged.empty:
         new_columns = [
@@ -632,7 +628,6 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
             "norm_stake_to_fees_iqr_deviation",
             "norm_success_rate",
             "norm_avg_sync_duration",
-            "norm_indexing_agreement_acceptance_latency",
         ]
         for col in new_columns:
             merged[col] = pd.Series(dtype=float)
@@ -701,25 +696,8 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
         else:
             merged["norm_avg_sync_duration"] = np.nan
 
-    # Normalize indexing_agreement_acceptance_latency
-    # Use pre-computed if available, otherwise compute
-    if "norm_indexing_agreement_acceptance_latency" not in merged.columns:
-        if "indexing_agreement_acceptance_latency" in merged.columns:
-            merged["norm_indexing_agreement_acceptance_latency"] = (
-                _normalize_indexing_agreement_acceptance_latency(
-                    merged["indexing_agreement_acceptance_latency"]
-                )
-            )  # lower is better (NA filled with 0 = optimistic)
-        else:
-            merged["norm_indexing_agreement_acceptance_latency"] = np.nan
-
-    # Fill NaN values with 0 for all norm_ columns except norm_indexing_agreement_acceptance_latency
-    norm_columns = [
-        col
-        for col in merged.columns
-        if col.startswith("norm_")
-        and col != "norm_indexing_agreement_acceptance_latency"
-    ]
+    # Fill NaN values with 0 for all norm_ columns
+    norm_columns = [col for col in merged.columns if col.startswith("norm_")]
     merged[norm_columns] = merged[norm_columns].fillna(0)
 
     return merged
@@ -779,73 +757,6 @@ def _normalize_uptime_and_success_rate(series: pd.Series) -> pd.Series:
 
     # Reindex and fill NaN's with 0.
     normalized = normalized.reindex(series.index).fillna(0)
-
-    return normalized
-
-
-def _normalize_indexing_agreement_acceptance_latency(
-    latency_series: pd.Series,
-    l: float = 1.002,  # noqa: E741
-    k: float = 1,
-    x0: float = 6,
-) -> pd.Series:
-    """
-    Normalize indexing agreement acceptance latency using a piecewise function:
-    logistic for x <= x0, linear for x > x0.
-
-    Note:
-    - Indexing agreement acceptance latency should be measured in hours to 2 d.p, not minutes or seconds.
-    - Lower latency results in higher normalized values.
-    - Negative latency values are clipped to 0 before normalization.
-    - Large latency values are clipped to a maximum of 8 hours, after this the score is 0 anyway.
-
-    :param latency_series: The input series containing latency data in hours.
-    :param l: The logistic function's maximum value. Defaults to 1.002.
-    :param k: The steepness of the curve. Defaults to 1.
-    :param x0: The x-value of the sigmoid's midpoint. Defaults to 6 hours.
-    :return: A new series with normalized values between 0 and 1.
-    """
-
-    def logistic(x):
-        """
-        This function creates the smooth transition from high scores
-        for low latencies to low scores for high latencies.
-
-        x: time in hours
-        """
-        return l / (1 + np.exp(k * (x - x0)))
-
-    # x0 is the midpoint of the logistic function, we need to find the gradient of the slope through that point
-    def slope_at_x0():
-        """
-        Calculate the slope of the logistic function at x0.
-        """
-        h = 1e-6
-        return (logistic(x0 + h) - logistic(x0 - h)) / (2 * h)
-
-    m = slope_at_x0()
-
-    def piecewise_function(x):
-        """
-        Apply a piecewise function: logistic for x <= x0, linear for x > x0.
-        """
-        return np.where(x <= x0, logistic(x), logistic(x0) + m * (x - x0))
-
-    # Fill NA with optimistic value (0 = fastest = best score)
-    latency_series = pd.to_numeric(latency_series, errors="coerce").fillna(0.0)
-
-    # Replace negative values with 0 (as negative latency doesn't make sense)
-    latency_series = latency_series.clip(lower=0)
-
-    # Configure max input latency and clip the series so all values are <= the max value.
-    max_latency = 8
-    clipped_latency = np.clip(latency_series, 0, max_latency)
-
-    # Apply the piecewise function to normalize acceptance latency
-    normalized = pd.Series(piecewise_function(clipped_latency)).round(3)
-
-    # Handle any remaining NaN's with optimistic score
-    normalized = normalized.fillna(1.0)
 
     return normalized
 
