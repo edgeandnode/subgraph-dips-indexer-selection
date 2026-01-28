@@ -1357,7 +1357,7 @@ class TestTargetSize:
         )
 
     def test_target_size_defaults_to_three(self, sample_data_with_scores):
-        """Default target_size is 3 for backwards compatibility."""
+        """Default target_size is 3."""
         # Arrange & Act
         with patch("iisa.indexer_selection.DataProcessor._process_data"):
             processor = DataProcessor(

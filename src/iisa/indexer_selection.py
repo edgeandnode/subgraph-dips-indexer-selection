@@ -59,12 +59,12 @@ DEFAULT_WEIGHTS = cast(
     WeightsDict,
     MappingProxyType(
         {
-            "lat_lin_reg_coefficient": 0.3199,
-            "uptime_score": 0.2200,
-            "existing_dips_agreements": 0.1600,
-            "stake_to_fees_iqr_deviation": 0.1350,
+            "lat_lin_reg_coefficient": 0.32,
+            "uptime_score": 0.22,
+            "existing_dips_agreements": 0.16,
+            "stake_to_fees_iqr_deviation": 0.135,
             "success_rate": 0.0825,
-            "avg_sync_duration": 0.0826,
+            "avg_sync_duration": 0.0825,
         }
     ),
 )
@@ -104,7 +104,6 @@ class DataProcessor:
 
         Args:
             target_size: The target number of indexers to assign to this deployment.
-                         Defaults to 3 for backwards compatibility.
         """
         # Initialize class variables with provided parameters
         self.data = pd.DataFrame(history)
