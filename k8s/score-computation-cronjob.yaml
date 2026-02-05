@@ -14,7 +14,7 @@ metadata:
   labels:
     app: iisa-score-computation
 spec:
-  schedule: "0 0 * * *"  # Daily at midnight UTC
+  schedule: "0 9 * * *"  # Daily at 09:00 UTC (after dbt pipeline refreshes upstream tables at ~08:00 UTC)
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
