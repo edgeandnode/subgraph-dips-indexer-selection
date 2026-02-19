@@ -1002,7 +1002,7 @@ class TestFetchStakeToFees:
         assert result.loc[EXPECTED_INDEXER, "stake_to_fees"] == 10000.0
         assert pd.isna(result.loc[unknown_indexer, "stake_to_fees"])
 
-    def test_output_schema_matches_bigquery(self):
+    def test_output_schema(self):
         """Output must be indexed by 'indexer' with a 'stake_to_fees' column."""
         # Arrange
         provider = self._build_provider_with_fees({EXPECTED_INDEXER: 50.0})

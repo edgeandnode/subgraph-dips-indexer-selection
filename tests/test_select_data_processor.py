@@ -68,9 +68,9 @@ def mock__combined_query_results(faker):
 
 
 @pytest.fixture
-def mock__bigquery_provider(faker, mock__combined_query_results):
-    bigquery_provider = MagicMock()
-    bigquery_provider.return_value.fetch_initial_query_results.return_value = (
+def mock__provider(faker, mock__combined_query_results):
+    provider = MagicMock()
+    provider.return_value.fetch_initial_query_results.return_value = (
         pd.DataFrame(
             {
                 "deployment_hash": [faker.deployment_id() for _ in range(3)],
@@ -79,10 +79,10 @@ def mock__bigquery_provider(faker, mock__combined_query_results):
             }
         )
     )
-    bigquery_provider.return_value.fetch_combined_query_results.return_value = (
+    provider.return_value.fetch_combined_query_results.return_value = (
         mock__combined_query_results
     )
-    bigquery_provider.return_value.fetch_initial_stake_to_fees.return_value = (
+    provider.return_value.fetch_initial_stake_to_fees.return_value = (
         pd.DataFrame(
             {
                 "indexer": [faker.indexer_id() for _ in range(3)],
@@ -90,7 +90,7 @@ def mock__bigquery_provider(faker, mock__combined_query_results):
             }
         )
     )
-    return bigquery_provider
+    return provider
 
 
 class TestProcessSubgraph:
@@ -102,7 +102,7 @@ class TestProcessSubgraph:
     @pytest.mark.skip(reason="Flaky test: high dependency on internal details")
     @patch("iisa.indexer_selection.DataProcessor")
     def test_process_subgraph(
-        self, mock__data_processor, sample_data, mock__bigquery_provider
+        self, mock__data_processor, sample_data, mock__provider
     ):
         """
         Test the process_subgraph function creates a DataProcessor instance and returns the expected results.
@@ -188,13 +188,12 @@ class TestDataProcessor:
         This test verifies:
         1. The constructor correctly sets all instance variables with provided parameters.
         2. Default values are applied when optional parameters are not provided.
-        3. The BigQueryProvider is properly instantiated.
-        4. The _process_data method is called once.
-        5. The indexer_denylist is properly applied.
-        6. The 'data' DataFrame maintains its original content, while adding the new columns.
-        7. Optional parameters (existing_agreements, indexer_denylist) default empty if not set.
+        3. The _process_data method is called once.
+        4. The indexer_denylist is properly applied.
+        5. The 'data' DataFrame maintains its original content, while adding the new columns.
+        6. Optional parameters (existing_agreements, indexer_denylist) default empty if not set.
 
-        The test uses mock objects for BigQueryProvider and patch decorators for _process_data
+        The test uses mock objects and patch decorators for _process_data
         and derive_timestamps to avoid actual data fetching and ensure consistent test behavior.
         """
         # Define test input parameters
@@ -268,7 +267,7 @@ class TestDataProcessor:
         current_group,
         expected_added,
         expected_cancelled,
-        mock__bigquery_provider,
+        mock__provider,
     ):
         """
         This test verifies the get_indexer_selections method correctly identifies the
@@ -304,7 +303,7 @@ class TestDataProcessor:
         )
 
     def test_get_indexer_selections_empty_groups(
-        self, sample_data, mock__bigquery_provider
+        self, sample_data, mock__provider
     ):
         """
         Test get_indexer_selections method when both initial_group and current_group are empty.
@@ -340,7 +339,7 @@ class TestDataProcessor:
         mock_get_group,
         mock__fetch,
         sample_data,
-        mock__bigquery_provider,
+        mock__provider,
     ):
         """
         Test the _process_data method of the DataProcessor class.
@@ -402,7 +401,7 @@ class TestDataProcessor:
         assert processor.initial_group == ["A", "B"]
 
     def test_fetch_number_of_indexer_agreements(
-        self, sample_data, mock__bigquery_provider
+        self, sample_data, mock__provider
     ):
         """
         This test verifies the _fetch_number_of_indexer_agreements method updates the
@@ -448,7 +447,7 @@ class TestDataProcessor:
         ), "C issue"
 
     @pytest.fixture
-    def processor(self, sample_data, mock__bigquery_provider):
+    def processor(self, sample_data, mock__provider):
         return DataProcessor(
             history=sample_data,
             deployment_id=DeploymentId("test_subgraph"),
@@ -488,7 +487,7 @@ class TestDataProcessor:
         assert result == []
 
     def test_get_current_group_subgraph_not_in_agreements(
-        self, processor, mock__bigquery_provider
+        self, processor, mock__provider
     ):
         """
         Test _get_current_group when the subgraph 'test_subgraph' is not in any agreement.
@@ -503,7 +502,7 @@ class TestDataProcessor:
     @patch("iisa.indexer_selection._normalize_metrics")
     @patch("iisa.indexer_selection._calculate_weighted_score")
     def test_normalize_and_score(
-        self, mock_calculate_score, mock_normalize, sample_data, mock__bigquery_provider
+        self, mock_calculate_score, mock_normalize, sample_data, mock__provider
     ):
         """
         Test the _normalize_and_score method.
@@ -579,7 +578,7 @@ class TestDataProcessor:
         pd.testing.assert_series_equal(result["weighted_score"], expected_scores)
 
     @pytest.mark.skip(reason="Flaky test: high dependency on internal details")
-    def test_assign_indexers_to_subgraph(self, sample_data, mock__bigquery_provider):
+    def test_assign_indexers_to_subgraph(self, sample_data, mock__provider):
         """
         Test the _assign_indexers_to_subgraph method of DataProcessor.
 
@@ -645,7 +644,7 @@ class TestDataProcessor:
         initial_group,
         expected_calls,
         expected_final_group,
-        mock__bigquery_provider,
+        mock__provider,
     ):
         """
         Test the _add_indexers_to_group method of DataProcessor.
@@ -684,7 +683,7 @@ class TestDataProcessor:
             processor._add_indexers_to_group()
             assert processor.current_group == ["A"]
 
-    def test_meets_decentralization_requirements(self, mock__bigquery_provider):
+    def test_meets_decentralization_requirements(self, mock__provider):
         """
         Test the _meets_decentralization_requirements method of DataProcessor.
 
@@ -743,7 +742,7 @@ class TestDataProcessor:
         assert not processor._meets_decentralization_requirements("A")
 
     def test_meets_decentralization_requirements_edge_cases(
-        self, mock__bigquery_provider
+        self, mock__provider
     ):
         """
         Test _meets_decentralization_requirements with various edge cases.
@@ -789,7 +788,7 @@ class TestDataProcessor:
         assert processor._meets_decentralization_requirements("E")  # Adds more diversity
 
     def test_replace_underperforming_indexers_replaces_low_scorer(
-        self, mock__bigquery_provider
+        self, mock__provider
     ):
         """
         Test replacement when indexer scores below MIN_INDEXER_SCORE and
@@ -823,7 +822,7 @@ class TestDataProcessor:
         assert len(processor.current_group) == 3
 
     def test_replace_underperforming_indexers_keeps_adequate_performers(
-        self, mock__bigquery_provider
+        self, mock__provider
     ):
         """
         Test that indexers scoring >= MIN_INDEXER_SCORE are not replaced,
@@ -854,7 +853,7 @@ class TestDataProcessor:
         assert processor.current_group == ["A", "B", "C"]
 
     def test_replace_underperforming_indexers_margin_not_met(
-        self, mock__bigquery_provider
+        self, mock__provider
     ):
         """
         Test that no replacement occurs when candidate doesn't exceed
@@ -885,7 +884,7 @@ class TestDataProcessor:
         assert processor.current_group == ["A", "B", "C"]
 
     def test_replace_underperforming_indexers_multiple_swaps(
-        self, mock__bigquery_provider
+        self, mock__provider
     ):
         """
         Test iterative replacement when multiple indexers are below threshold.
@@ -921,7 +920,7 @@ class TestDataProcessor:
         assert len(processor.current_group) == 3
 
     def test_replace_underperforming_indexers_skips_newly_added(
-        self, mock__bigquery_provider
+        self, mock__provider
     ):
         """
         Test that newly added indexers are not eligible for replacement in the same call.
@@ -953,7 +952,7 @@ class TestDataProcessor:
         assert len(processor.current_group) == 3
 
     def test_find_best_replacement_or_select_best_indexer(
-        self, mock__bigquery_provider
+        self, mock__provider
     ):
         """
         Test the _find_best_replacement_or_select_best_indexer method of DataProcessor.
@@ -991,7 +990,7 @@ class TestDataProcessor:
             # Verify the number of decentralization requirement checks
             assert mock_decentralization.call_count == 1
 
-    def test_calculate_group_score(self, mock__bigquery_provider):
+    def test_calculate_group_score(self, mock__provider):
         """
         Test the _calculate_group_score method of the DataProcessor class.
 
@@ -1051,7 +1050,7 @@ class TestDataProcessor:
         pd.testing.assert_frame_equal(processor.data, original_data)
 
     def test_update_indexer_denylist_cancel_indexing_agreements(
-        self, sample_data, mock__bigquery_provider
+        self, sample_data, mock__provider
     ):
         """
         Test the update_indexer_denylist_cancel_indexing_agreements method of DataProcessor.

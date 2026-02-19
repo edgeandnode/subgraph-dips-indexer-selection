@@ -1,9 +1,8 @@
 """
 RedpandaProvider: Redpanda-backed data source for the score computation CronJob.
 
-Replaces BigQuery as the raw data source. A daily batch replay consumes the
-gateway_queries topic for the 28-day regression window using a two-pass
-architecture:
+A daily batch replay consumes the gateway_queries topic for the 28-day
+regression window using a two-pass architecture:
 
   Pass 1 (count): lightweight scan counting (deployment, indexer) pairs and
   accumulating fees. Uses minimal proto parsing (keys + fee only).
@@ -16,7 +15,7 @@ polling (consumer.consume). Partition offsets resolved in pass 1 are cached
 for reuse in pass 2.
 
 Stake data is fetched via GraphQL from the Graph Network subgraph.
-Computed scores are written to a JSON file on a shared PVC instead of BigQuery.
+Computed scores are written to a JSON file on a shared PVC.
 """
 
 import json
@@ -77,9 +76,9 @@ def _map_result_to_status(result: str) -> str:
 
 class RedpandaProvider:
     """
-    Duck-typed replacement for BigQueryClient.
+    Data provider for compute_all_scores.
 
-    Implements the same interface used by compute_all_scores:
+    Implements the interface expected by compute_all_scores:
       fetch_initial_query_results, fetch_combined_query_results,
       fetch_stake_to_fees, write_scores, scores_exist_for_today.
 
@@ -136,8 +135,7 @@ class RedpandaProvider:
         """
         Return row counts per (deployment_hash, indexer) pair.
 
-        Matches BigQueryClient.fetch_initial_query_results output schema:
-        columns [deployment_hash, indexer, num_rows].
+        Output schema: columns [deployment_hash, indexer, num_rows].
         """
         self._ensure_count_cache(start_date, num_days)
 
@@ -163,8 +161,7 @@ class RedpandaProvider:
         Algorithm R reservoir sampling during pass 2. The groupby truncation
         is kept as a safety net.
 
-        Matches BigQueryClient.fetch_combined_query_results output schema:
-        columns [query_id, deployment_hash, fee, timestamp, blocks_behind,
+        Output schema: columns [query_id, deployment_hash, fee, timestamp, blocks_behind,
                  response_time_ms, indexer, status, day_partition,
                  subgraph_network, url].
         """
@@ -199,7 +196,7 @@ class RedpandaProvider:
         by summing fee_grt across all indexer attempts in the 28-day window.
 
         Returns a DataFrame indexed by 'indexer' with a 'stake_to_fees' column,
-        matching the schema BigQueryClient.fetch_stake_to_fees returns.
+        matching the schema expected by compute_all_scores.
         """
         if not self._graph_network_url:
             logger.warning(
@@ -229,7 +226,7 @@ class RedpandaProvider:
         df["total_query_fees"] = df["indexer"].map(self._fees_per_indexer).fillna(0.0)
 
         # stake_to_fees = slashable_stake / total_fees. Indexers with zero fees
-        # get NaN (matches BigQuery behaviour where SQL division by zero produces NULL).
+        # get NaN (division by zero produces NULL / NaN).
         df["stake_to_fees"] = (
             df["recent_slashable_stake"] / df["total_query_fees"].replace(0.0, float("nan"))
         )
