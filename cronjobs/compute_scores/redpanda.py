@@ -29,6 +29,11 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Cap parallel partition consumers to avoid unbounded thread/connection creation.
+# The CronJob runs with 8 CPUs; one consumer per core saturates throughput
+# without excessive Kafka connections on topics with many partitions.
+MAX_PARTITION_WORKERS = int(os.environ.get("REDPANDA_MAX_WORKERS", "8"))
+
 import base58
 import pandas as pd
 import requests
@@ -230,12 +235,7 @@ class RedpandaProvider:
         scores_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = str(scores_path) + ".tmp"
 
-        # Serialise datetimes to ISO strings for round-trip fidelity.
-        data = scores_df.copy()
-        for col in data.select_dtypes(include=["datetime64[ns, UTC]", "datetime64[ns]"]).columns:
-            data[col] = data[col].dt.strftime("%Y-%m-%dT%H:%M:%S%z")
-
-        data.to_json(tmp_path, orient="records", date_format="iso", date_unit="s")
+        scores_df.to_json(tmp_path, orient="records", date_format="iso", date_unit="s")
         os.replace(tmp_path, str(scores_path))
 
         memory_mb = scores_df.memory_usage(deep=True).sum() / (1024 * 1024)
@@ -379,7 +379,7 @@ class RedpandaProvider:
             finally:
                 consumer.close()
 
-        with ThreadPoolExecutor(max_workers=len(partitions)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(partitions), MAX_PARTITION_WORKERS)) as pool:
             results = list(pool.map(count_partition, partitions))
 
         # Merge per-partition counts and fees
@@ -518,7 +518,7 @@ class RedpandaProvider:
             finally:
                 consumer.close()
 
-        with ThreadPoolExecutor(max_workers=len(partitions)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(partitions), MAX_PARTITION_WORKERS)) as pool:
             results = list(pool.map(sample_partition, partitions))
 
         # Merge per-partition reservoirs

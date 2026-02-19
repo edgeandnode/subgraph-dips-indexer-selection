@@ -54,19 +54,19 @@ class TestSettings:
         assert settings.port == 8080
         assert settings.log_level == "INFO"
 
-    def test_settings_requires_gcp_project(self):
-        """Verify ValidationError when IISA_GCP_PROJECT missing."""
-        # Arrange - remove the required env var if present
+    def test_gcp_project_defaults_to_empty(self):
+        """gcp_project defaults to empty string (validated at runtime for bigquery mode)."""
+        # Arrange - remove the env var if present
         env_without_project = {k: v for k, v in os.environ.items() if k != "IISA_GCP_PROJECT"}
 
-        # Act & Assert
+        # Act
         with patch.dict(os.environ, env_without_project, clear=True):
             from iisa.iisa_http_endpoints import Settings
 
-            with pytest.raises(ValidationError) as exc_info:
-                Settings()
+            settings = Settings()
 
-            assert "gcp_project" in str(exc_info.value)
+        # Assert — empty string, not a validation error
+        assert settings.gcp_project == ""
 
     def test_get_settings_cached(self):
         """Verify @lru_cache returns same instance."""

@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import NewType, Optional, Tuple
 
 import pandas as pd
-from bigframes import pandas as bpd
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -38,6 +37,9 @@ class BigQueryProvider:
     """Reads pre-computed indexer scores from BigQuery."""
 
     def __init__(self, project: str, location: str) -> None:
+        from bigframes import pandas as bpd
+
+        self._bpd = bpd
         bpd.options.bigquery.project = project
         bpd.options.bigquery.location = location
         bpd.options.display.progress_bar = None
@@ -49,7 +51,7 @@ class BigQueryProvider:
         reraise=True,
     )
     def _read_gbq_dataframe(self, query: QueryStr) -> pd.DataFrame:
-        return bpd.read_gbq(query).to_pandas()
+        return self._bpd.read_gbq(query).to_pandas()
 
     def fetch_indexer_scores(
         self, dataset: str = "iisa_data_for_dips"
@@ -64,7 +66,7 @@ class BigQueryProvider:
         """
         logger.info("Fetching pre-computed indexer scores from BigQuery")
 
-        project = bpd.options.bigquery.project
+        project = self._bpd.options.bigquery.project
 
         query = QueryStr(f"""
             SELECT *
@@ -149,22 +151,22 @@ class DataManager:
     """
 
     def __init__(self, provider) -> None:
-        self._bq = provider
+        self._provider = provider
         self._data: Optional[pd.DataFrame] = None
         self._scores_computed_at: Optional[datetime] = None
 
     def load_scores(self) -> bool:
         """
-        Load pre-computed indexer scores from BigQuery.
+        Load pre-computed indexer scores from the configured provider.
 
         :return: True if scores were loaded successfully, False otherwise.
         """
-        logger.info("Loading pre-computed indexer scores from BigQuery")
+        logger.info("Loading pre-computed indexer scores")
 
-        scores_df, computed_at = self._bq.fetch_indexer_scores()
+        scores_df, computed_at = self._provider.fetch_indexer_scores()
 
         if scores_df.empty:
-            logger.warning("No pre-computed scores available in indexer_scores table")
+            logger.warning("No pre-computed scores available")
             self._data = None
             return False
 
