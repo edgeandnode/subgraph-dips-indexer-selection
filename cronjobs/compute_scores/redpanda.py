@@ -153,8 +153,8 @@ class RedpandaProvider:
         # Safety net: truncate any pair that exceeds rows_to_use after merge
         df = (
             self._row_cache_df
-            .groupby(["deployment_hash", "indexer"], group_keys=False)
-            .apply(lambda x: x.iloc[:rows_to_use])
+            .groupby(["deployment_hash", "indexer"])
+            .head(rows_to_use)
             .reset_index(drop=True)
         )
 
