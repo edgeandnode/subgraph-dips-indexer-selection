@@ -14,7 +14,7 @@ from collections import namedtuple
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, List
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 
 import pandas as pd
 import pytest
@@ -45,9 +45,10 @@ sys.modules["proto.gateway_queries_pb2"] = _pb2_mod
 
 ClientQueryProtobuf = _pb2_mod.ClientQueryProtobuf
 IndexerQueryProtobuf = _pb2_mod.IndexerQueryProtobuf
+extract_keys_and_fees = _pb2_mod.extract_keys_and_fees
+extract_sample_fields = _pb2_mod.extract_sample_fields
 
 from redpanda import (
-    MAX_RESERVOIR_PER_PAIR,
     RedpandaProvider,
     _bytes_to_cid,
     _bytes_to_hex,
@@ -196,7 +197,7 @@ class TestMapResultToStatus:
 
 
 # ---------------------------------------------------------------------------
-# Proto parser tests
+# Proto parser tests (existing class-based)
 # ---------------------------------------------------------------------------
 
 
@@ -298,6 +299,130 @@ class TestClientQueryProtobufParsing:
 
 
 # ---------------------------------------------------------------------------
+# Proto extraction function tests (optimized parsers)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractKeysAndFees:
+    """Tests for the pass 1 minimal parser."""
+
+    def test_returns_correct_tuples(self):
+        # Arrange — two-attempt message
+        a1 = _build_indexer_attempt(
+            indexer=INDEXER_BYTES, deployment=DEPLOYMENT_BYTES,
+            indexed_chain="mainnet", url="https://a.example.com/",
+            fee_grt=0.001, response_time_ms=50, result="success", blocks_behind=0,
+        )
+        a2 = _build_indexer_attempt(
+            indexer=bytes(20), deployment=DEPLOYMENT_BYTES,
+            indexed_chain="mainnet", url="https://b.example.com/",
+            fee_grt=0.002, response_time_ms=80, result="Timeout", blocks_behind=3,
+        )
+        raw = _build_client_query("qid-001-JFK", [a1, a2])
+
+        # Act
+        results = extract_keys_and_fees(raw)
+
+        # Assert
+        assert len(results) == 2
+        idx1, dep1, fee1 = results[0]
+        assert idx1 == INDEXER_BYTES
+        assert dep1 == DEPLOYMENT_BYTES
+        assert abs(fee1 - 0.001) < 1e-9
+
+        idx2, dep2, fee2 = results[1]
+        assert idx2 == bytes(20)
+        assert dep2 == DEPLOYMENT_BYTES
+        assert abs(fee2 - 0.002) < 1e-9
+
+    def test_empty_message_returns_empty_list(self):
+        # A message with no indexer_queries field
+        raw = _encode_field_str(3, "qid-empty")
+
+        # Act
+        results = extract_keys_and_fees(raw)
+
+        # Assert
+        assert results == []
+
+    def test_empty_bytes_returns_empty_list(self):
+        assert extract_keys_and_fees(b"") == []
+
+
+class TestExtractSampleFields:
+    """Tests for the pass 2 selective parser."""
+
+    def test_returns_query_id_and_attempts(self):
+        # Arrange
+        a1 = _build_indexer_attempt(
+            indexer=INDEXER_BYTES, deployment=DEPLOYMENT_BYTES,
+            indexed_chain="mainnet", url="https://indexer.example.com/",
+            fee_grt=0.001, response_time_ms=42, result="success", blocks_behind=5,
+        )
+        raw = _build_client_query("abc123-JFK", [a1])
+
+        # Act
+        query_id, attempts = extract_sample_fields(raw)
+
+        # Assert
+        assert query_id == "abc123-JFK"
+        assert len(attempts) == 1
+
+        att = attempts[0]
+        assert att["indexer_bytes"] == INDEXER_BYTES
+        assert att["deployment_bytes"] == DEPLOYMENT_BYTES
+        assert att["indexed_chain"] == "mainnet"
+        assert att["url"] == "https://indexer.example.com/"
+        assert abs(att["fee_grt"] - 0.001) < 1e-9
+        assert att["response_time_ms"] == 42
+        assert att["result"] == "success"
+        assert att["blocks_behind"] == 5
+
+    def test_skipped_fields_not_present(self):
+        """allocation (field 3), seconds_behind (8), indexer_errors (10) are skipped."""
+        a1 = _build_indexer_attempt(
+            indexer=INDEXER_BYTES, deployment=DEPLOYMENT_BYTES,
+            indexed_chain="mainnet", url="https://indexer.example.com/",
+            fee_grt=0.001, response_time_ms=42, result="success", blocks_behind=0,
+        )
+        raw = _build_client_query("qid-skip", [a1])
+
+        query_id, attempts = extract_sample_fields(raw)
+        att = attempts[0]
+
+        # These keys should NOT be in the dict
+        assert "allocation" not in att
+        assert "seconds_behind" not in att
+        assert "indexer_errors" not in att
+
+    def test_multiple_attempts(self):
+        a1 = _build_indexer_attempt(
+            indexer=INDEXER_BYTES, deployment=DEPLOYMENT_BYTES,
+            indexed_chain="mainnet", url="https://a.example.com/",
+            fee_grt=0.001, response_time_ms=50, result="success", blocks_behind=0,
+        )
+        a2 = _build_indexer_attempt(
+            indexer=bytes(20), deployment=DEPLOYMENT_BYTES,
+            indexed_chain="arbitrum-one", url="https://b.example.com/",
+            fee_grt=0.002, response_time_ms=80, result="Timeout", blocks_behind=10,
+        )
+        raw = _build_client_query("qid-multi", [a1, a2])
+
+        query_id, attempts = extract_sample_fields(raw)
+
+        assert query_id == "qid-multi"
+        assert len(attempts) == 2
+        assert attempts[0]["indexed_chain"] == "mainnet"
+        assert attempts[1]["indexed_chain"] == "arbitrum-one"
+        assert attempts[1]["result"] == "Timeout"
+
+    def test_empty_bytes(self):
+        query_id, attempts = extract_sample_fields(b"")
+        assert query_id == ""
+        assert attempts == []
+
+
+# ---------------------------------------------------------------------------
 # RedpandaProvider: write_scores / scores_exist_for_today
 # ---------------------------------------------------------------------------
 
@@ -376,7 +501,7 @@ class TestScoresFileIO:
 
 
 # ---------------------------------------------------------------------------
-# RedpandaProvider: _stream_and_cache via mocked Kafka
+# Mock helpers for two-pass architecture
 # ---------------------------------------------------------------------------
 
 
@@ -391,8 +516,55 @@ def _fake_kafka_message(ts_ms: int, value: bytes, partition: int = 0, offset: in
     return msg
 
 
+def _make_mock_consumer_class(consumer_mocks: List[MagicMock]) -> MagicMock:
+    """
+    Build a mock Consumer class that returns a different mock instance
+    on each instantiation (resolution consumer, then per-partition consumers).
+    """
+    MockClass = MagicMock()
+    MockClass.side_effect = consumer_mocks
+    return MockClass
+
+
+def _make_resolution_consumer(topic: str, partition_ids: List[int], start_offset: int = 100):
+    """Build a mock consumer for partition resolution (list_topics + offsets_for_times)."""
+    mock = MagicMock()
+
+    mock_topic_meta = MagicMock()
+    mock_topic_meta.partitions = {pid: MagicMock() for pid in partition_ids}
+    mock.list_topics.return_value.topics = {topic: mock_topic_meta}
+
+    resolved_tps = []
+    for pid in partition_ids:
+        tp = MagicMock()
+        tp.topic = topic
+        tp.partition = pid
+        tp.offset = start_offset
+        resolved_tps.append(tp)
+    mock.offsets_for_times.return_value = resolved_tps
+
+    return mock
+
+
+def _make_partition_consumer(message_batches: List[List]):
+    """
+    Build a mock consumer for a single partition.
+
+    message_batches is a list of lists: each inner list is returned by
+    one call to consume(). Empty lists simulate timeouts.
+    """
+    mock = MagicMock()
+    mock.consume.side_effect = message_batches
+    return mock
+
+
+# ---------------------------------------------------------------------------
+# RedpandaProvider: two-pass caching tests
+# ---------------------------------------------------------------------------
+
+
 class TestRedpandaProviderCaching:
-    """Tests for _stream_and_cache, fetch_initial_query_results, fetch_combined_query_results."""
+    """Tests for _count_pass, _sample_pass, fetch_initial_query_results, fetch_combined_query_results."""
 
     def _build_provider(self) -> RedpandaProvider:
         """Build a RedpandaProvider with mocked environment."""
@@ -437,7 +609,7 @@ class TestRedpandaProviderCaching:
         return _build_client_query(query_id, [a1, a2])
 
     def test_fetch_initial_query_results_counts(self):
-        """fetch_initial_query_results should return true attempt counts."""
+        """fetch_initial_query_results should return true attempt counts (count pass only)."""
         # Arrange
         provider = self._build_provider()
         start_date = date(2024, 1, 1)
@@ -446,35 +618,23 @@ class TestRedpandaProviderCaching:
 
         deployment = bytes(range(32))
         indexer1 = INDEXER_BYTES
-        indexer2 = bytes(20)  # zero bytes — 20 zeros
+        indexer2 = bytes(20)
 
         msg_value = self._two_attempt_message(
             "qid-001-JFK", deployment, indexer1, indexer2, ts_ms
         )
         fake_msg = _fake_kafka_message(ts_ms, msg_value)
 
-        # Mock the Kafka Consumer
-        MockConsumer = MagicMock()
-        mock_consumer = MockConsumer.return_value
+        # Resolution consumer (for _resolve_partitions)
+        resolution_consumer = _make_resolution_consumer("gateway_queries", [0])
 
-        # list_topics returns a topic with one partition
-        mock_topic_meta = MagicMock()
-        mock_topic_meta.partitions = {0: MagicMock()}
-        mock_consumer.list_topics.return_value.topics = {"gateway_queries": mock_topic_meta}
+        # Count pass partition consumer — one batch of messages then 3 empty batches
+        count_consumer = _make_partition_consumer([
+            [fake_msg],  # batch 1: one message
+            [], [], [],  # 3 empty = end of data
+        ])
 
-        # offsets_for_times returns a valid offset
-        from confluent_kafka import TopicPartition
-        mock_tp = MagicMock()
-        mock_tp.topic = "gateway_queries"
-        mock_tp.partition = 0
-        mock_tp.offset = 100
-        mock_consumer.offsets_for_times.return_value = [mock_tp]
-
-        # poll returns one message then None (timeout sentinel)
-        mock_consumer.poll.side_effect = [fake_msg, None, None, None]
-
-        # Consumer is a local import inside _stream_and_cache; patch at source module.
-        with patch("confluent_kafka.Consumer", MockConsumer):
+        with patch("confluent_kafka.Consumer", side_effect=[resolution_consumer, count_consumer]):
             result = provider.fetch_initial_query_results(start_date, num_days)
 
         # Assert — two (deployment, indexer) pairs, each seen once
@@ -508,40 +668,64 @@ class TestRedpandaProviderCaching:
             raw = _build_client_query(f"qid-{i:03d}-JFK", [a])
             messages.append(_fake_kafka_message(base_ts_ms + i * 1000, raw))
 
-        MockConsumer = MagicMock()
-        mock_consumer = MockConsumer.return_value
+        # Resolution consumer (shared for both passes)
+        resolution_consumer = _make_resolution_consumer("gateway_queries", [0])
 
-        mock_topic_meta = MagicMock()
-        mock_topic_meta.partitions = {0: MagicMock()}
-        mock_consumer.list_topics.return_value.topics = {"gateway_queries": mock_topic_meta}
+        # Count pass consumer
+        count_consumer = _make_partition_consumer([
+            messages,   # all 5 messages in one batch
+            [], [], [],
+        ])
 
-        mock_tp = MagicMock()
-        mock_tp.topic = "gateway_queries"
-        mock_tp.partition = 0
-        mock_tp.offset = 0
-        mock_consumer.offsets_for_times.return_value = [mock_tp]
+        # Sample pass consumer (same messages replayed)
+        sample_consumer = _make_partition_consumer([
+            messages,
+            [], [], [],
+        ])
 
-        # Return all 5 messages then trigger timeout
-        mock_consumer.poll.side_effect = messages + [None, None, None]
-
-        # Consumer is a local import inside _stream_and_cache; patch at source module.
-        with patch("confluent_kafka.Consumer", MockConsumer):
-            # Fetch with rows_to_use=3 — should cap at 3 rows for this pair
+        with patch(
+            "confluent_kafka.Consumer",
+            side_effect=[resolution_consumer, count_consumer, sample_consumer],
+        ):
             result = provider.fetch_combined_query_results(start_date, num_days, rows_to_use=3)
 
-        # Assert
+        # Assert — capped at 3
         assert len(result) == 3, f"Expected 3 rows (cap), got {len(result)}"
 
-    def test_second_call_uses_cache(self):
-        """The second fetch call must not trigger a second Kafka replay."""
+    def test_second_call_uses_count_cache(self):
+        """The second fetch_initial call must not trigger a second count pass."""
         provider = self._build_provider()
         start_date = date(2024, 1, 1)
         num_days = 1
 
-        # Seed the cache directly
-        provider._cache_start_date = start_date
-        provider._cache_num_days = num_days
+        # Seed the count cache directly
+        provider._count_cache_start_date = start_date
+        provider._count_cache_num_days = num_days
         provider._count_cache = {(_bytes_to_cid(bytes(32)), _bytes_to_hex(INDEXER_BYTES)): 10}
+        provider._fees_per_indexer = {_bytes_to_hex(INDEXER_BYTES): 0.01}
+
+        with patch.object(provider, "_count_pass") as mock_count:
+            result = provider.fetch_initial_query_results(start_date, num_days)
+
+        mock_count.assert_not_called()
+        assert len(result) == 1
+
+    def test_second_call_uses_row_cache(self):
+        """The second fetch_combined call must not trigger a second sample pass."""
+        provider = self._build_provider()
+        start_date = date(2024, 1, 1)
+        num_days = 1
+        rows_to_use = 100
+
+        # Seed both caches
+        provider._count_cache_start_date = start_date
+        provider._count_cache_num_days = num_days
+        provider._count_cache = {(_bytes_to_cid(bytes(32)), _bytes_to_hex(INDEXER_BYTES)): 10}
+        provider._fees_per_indexer = {}
+
+        provider._row_cache_start_date = start_date
+        provider._row_cache_num_days = num_days
+        provider._row_cache_rows_to_use = rows_to_use
         provider._row_cache_df = pd.DataFrame(
             [{"query_id": "x", "deployment_hash": _bytes_to_cid(bytes(32)),
               "fee": 0.001, "timestamp": pd.Timestamp("2024-01-01", tz="UTC"),
@@ -551,12 +735,118 @@ class TestRedpandaProviderCaching:
               "url": "https://indexer.example.com/"}]
         )
 
-        with patch.object(provider, "_stream_and_cache") as mock_stream:
+        with patch.object(provider, "_count_pass") as mock_count, \
+             patch.object(provider, "_sample_pass") as mock_sample:
+            result = provider.fetch_combined_query_results(start_date, num_days, rows_to_use)
+
+        mock_count.assert_not_called()
+        mock_sample.assert_not_called()
+        assert len(result) == 1
+
+    def test_empty_partitions_produce_empty_caches(self):
+        """When no valid partitions exist, caches should be empty."""
+        provider = self._build_provider()
+        start_date = date(2024, 1, 1)
+        num_days = 1
+
+        # Resolution consumer returns no valid offsets (offset = -1001)
+        resolution_consumer = MagicMock()
+        mock_topic_meta = MagicMock()
+        mock_topic_meta.partitions = {0: MagicMock()}
+        resolution_consumer.list_topics.return_value.topics = {"gateway_queries": mock_topic_meta}
+
+        invalid_tp = MagicMock()
+        invalid_tp.topic = "gateway_queries"
+        invalid_tp.partition = 0
+        invalid_tp.offset = -1001  # OFFSET_INVALID
+        resolution_consumer.offsets_for_times.return_value = [invalid_tp]
+
+        with patch("confluent_kafka.Consumer", side_effect=[resolution_consumer]):
             result = provider.fetch_initial_query_results(start_date, num_days)
 
-        # _stream_and_cache must NOT have been called when cache is valid
-        mock_stream.assert_not_called()
-        assert len(result) == 1
+        assert result.empty
+        assert provider._count_cache == {}
+        assert provider._fees_per_indexer == {}
+
+
+# ---------------------------------------------------------------------------
+# Parallel merge test
+# ---------------------------------------------------------------------------
+
+
+class TestParallelMerge:
+    """Verify cross-partition merge correctness."""
+
+    def _build_provider(self) -> RedpandaProvider:
+        with patch.dict(
+            os.environ,
+            {
+                "REDPANDA_BOOTSTRAP_SERVERS": "localhost:9092",
+                "REDPANDA_TOPIC": "gateway_queries",
+            },
+        ):
+            return RedpandaProvider()
+
+    def test_two_partitions_merge_counts_and_cap(self):
+        """
+        Two partitions with overlapping pairs: merged counts sum correctly
+        and merged reservoirs don't exceed rows_to_use.
+        """
+        provider = self._build_provider()
+        start_date = date(2024, 1, 1)
+        num_days = 1
+        base_ts_ms = int(datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+
+        deployment = bytes(range(32))
+        indexer1 = INDEXER_BYTES
+
+        # 4 messages per partition for the same pair, 8 total
+        def make_messages(offset_start):
+            msgs = []
+            for i in range(4):
+                a = _build_indexer_attempt(
+                    indexer=indexer1, deployment=deployment,
+                    indexed_chain="mainnet", url="https://indexer1.example.com/",
+                    fee_grt=0.001, response_time_ms=50 + i,
+                    result="success", blocks_behind=0,
+                )
+                raw = _build_client_query(f"qid-{offset_start + i:03d}-JFK", [a])
+                msgs.append(_fake_kafka_message(base_ts_ms + i * 1000, raw))
+            return msgs
+
+        p0_msgs = make_messages(0)
+        p1_msgs = make_messages(100)
+
+        # Resolution consumer: 2 partitions
+        resolution_consumer = _make_resolution_consumer("gateway_queries", [0, 1])
+
+        # Count pass: one consumer per partition
+        count_p0 = _make_partition_consumer([p0_msgs, [], [], []])
+        count_p1 = _make_partition_consumer([p1_msgs, [], [], []])
+
+        # Sample pass: replay the same messages
+        sample_p0 = _make_partition_consumer([p0_msgs, [], [], []])
+        sample_p1 = _make_partition_consumer([p1_msgs, [], [], []])
+
+        with patch(
+            "confluent_kafka.Consumer",
+            side_effect=[
+                resolution_consumer,   # partition resolution
+                count_p0, count_p1,    # count pass (2 partitions)
+                sample_p0, sample_p1,  # sample pass (2 partitions)
+            ],
+        ):
+            # Count pass
+            initial = provider.fetch_initial_query_results(start_date, num_days)
+
+            # Verify merged count = 4 + 4 = 8
+            assert len(initial) == 1
+            assert initial.iloc[0]["num_rows"] == 8
+
+            # Sample pass with cap = 3
+            combined = provider.fetch_combined_query_results(start_date, num_days, rows_to_use=3)
+
+        assert len(combined) == 3, f"Expected 3 rows (cap), got {len(combined)}"
 
 
 # ---------------------------------------------------------------------------
@@ -730,8 +1020,8 @@ class TestFetchStakeToFees:
         assert list(result.columns) == ["stake_to_fees"]
 
 
-class TestFeesAccumulatedDuringConsume:
-    """Verify that _fees_per_indexer is populated during the Kafka replay."""
+class TestFeesAccumulatedDuringCountPass:
+    """Verify that _fees_per_indexer is populated during the count pass."""
 
     def _build_provider(self) -> RedpandaProvider:
         with patch.dict(
@@ -773,23 +1063,17 @@ class TestFeesAccumulatedDuringConsume:
         msg1 = _fake_kafka_message(base_ts_ms, _build_client_query("q1-JFK", [a1, a2]))
         msg2 = _fake_kafka_message(base_ts_ms + 1000, _build_client_query("q2-JFK", [a3]))
 
-        MockConsumer = MagicMock()
-        mock_consumer = MockConsumer.return_value
+        # Resolution consumer
+        resolution_consumer = _make_resolution_consumer("gateway_queries", [0])
 
-        mock_topic_meta = MagicMock()
-        mock_topic_meta.partitions = {0: MagicMock()}
-        mock_consumer.list_topics.return_value.topics = {"gateway_queries": mock_topic_meta}
-
-        mock_tp = MagicMock()
-        mock_tp.topic = "gateway_queries"
-        mock_tp.partition = 0
-        mock_tp.offset = 0
-        mock_consumer.offsets_for_times.return_value = [mock_tp]
-
-        mock_consumer.poll.side_effect = [msg1, msg2, None, None, None]
+        # Count pass consumer
+        count_consumer = _make_partition_consumer([
+            [msg1, msg2],
+            [], [], [],
+        ])
 
         # Act
-        with patch("confluent_kafka.Consumer", MockConsumer):
+        with patch("confluent_kafka.Consumer", side_effect=[resolution_consumer, count_consumer]):
             provider.fetch_initial_query_results(start_date, num_days)
 
         # Assert

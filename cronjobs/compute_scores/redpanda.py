@@ -2,9 +2,18 @@
 RedpandaProvider: Redpanda-backed data source for the score computation CronJob.
 
 Replaces BigQuery as the raw data source. A daily batch replay consumes the
-gateway_queries topic for the 28-day regression window, applies stratified
-reservoir sampling, and produces DataFrames with the same schema that
-processing.py expects.
+gateway_queries topic for the 28-day regression window using a two-pass
+architecture:
+
+  Pass 1 (count): lightweight scan counting (deployment, indexer) pairs and
+  accumulating fees. Uses minimal proto parsing (keys + fee only).
+
+  Pass 2 (sample): reservoir sampling with cap = rows_to_use (from adjust_rows).
+  Uses selective proto parsing, raw byte keys, and deferred string conversion.
+
+Both passes consume partitions in parallel via ThreadPoolExecutor with batch
+polling (consumer.consume). Partition offsets resolved in pass 1 are cached
+for reuse in pass 2.
 
 Stake data is fetched via GraphQL from the Graph Network subgraph.
 Computed scores are written to a JSON file on a shared PVC instead of BigQuery.
@@ -15,6 +24,7 @@ import logging
 import os
 import random
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -23,13 +33,9 @@ import base58
 import pandas as pd
 import requests
 
-from proto.gateway_queries_pb2 import ClientQueryProtobuf
+from proto.gateway_queries_pb2 import extract_keys_and_fees, extract_sample_fields
 
 logger = logging.getLogger(__name__)
-
-# Maximum rows buffered per (deployment_hash, indexer) pair.
-# Algorithm R reservoir — excess messages replace random earlier entries.
-MAX_RESERVOIR_PER_PAIR = 50_000
 
 SCORES_FILE_PATH = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_scores.json")
 
@@ -72,8 +78,8 @@ class RedpandaProvider:
       fetch_initial_query_results, fetch_combined_query_results,
       fetch_stake_to_fees, write_scores, scores_exist_for_today.
 
-    The Kafka replay is performed once per day; both fetch methods share a
-    single in-memory cache built during _stream_and_cache.
+    Uses a two-pass replay: pass 1 counts pairs and fees (cheap), pass 2
+    reservoir-samples rows capped at rows_to_use (from adjust_rows).
     """
 
     def __init__(self) -> None:
@@ -82,12 +88,20 @@ class RedpandaProvider:
         self._graph_network_url = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
         self._scores_path = SCORES_FILE_PATH
 
-        # Reservoir cache — populated by _stream_and_cache
+        # Count cache — populated by _count_pass
         self._count_cache: Dict[Tuple[str, str], int] = {}
-        self._row_cache_df: Optional[pd.DataFrame] = None
         self._fees_per_indexer: Dict[str, float] = {}
-        self._cache_start_date: Optional[date] = None
-        self._cache_num_days: Optional[int] = None
+        self._count_cache_start_date: Optional[date] = None
+        self._count_cache_num_days: Optional[int] = None
+
+        # Row cache — populated by _sample_pass
+        self._row_cache_df: Optional[pd.DataFrame] = None
+        self._row_cache_start_date: Optional[date] = None
+        self._row_cache_num_days: Optional[int] = None
+        self._row_cache_rows_to_use: Optional[int] = None
+
+        # Partition offsets cached between passes
+        self._cached_partitions: Optional[list] = None
 
     # -----------------------------------------------------------------------
     # Public interface
@@ -100,7 +114,7 @@ class RedpandaProvider:
         Matches BigQueryClient.fetch_initial_query_results output schema:
         columns [deployment_hash, indexer, num_rows].
         """
-        self._ensure_cache(start_date, num_days)
+        self._ensure_count_cache(start_date, num_days)
 
         rows = [
             {"deployment_hash": dep, "indexer": idx, "num_rows": count}
@@ -120,27 +134,23 @@ class RedpandaProvider:
         """
         Return sampled query rows for regression analysis.
 
-        Caps each (deployment_hash, indexer) pair to rows_to_use rows.
-        Because the reservoir rows are already drawn uniformly at random
-        (Algorithm R), truncation is equivalent to further sampling.
+        Caps each (deployment_hash, indexer) pair to rows_to_use rows via
+        Algorithm R reservoir sampling during pass 2. The groupby truncation
+        is kept as a safety net.
 
         Matches BigQueryClient.fetch_combined_query_results output schema:
         columns [query_id, deployment_hash, fee, timestamp, blocks_behind,
                  response_time_ms, indexer, status, day_partition,
                  subgraph_network, url].
         """
-        self._ensure_cache(start_date, num_days)
+        self._ensure_count_cache(start_date, num_days)
+        self._ensure_row_cache(start_date, num_days, rows_to_use)
 
         if self._row_cache_df is None or self._row_cache_df.empty:
             logger.warning("Row cache is empty — no data in the specified Redpanda window")
-            return pd.DataFrame(
-                columns=[
-                    "query_id", "deployment_hash", "fee", "timestamp",
-                    "blocks_behind", "response_time_ms", "indexer", "status",
-                    "day_partition", "subgraph_network", "url",
-                ]
-            )
+            return _empty_combined_df()
 
+        # Safety net: truncate any pair that exceeds rows_to_use after merge
         df = (
             self._row_cache_df
             .groupby(["deployment_hash", "indexer"], group_keys=False)
@@ -160,7 +170,7 @@ class RedpandaProvider:
         stake_to_fees = (staked_tokens - locked_tokens) / total_fees_earned
 
         Stake comes from The Graph Network subgraph (current on-chain state).
-        Fees come from self._fees_per_indexer, populated during _stream_and_cache
+        Fees come from self._fees_per_indexer, populated during _count_pass
         by summing fee_grt across all indexer attempts in the 28-day window.
 
         Returns a DataFrame indexed by 'indexer' with a 'stake_to_fees' column,
@@ -259,206 +269,368 @@ class RedpandaProvider:
     # Internal: cache management
     # -----------------------------------------------------------------------
 
-    def _ensure_cache(self, start_date: date, num_days: int) -> None:
-        """Trigger a Kafka replay only if the cache doesn't cover this window."""
+    def _ensure_count_cache(self, start_date: date, num_days: int) -> None:
+        """Trigger a count pass only if the cache doesn't cover this window."""
         if (
-            self._row_cache_df is not None
-            and self._cache_start_date == start_date
-            and self._cache_num_days == num_days
+            self._count_cache
+            and self._count_cache_start_date == start_date
+            and self._count_cache_num_days == num_days
         ):
             return
-        self._stream_and_cache(start_date, num_days)
+        self._count_pass(start_date, num_days)
 
-    def _stream_and_cache(self, start_date: date, num_days: int) -> None:
+    def _ensure_row_cache(self, start_date: date, num_days: int, rows_to_use: int) -> None:
+        """Trigger a sample pass only if the cache doesn't cover this window/cap."""
+        if (
+            self._row_cache_df is not None
+            and self._row_cache_start_date == start_date
+            and self._row_cache_num_days == num_days
+            and self._row_cache_rows_to_use == rows_to_use
+        ):
+            return
+        self._sample_pass(start_date, num_days, rows_to_use)
+
+    # -----------------------------------------------------------------------
+    # Internal: partition resolution
+    # -----------------------------------------------------------------------
+
+    def _resolve_partitions(self, start_ts_ms: int) -> list:
         """
-        Replay the gateway_queries topic for the given window.
+        Resolve timestamp-based offsets for all partitions of self._topic.
 
-        Seeks to start_date using offset-for-timestamp, polls until
-        start_date + num_days, and applies Algorithm R reservoir sampling
-        per (deployment_hash, indexer) pair.
-
-        After completion, populates:
-          self._count_cache      — true per-pair message counts (for adjust_rows)
-          self._row_cache_df     — reservoir DataFrame (for fetch_combined_query_results)
-          self._fees_per_indexer — total fee_grt earned per indexer (for stake_to_fees)
+        Creates a temporary consumer for metadata and offset resolution,
+        stores result in self._cached_partitions for reuse in pass 2.
         """
-        from confluent_kafka import Consumer, TopicPartition, KafkaException
+        from confluent_kafka import Consumer, TopicPartition
 
+        consumer = Consumer(
+            {
+                "bootstrap.servers": self._bootstrap_servers,
+                "group.id": "iisa-score-computation-replay",
+                "enable.auto.commit": False,
+            }
+        )
+        try:
+            meta = consumer.list_topics(self._topic, timeout=30)
+            if self._topic not in meta.topics:
+                raise RuntimeError(f"Topic '{self._topic}' not found in Redpanda")
+
+            partition_ids = list(meta.topics[self._topic].partitions.keys())
+            seek_tps = [TopicPartition(self._topic, pid, start_ts_ms) for pid in partition_ids]
+
+            resolved = consumer.offsets_for_times(seek_tps, timeout=30)
+            valid = [
+                TopicPartition(tp.topic, tp.partition, tp.offset)
+                for tp in resolved
+                if tp.offset >= 0
+            ]
+        finally:
+            consumer.close()
+
+        self._cached_partitions = valid
+        return valid
+
+    # -----------------------------------------------------------------------
+    # Internal: Pass 1 — count
+    # -----------------------------------------------------------------------
+
+    def _count_pass(self, start_date: date, num_days: int) -> None:
+        """
+        Pass 1: lightweight scan counting (deployment, indexer) pairs.
+
+        Uses extract_keys_and_fees for minimal parsing, raw byte keys,
+        batch polling, and parallel partition consumption.
+        """
         start_dt = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=timezone.utc)
         end_dt = start_dt + timedelta(days=num_days)
         start_ts_ms = int(start_dt.timestamp() * 1000)
         end_ts_ms = int(end_dt.timestamp() * 1000)
 
         logger.info(
-            f"Starting Redpanda replay: topic={self._topic}, "
+            f"Starting count pass: topic={self._topic}, "
             f"window={start_date} to {end_dt.date()}"
         )
 
-        consumer = Consumer(
-            {
-                "bootstrap.servers": self._bootstrap_servers,
-                # group.id is required by confluent-kafka but unused — we call
-                # assign() for manual partition assignment, bypassing group
-                # coordination entirely.
-                "group.id": "iisa-score-computation-replay",
-                "enable.auto.commit": False,
-            }
-        )
+        partitions = self._resolve_partitions(start_ts_ms)
 
-        try:
-            self._consume(consumer, start_ts_ms, end_ts_ms)
-        finally:
-            consumer.close()
-
-        logger.info(
-            f"Replay complete: {sum(self._count_cache.values())} total attempts "
-            f"across {len(self._count_cache)} (deployment, indexer) pairs"
-        )
-        self._cache_start_date = start_date
-        self._cache_num_days = num_days
-
-    def _consume(self, consumer, start_ts_ms: int, end_ts_ms: int) -> None:
-        """Drive the consumer loop and populate internal caches."""
-        from confluent_kafka import TopicPartition, KafkaException, OFFSET_INVALID
-
-        # Discover partitions.
-        meta = consumer.list_topics(self._topic, timeout=30)
-        if self._topic not in meta.topics:
-            raise RuntimeError(f"Topic '{self._topic}' not found in Redpanda")
-
-        partition_ids = list(meta.topics[self._topic].partitions.keys())
-        seek_tps = [TopicPartition(self._topic, pid, start_ts_ms) for pid in partition_ids]
-
-        # Resolve timestamp → offset for each partition.
-        resolved = consumer.offsets_for_times(seek_tps, timeout=30)
-        valid = [
-            TopicPartition(tp.topic, tp.partition, tp.offset)
-            for tp in resolved
-            if tp.offset >= 0  # -1001 (OFFSET_INVALID) means no message at that time
-        ]
-
-        if not valid:
+        if not partitions:
             logger.warning(
                 "No Redpanda messages found for the requested time window — "
                 f"start_ts_ms={start_ts_ms}"
             )
             self._count_cache = {}
             self._fees_per_indexer = {}
-            self._row_cache_df = _empty_combined_df()
+            self._count_cache_start_date = start_date
+            self._count_cache_num_days = num_days
             return
 
-        consumer.assign(valid)
+        # Consume partitions in parallel
+        def count_partition(tp):
+            from confluent_kafka import Consumer, TopicPartition as TP
+            consumer = Consumer(
+                {
+                    "bootstrap.servers": self._bootstrap_servers,
+                    "group.id": "iisa-score-computation-replay",
+                    "enable.auto.commit": False,
+                }
+            )
+            try:
+                consumer.assign([TP(tp.topic, tp.partition, tp.offset)])
+                return self._count_partition_loop(consumer, end_ts_ms)
+            finally:
+                consumer.close()
 
-        # Reservoir state: {(deployment_hash, indexer): list of row dicts}
-        reservoirs: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
-        counts: Dict[Tuple[str, str], int] = defaultdict(int)
-        fees_per_indexer: Dict[str, float] = defaultdict(float)
+        with ThreadPoolExecutor(max_workers=len(partitions)) as pool:
+            results = list(pool.map(count_partition, partitions))
 
+        # Merge per-partition counts and fees
+        merged_counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
+        merged_fees: Dict[bytes, float] = defaultdict(float)
         total_messages = 0
-        total_attempts = 0
-        skipped_messages = 0
-        consecutive_timeouts = 0
-        max_consecutive_timeouts = 3  # 3 × 30 s = 90 s idle before stopping
+        for counts, fees, msg_count in results:
+            for key, val in counts.items():
+                merged_counts[key] += val
+            for idx_bytes, fee in fees.items():
+                merged_fees[idx_bytes] += fee
+            total_messages += msg_count
+
+        # Convert byte keys to string keys — only ~N_pairs conversions
+        self._count_cache = {}
+        for (dep_bytes, idx_bytes), count in merged_counts.items():
+            dep_str = _bytes_to_cid(dep_bytes)
+            idx_str = _bytes_to_hex(idx_bytes)
+            if dep_str and idx_str:
+                self._count_cache[(dep_str, idx_str)] = count
+
+        self._fees_per_indexer = {}
+        for idx_bytes, fee in merged_fees.items():
+            idx_str = _bytes_to_hex(idx_bytes)
+            if idx_str:
+                self._fees_per_indexer[idx_str] = fee
+
+        self._count_cache_start_date = start_date
+        self._count_cache_num_days = num_days
+
+        logger.info(
+            f"Count pass complete: {total_messages:,} messages, "
+            f"{sum(self._count_cache.values()):,} attempts across "
+            f"{len(self._count_cache)} (deployment, indexer) pairs"
+        )
+
+    def _count_partition_loop(
+        self, consumer, end_ts_ms: int
+    ) -> Tuple[Dict[Tuple[bytes, bytes], int], Dict[bytes, float], int]:
+        """
+        Consume one partition for the count pass.
+
+        Returns (counts_by_pair, fees_by_indexer, message_count).
+        """
+        counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
+        fees: Dict[bytes, float] = defaultdict(float)
+        total_messages = 0
+        consecutive_empty = 0
 
         while True:
-            msg = consumer.poll(timeout=30.0)
+            messages = consumer.consume(num_messages=1000, timeout=30.0)
 
-            if msg is None:
-                consecutive_timeouts += 1
-                logger.debug(
-                    f"Poll timeout ({consecutive_timeouts}/{max_consecutive_timeouts})"
-                )
-                if consecutive_timeouts >= max_consecutive_timeouts:
-                    logger.info("Reached end of available data (consecutive poll timeouts)")
+            if not messages:
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
                     break
                 continue
 
-            consecutive_timeouts = 0
+            consecutive_empty = 0
 
-            if msg.error():
-                logger.error(f"Kafka error: {msg.error()}")
-                continue
+            for msg in messages:
+                if msg.error():
+                    continue
 
-            ts_type, ts_ms = msg.timestamp()
-            if ts_ms < 0:
-                # No timestamp — use current time as approximation and continue.
-                ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                ts_type, ts_ms = msg.timestamp()
+                if ts_ms < 0:
+                    ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-            if ts_ms > end_ts_ms:
-                logger.info("Reached end of replay window (message timestamp past end_ts)")
-                break
+                if ts_ms > end_ts_ms:
+                    return (counts, fees, total_messages)
 
-            total_messages += 1
+                total_messages += 1
 
-            try:
-                client_query = ClientQueryProtobuf.FromString(msg.value())
-            except Exception as e:
-                skipped_messages += 1
-                logger.debug(f"Failed to parse message: {e}")
-                continue
+                try:
+                    attempts = extract_keys_and_fees(msg.value())
+                except Exception:
+                    continue
 
-            timestamp = pd.Timestamp(ts_ms, unit="ms", tz="UTC")
-            day_partition = timestamp.date()
+                for idx_bytes, dep_bytes, fee_grt in attempts:
+                    if len(dep_bytes) == 32 and len(idx_bytes) == 20:
+                        counts[(dep_bytes, idx_bytes)] += 1
+                        fees[idx_bytes] += fee_grt
 
-            for attempt in client_query.indexer_queries:
-                deployment_hash = _bytes_to_cid(attempt.deployment)
-                indexer = _bytes_to_hex(attempt.indexer)
+        return (counts, fees, total_messages)
 
-                if not deployment_hash or not indexer or not attempt.url:
-                    continue  # Skip malformed attempts
+    # -----------------------------------------------------------------------
+    # Internal: Pass 2 — sample
+    # -----------------------------------------------------------------------
 
-                total_attempts += 1
+    def _sample_pass(self, start_date: date, num_days: int, rows_to_use: int) -> None:
+        """
+        Pass 2: reservoir sampling with cap = rows_to_use.
 
-                url = attempt.url if attempt.url.endswith("/") else attempt.url + "/"
-                row = {
-                    "query_id": client_query.query_id,
-                    "deployment_hash": deployment_hash,
-                    "fee": attempt.fee_grt,
-                    "timestamp": timestamp,
-                    "blocks_behind": attempt.blocks_behind,
-                    "response_time_ms": attempt.response_time_ms,
-                    "indexer": indexer,
-                    "status": _map_result_to_status(attempt.result),
-                    "day_partition": day_partition,
-                    "subgraph_network": attempt.indexed_chain,
-                    "url": url,
-                }
-
-                key = (deployment_hash, indexer)
-                n = counts[key]
-
-                if n < MAX_RESERVOIR_PER_PAIR:
-                    reservoirs[key].append(row)
-                else:
-                    j = random.randint(0, n - 1)
-                    if j < MAX_RESERVOIR_PER_PAIR:
-                        reservoirs[key][j] = row
-
-                counts[key] += 1
-                fees_per_indexer[indexer] += attempt.fee_grt
-
-            if total_messages % 100_000 == 0:
-                logger.info(
-                    f"  {total_messages:,} messages consumed, "
-                    f"{total_attempts:,} attempts buffered"
-                )
+        Uses extract_sample_fields for selective parsing, raw byte keys,
+        batch polling, cached partitions, deferred string conversion,
+        parallel partition consumption, and thread-local PRNG.
+        """
+        start_dt = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+        end_dt = start_dt + timedelta(days=num_days)
+        start_ts_ms = int(start_dt.timestamp() * 1000)
+        end_ts_ms = int(end_dt.timestamp() * 1000)
 
         logger.info(
-            f"Consume loop done: {total_messages:,} messages, "
-            f"{total_attempts:,} attempts, {skipped_messages} parse errors"
+            f"Starting sample pass: topic={self._topic}, "
+            f"window={start_date} to {end_dt.date()}, "
+            f"rows_to_use={rows_to_use}"
         )
 
-        self._count_cache = dict(counts)
-        self._fees_per_indexer = dict(fees_per_indexer)
+        # Reuse cached partitions from pass 1 if available
+        partitions = self._cached_partitions
+        if partitions is None:
+            partitions = self._resolve_partitions(start_ts_ms)
 
+        if not partitions:
+            logger.warning("No valid partitions for sample pass")
+            self._row_cache_df = _empty_combined_df()
+            self._row_cache_start_date = start_date
+            self._row_cache_num_days = num_days
+            self._row_cache_rows_to_use = rows_to_use
+            return
+
+        # Consume partitions in parallel, each with a thread-local PRNG
+        def sample_partition(tp):
+            from confluent_kafka import Consumer, TopicPartition as TP
+            rng = random.Random()
+            consumer = Consumer(
+                {
+                    "bootstrap.servers": self._bootstrap_servers,
+                    "group.id": "iisa-score-computation-replay",
+                    "enable.auto.commit": False,
+                }
+            )
+            try:
+                consumer.assign([TP(tp.topic, tp.partition, tp.offset)])
+                return self._sample_partition_loop(consumer, end_ts_ms, rows_to_use, rng)
+            finally:
+                consumer.close()
+
+        with ThreadPoolExecutor(max_workers=len(partitions)) as pool:
+            results = list(pool.map(sample_partition, partitions))
+
+        # Merge per-partition reservoirs
+        merged_reservoirs: Dict[Tuple[bytes, bytes], List[dict]] = defaultdict(list)
+        merged_counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
+        for reservoirs, counts in results:
+            for key, rows in reservoirs.items():
+                merged_reservoirs[key].extend(rows)
+            for key, count in counts.items():
+                merged_counts[key] += count
+
+        # Truncate pairs that exceed rows_to_use after cross-partition merge
         all_rows: List[dict] = []
-        for rows in reservoirs.values():
+        for key, rows in merged_reservoirs.items():
+            if len(rows) > rows_to_use:
+                random.shuffle(rows)
+                rows = rows[:rows_to_use]
             all_rows.extend(rows)
 
         if all_rows:
-            self._row_cache_df = pd.DataFrame(all_rows)
+            self._row_cache_df = _build_dataframe(all_rows)
         else:
             self._row_cache_df = _empty_combined_df()
+
+        self._row_cache_start_date = start_date
+        self._row_cache_num_days = num_days
+        self._row_cache_rows_to_use = rows_to_use
+
+        logger.info(
+            f"Sample pass complete: {len(all_rows):,} rows buffered across "
+            f"{len(merged_reservoirs)} pairs"
+        )
+
+    def _sample_partition_loop(
+        self,
+        consumer,
+        end_ts_ms: int,
+        rows_to_use: int,
+        rng: random.Random,
+    ) -> Tuple[Dict[Tuple[bytes, bytes], List[dict]], Dict[Tuple[bytes, bytes], int]]:
+        """
+        Consume one partition for the sample pass.
+
+        Returns (reservoirs, counts) where reservoirs maps (dep_bytes, idx_bytes)
+        to a list of row dicts with raw bytes and ts_ms (deferred conversion).
+        """
+        reservoirs: Dict[Tuple[bytes, bytes], List[dict]] = defaultdict(list)
+        counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
+        consecutive_empty = 0
+
+        while True:
+            messages = consumer.consume(num_messages=1000, timeout=30.0)
+
+            if not messages:
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    break
+                continue
+
+            consecutive_empty = 0
+
+            for msg in messages:
+                if msg.error():
+                    continue
+
+                ts_type, ts_ms = msg.timestamp()
+                if ts_ms < 0:
+                    ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+                if ts_ms > end_ts_ms:
+                    return (reservoirs, counts)
+
+                try:
+                    query_id, attempts = extract_sample_fields(msg.value())
+                except Exception:
+                    continue
+
+                for attempt in attempts:
+                    idx_bytes = attempt["indexer_bytes"]
+                    dep_bytes = attempt["deployment_bytes"]
+                    url = attempt["url"]
+
+                    if len(dep_bytes) != 32 or len(idx_bytes) != 20 or not url:
+                        continue
+
+                    key = (dep_bytes, idx_bytes)
+                    n = counts[key]
+
+                    row = {
+                        "query_id": query_id,
+                        "indexer_bytes": idx_bytes,
+                        "deployment_bytes": dep_bytes,
+                        "fee": attempt["fee_grt"],
+                        "ts_ms": ts_ms,
+                        "blocks_behind": attempt["blocks_behind"],
+                        "response_time_ms": attempt["response_time_ms"],
+                        "status": _map_result_to_status(attempt["result"]),
+                        "subgraph_network": attempt["indexed_chain"],
+                        "url": url if url.endswith("/") else url + "/",
+                    }
+
+                    if n < rows_to_use:
+                        reservoirs[key].append(row)
+                    else:
+                        j = rng.randint(0, n - 1)
+                        if j < rows_to_use:
+                            reservoirs[key][j] = row
+
+                    counts[key] += 1
+
+        return (reservoirs, counts)
 
     # -----------------------------------------------------------------------
     # Internal: GraphQL pagination
@@ -506,6 +678,24 @@ class RedpandaProvider:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _build_dataframe(rows: List[dict]) -> pd.DataFrame:
+    """
+    Convert raw row dicts (with byte keys and ts_ms) into the final DataFrame.
+
+    Performs deferred string conversions in bulk rather than per-message
+    during streaming.
+    """
+    df = pd.DataFrame(rows)
+
+    df["deployment_hash"] = df["deployment_bytes"].apply(_bytes_to_cid)
+    df["indexer"] = df["indexer_bytes"].apply(_bytes_to_hex)
+    df["timestamp"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True)
+    df["day_partition"] = df["timestamp"].dt.date
+
+    df = df.drop(columns=["deployment_bytes", "indexer_bytes", "ts_ms"])
+    return df
 
 
 def _empty_combined_df() -> pd.DataFrame:
