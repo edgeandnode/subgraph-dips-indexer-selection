@@ -3,10 +3,6 @@ pandas>=2.0,<3.0
 numpy>=1.24,<3.0
 pyarrow>=14.0,<18.0
 
-# BigQuery
-bigframes>=1.0,<2.0
-google-cloud-bigquery>=3.0,<4.0
-
 # Machine learning (for linear regression)
 scipy>=1.11,<2.0
 scikit-learn>=1.3,<2.0
@@ -20,7 +16,7 @@ tenacity>=8.2,<10.0
 # Airport data (for IATA geolocation)
 airportsdata>=20230101
 
-# Redpanda / Kafka consumer (DATA_SOURCE=redpanda)
+# Redpanda / Kafka consumer
 confluent-kafka>=2.3,<3.0
 
 # GraphQL HTTP calls for Graph Network subgraph stake data

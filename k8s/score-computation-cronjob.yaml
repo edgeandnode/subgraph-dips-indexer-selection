@@ -42,21 +42,10 @@ spec:
                 memory: "50Gi"
                 cpu: "8"
             env:
-            - name: DATA_SOURCE
-              value: "bigquery"  # Set to "redpanda" for local-network mode
-            - name: BQ_PROJECT
-              value: "graph-mainnet"
-            - name: BQ_DATASET
-              value: "iisa_data_for_dips"
-            - name: BQ_LOCATION
-              value: "US"
             - name: NUM_DAYS
               value: "28"
             - name: TARGET_ROWS
               value: "20000000"
-            - name: GOOGLE_APPLICATION_CREDENTIALS
-              value: /app/credentials/service-account.json
-            # Redpanda mode env vars (used when DATA_SOURCE=redpanda)
             - name: REDPANDA_BOOTSTRAP_SERVERS
               value: ""  # e.g. redpanda:9092
             - name: REDPANDA_TOPIC
@@ -83,16 +72,10 @@ spec:
                 drop:
                   - ALL
             volumeMounts:
-            - name: gcp-credentials
-              mountPath: /app/credentials
-              readOnly: true
             - name: scores
               mountPath: /app/scores
           restartPolicy: Never
           volumes:
-          - name: gcp-credentials
-            secret:
-              secretName: iisa-gcp-credentials
           - name: scores
             persistentVolumeClaim:
               claimName: iisa-scores

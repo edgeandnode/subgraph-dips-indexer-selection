@@ -17,8 +17,6 @@ class TestSettings:
         """Verify IISA_ prefix environment variables load correctly."""
         # Arrange
         env_vars = {
-            "IISA_GCP_PROJECT": "test-project",
-            "IISA_GCP_LOCATION": "EU",
             "IISA_HOST": "127.0.0.1",
             "IISA_PORT": "9000",
             "IISA_LOG_LEVEL": "DEBUG",
@@ -31,47 +29,26 @@ class TestSettings:
             settings = Settings()
 
         # Assert
-        assert settings.gcp_project == "test-project"
-        assert settings.gcp_location == "EU"
         assert settings.host == "127.0.0.1"
         assert settings.port == 9000
         assert settings.log_level == "DEBUG"
 
     def test_settings_default_values(self):
-        """Verify defaults: gcp_location="US", host="0.0.0.0", port=8080, log_level="INFO"."""
-        # Arrange
-        env_vars = {"IISA_GCP_PROJECT": "test-project"}
+        """Verify defaults: host="0.0.0.0", port=8080, log_level="INFO"."""
+        # Arrange & Act
+        from iisa.iisa_http_endpoints import Settings
 
-        # Act
-        with patch.dict(os.environ, env_vars, clear=False):
-            from iisa.iisa_http_endpoints import Settings
-
-            settings = Settings()
+        settings = Settings()
 
         # Assert
-        assert settings.gcp_location == "US"
         assert settings.host == "0.0.0.0"
         assert settings.port == 8080
         assert settings.log_level == "INFO"
 
-    def test_gcp_project_defaults_to_empty(self):
-        """gcp_project defaults to empty string (validated at runtime for bigquery mode)."""
-        # Arrange - remove the env var if present
-        env_without_project = {k: v for k, v in os.environ.items() if k != "IISA_GCP_PROJECT"}
-
-        # Act
-        with patch.dict(os.environ, env_without_project, clear=True):
-            from iisa.iisa_http_endpoints import Settings
-
-            settings = Settings()
-
-        # Assert — empty string, not a validation error
-        assert settings.gcp_project == ""
-
     def test_get_settings_cached(self):
         """Verify @lru_cache returns same instance."""
         # Arrange
-        env_vars = {"IISA_GCP_PROJECT": "test-project"}
+        env_vars = {}
 
         with patch.dict(os.environ, env_vars, clear=False):
             # Need to reimport to get fresh cache
@@ -194,22 +171,20 @@ class TestIISAState:
         assert state._initialized is False
 
     @patch("iisa.iisa_http_endpoints.DataManager")
-    @patch("iisa.iisa_http_endpoints.BigQueryProvider")
-    def test_initialize_success(self, mock_bq_class, mock_dm_class):
-        """Mock BigQueryProvider/DataManager, verify _initialized=True."""
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_initialize_success(self, mock_loader_class, mock_dm_class):
+        """Mock FileScoreLoader/DataManager, verify _initialized=True."""
         # Arrange
         from iisa.iisa_http_endpoints import IISAState, Settings
 
-        mock_bq_instance = MagicMock()
-        mock_bq_class.return_value = mock_bq_instance
+        mock_loader_instance = MagicMock()
+        mock_loader_class.return_value = mock_loader_instance
 
         mock_dm_instance = MagicMock()
         mock_dm_class.return_value = mock_dm_instance
 
         state = IISAState()
-
-        with patch.dict(os.environ, {"IISA_GCP_PROJECT": "test-project"}):
-            settings = Settings()
+        settings = Settings()
 
         # Act
         result = state.initialize(settings)
@@ -219,24 +194,19 @@ class TestIISAState:
         assert state._initialized is True
         assert state.settings is settings
         assert state.data_manager is mock_dm_instance
-        mock_bq_class.assert_called_once_with(
-            project="test-project",
-            location="US",
-        )
-        mock_dm_class.assert_called_once_with(mock_bq_instance)
+        mock_loader_class.assert_called_once()
+        mock_dm_class.assert_called_once_with(mock_loader_instance)
 
-    @patch("iisa.iisa_http_endpoints.BigQueryProvider")
-    def test_initialize_failure(self, mock_bq_class):
-        """Mock BigQueryProvider to raise, verify returns False and logs warning."""
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_initialize_failure(self, mock_loader_class):
+        """Mock FileScoreLoader to raise, verify returns False and logs warning."""
         # Arrange
         from iisa.iisa_http_endpoints import IISAState, Settings
 
-        mock_bq_class.side_effect = Exception("Connection failed")
+        mock_loader_class.side_effect = Exception("Connection failed")
 
         state = IISAState()
-
-        with patch.dict(os.environ, {"IISA_GCP_PROJECT": "test-project"}):
-            settings = Settings()
+        settings = Settings()
 
         # Act
         result = state.initialize(settings)
@@ -246,8 +216,8 @@ class TestIISAState:
         assert state._initialized is False
 
     @patch("iisa.iisa_http_endpoints.DataManager")
-    @patch("iisa.iisa_http_endpoints.BigQueryProvider")
-    def test_refresh_data_success(self, mock_bq_class, mock_dm_class):
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_refresh_data_success(self, mock_loader_class, mock_dm_class):
         """Mock load_scores()=True, verify _history populated."""
         # Arrange
         from iisa.iisa_http_endpoints import IISAState, Settings
@@ -260,10 +230,7 @@ class TestIISAState:
         mock_dm_class.return_value = mock_dm_instance
 
         state = IISAState()
-
-        with patch.dict(os.environ, {"IISA_GCP_PROJECT": "test-project"}):
-            settings = Settings()
-
+        settings = Settings()
         state.initialize(settings)
 
         # Act
@@ -276,8 +243,8 @@ class TestIISAState:
         mock_dm_instance.load_scores.assert_called_once()
 
     @patch("iisa.iisa_http_endpoints.DataManager")
-    @patch("iisa.iisa_http_endpoints.BigQueryProvider")
-    def test_refresh_data_failure(self, mock_bq_class, mock_dm_class):
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_refresh_data_failure(self, mock_loader_class, mock_dm_class):
         """Mock load_scores()=False, verify returns False."""
         # Arrange
         from iisa.iisa_http_endpoints import IISAState, Settings
@@ -287,10 +254,7 @@ class TestIISAState:
         mock_dm_class.return_value = mock_dm_instance
 
         state = IISAState()
-
-        with patch.dict(os.environ, {"IISA_GCP_PROJECT": "test-project"}):
-            settings = Settings()
-
+        settings = Settings()
         state.initialize(settings)
 
         # Act
@@ -300,21 +264,18 @@ class TestIISAState:
         assert result is False
 
     @patch("iisa.iisa_http_endpoints.DataManager")
-    @patch("iisa.iisa_http_endpoints.BigQueryProvider")
-    def test_refresh_data_exception(self, mock_bq_class, mock_dm_class):
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_refresh_data_exception(self, mock_loader_class, mock_dm_class):
         """Mock load_scores() to raise exception, verify returns False."""
         # Arrange
         from iisa.iisa_http_endpoints import IISAState, Settings
 
         mock_dm_instance = MagicMock()
-        mock_dm_instance.load_scores.side_effect = Exception("BigQuery connection failed")
+        mock_dm_instance.load_scores.side_effect = Exception("Connection failed")
         mock_dm_class.return_value = mock_dm_instance
 
         state = IISAState()
-
-        with patch.dict(os.environ, {"IISA_GCP_PROJECT": "test-project"}):
-            settings = Settings()
-
+        settings = Settings()
         state.initialize(settings)
 
         # Act
@@ -439,8 +400,8 @@ class TestRefreshEndpoint:
     """Tests for POST /refresh endpoint."""
 
     @patch("iisa.iisa_http_endpoints.DataManager")
-    @patch("iisa.iisa_http_endpoints.BigQueryProvider")
-    def test_refresh_success(self, mock_bq_class, mock_dm_class, mock_history_df):
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_refresh_success(self, mock_loader_class, mock_dm_class, mock_history_df):
         """Mock refresh_data()=True, verify 200 with row count."""
         # Arrange
         from iisa import iisa_http_endpoints
@@ -451,9 +412,8 @@ class TestRefreshEndpoint:
         mock_dm_instance.get_data.return_value = mock_history_df
         mock_dm_class.return_value = mock_dm_instance
 
-        with patch.dict(os.environ, {"IISA_GCP_PROJECT": "test-project"}):
-            settings = Settings()
-            iisa_http_endpoints._state.initialize(settings)
+        settings = Settings()
+        iisa_http_endpoints._state.initialize(settings)
 
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -481,8 +441,8 @@ class TestRefreshEndpoint:
         assert "not initialized" in response.json()["detail"]
 
     @patch("iisa.iisa_http_endpoints.DataManager")
-    @patch("iisa.iisa_http_endpoints.BigQueryProvider")
-    def test_refresh_failure(self, mock_bq_class, mock_dm_class):
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_refresh_failure(self, mock_loader_class, mock_dm_class):
         """Mock refresh_data()=False, verify 500 Internal Server Error."""
         # Arrange
         from iisa import iisa_http_endpoints
@@ -492,9 +452,8 @@ class TestRefreshEndpoint:
         mock_dm_instance.load_scores.return_value = False
         mock_dm_class.return_value = mock_dm_instance
 
-        with patch.dict(os.environ, {"IISA_GCP_PROJECT": "test-project"}):
-            settings = Settings()
-            iisa_http_endpoints._state.initialize(settings)
+        settings = Settings()
+        iisa_http_endpoints._state.initialize(settings)
 
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -510,8 +469,8 @@ class TestGetScoreEndpoint:
     """Tests for POST /get-score endpoint."""
 
     @patch("iisa.iisa_http_endpoints.DataManager")
-    @patch("iisa.iisa_http_endpoints.BigQueryProvider")
-    def test_get_score_found(self, mock_bq_class, mock_dm_class, mock_history_df):
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_get_score_found(self, mock_loader_class, mock_dm_class, mock_history_df):
         """Verify returns score and components for existing indexer."""
         # Arrange
         from iisa import iisa_http_endpoints
@@ -522,10 +481,9 @@ class TestGetScoreEndpoint:
         mock_dm_instance.get_data.return_value = mock_history_df
         mock_dm_class.return_value = mock_dm_instance
 
-        with patch.dict(os.environ, {"IISA_GCP_PROJECT": "test-project"}):
-            settings = Settings()
-            iisa_http_endpoints._state.initialize(settings)
-            iisa_http_endpoints._state.refresh_data()
+        settings = Settings()
+        iisa_http_endpoints._state.initialize(settings)
+        iisa_http_endpoints._state.refresh_data()
 
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -541,8 +499,8 @@ class TestGetScoreEndpoint:
         assert isinstance(data["components"], dict)
 
     @patch("iisa.iisa_http_endpoints.DataManager")
-    @patch("iisa.iisa_http_endpoints.BigQueryProvider")
-    def test_get_score_not_found(self, mock_bq_class, mock_dm_class, mock_history_df):
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_get_score_not_found(self, mock_loader_class, mock_dm_class, mock_history_df):
         """Verify returns found=false for non-existent indexer."""
         # Arrange
         from iisa import iisa_http_endpoints
@@ -553,10 +511,9 @@ class TestGetScoreEndpoint:
         mock_dm_instance.get_data.return_value = mock_history_df
         mock_dm_class.return_value = mock_dm_instance
 
-        with patch.dict(os.environ, {"IISA_GCP_PROJECT": "test-project"}):
-            settings = Settings()
-            iisa_http_endpoints._state.initialize(settings)
-            iisa_http_endpoints._state.refresh_data()
+        settings = Settings()
+        iisa_http_endpoints._state.initialize(settings)
+        iisa_http_endpoints._state.refresh_data()
 
         client = TestClient(app, raise_server_exceptions=False)
 

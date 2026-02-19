@@ -1,92 +1,26 @@
 """
-Loads pre-computed indexer scores from BigQuery or a local JSON file.
+Loads pre-computed indexer scores from a JSON file on a shared PVC.
 
-Scores are computed daily by a CronJob (cronjobs/compute_scores/) and written either
-to the indexer_scores BigQuery table (bigquery mode) or to a JSON file on a shared
-PVC (redpanda mode). IISA reads these scores on startup using DataManager.load_scores().
+Scores are computed daily by a CronJob (cronjobs/compute_scores/) and written
+to a JSON file. IISA reads these scores on startup using DataManager.load_scores().
 """
 
 import json
 import logging
 import os
-import socket
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import NewType, Optional, Tuple
+from typing import Optional, Tuple
 
 import pandas as pd
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
-__all__ = ["BigQueryProvider", "FileScoreLoader", "DataManager"]
-
-QueryStr = NewType("QueryStr", str)
+__all__ = ["FileScoreLoader", "DataManager"]
 
 # Staleness thresholds
 STALE_SCORES_WARNING_HOURS = 48
 STALE_SCORES_CRITICAL_HOURS = 168  # 7 days
 
 logger = logging.getLogger(__name__)
-
-
-class BigQueryProvider:
-    """Reads pre-computed indexer scores from BigQuery."""
-
-    def __init__(self, project: str, location: str) -> None:
-        from bigframes import pandas as bpd
-
-        self._bpd = bpd
-        bpd.options.bigquery.project = project
-        bpd.options.bigquery.location = location
-        bpd.options.display.progress_bar = None
-
-    @retry(
-        retry=retry_if_exception_type((ConnectionError, socket.timeout)),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, max=60),
-        reraise=True,
-    )
-    def _read_gbq_dataframe(self, query: QueryStr) -> pd.DataFrame:
-        return self._bpd.read_gbq(query).to_pandas()
-
-    def fetch_indexer_scores(
-        self, dataset: str = "iisa_data_for_dips"
-    ) -> Tuple[pd.DataFrame, Optional[datetime]]:
-        """
-        Fetch pre-computed indexer scores from the indexer_scores table.
-
-        Returns ~60 rows (one per indexer) computed daily by CronJob.
-
-        :param dataset: The BigQuery dataset containing the indexer_scores table.
-        :return: Tuple of (DataFrame with scores, timestamp when computed).
-        """
-        logger.info("Fetching pre-computed indexer scores from BigQuery")
-
-        project = self._bpd.options.bigquery.project
-
-        query = QueryStr(f"""
-            SELECT *
-            FROM `{project}.{dataset}.indexer_scores`
-            WHERE computed_at = (
-                SELECT MAX(computed_at)
-                FROM `{project}.{dataset}.indexer_scores`
-            )
-        """)
-
-        dataframe = self._read_gbq_dataframe(query)
-
-        if dataframe.empty:
-            logger.warning("No scores found in indexer_scores table")
-            return dataframe, None
-
-        computed_at = pd.to_datetime(dataframe["computed_at"].iloc[0])
-        logger.info(f"Fetched {len(dataframe)} indexer scores (computed at {computed_at})")
-
-        return dataframe, computed_at
 
 
 SCORES_FILE_PATH = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_scores.json")
@@ -96,8 +30,8 @@ class FileScoreLoader:
     """
     Reads pre-computed indexer scores from a JSON file on a shared PVC.
 
-    Used when SCORE_SOURCE=file (Redpanda / local-network mode). The CronJob
-    writes scores via RedpandaProvider.write_scores(); this class reads them back.
+    The CronJob writes scores via RedpandaProvider.write_scores(); this class
+    reads them back.
     """
 
     def __init__(self, scores_file_path: str = SCORES_FILE_PATH) -> None:
@@ -147,7 +81,7 @@ class DataManager:
     Scores are computed daily by a CronJob and include latency regression
     coefficients, uptime, success rate, and economic security metrics.
     Accepts any object with a fetch_indexer_scores() method — currently
-    BigQueryProvider or FileScoreLoader.
+    FileScoreLoader.
     """
 
     def __init__(self, provider) -> None:

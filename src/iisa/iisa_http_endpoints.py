@@ -6,12 +6,11 @@ contract expected by the Rust HTTP client in dipper-iisa.
 
 Endpoints:
 - GET /health - Health check, reports if data is loaded
-- POST /refresh - Reload scores from BigQuery
+- POST /refresh - Reload scores from the scores file
 - POST /select-indexers - Select optimal indexers for a deployment
 """
 
 import logging
-import os
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Optional
@@ -22,7 +21,7 @@ from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .indexer_selection import DataProcessor
-from .score_loader import BigQueryProvider, DataManager, FileScoreLoader
+from .score_loader import DataManager, FileScoreLoader
 
 __all__ = ["app", "Settings", "get_settings"]
 
@@ -37,7 +36,7 @@ class Settings(BaseSettings):
     Service configuration loaded from environment variables.
 
     All settings are prefixed with IISA_ in environment variables.
-    For example, IISA_GCP_PROJECT sets the gcp_project field.
+    For example, IISA_HOST sets the host field.
     """
 
     model_config = SettingsConfigDict(
@@ -46,10 +45,6 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
-
-    # Google Cloud Platform (required only when score_source=bigquery)
-    gcp_project: str = ""
-    gcp_location: str = "US"
 
     # Service configuration
     host: str = "0.0.0.0"
@@ -165,22 +160,8 @@ class IISAState:
         try:
             logger.info("Initializing IISA providers...")
 
-            score_source = os.environ.get("SCORE_SOURCE", "bigquery")
-
-            if score_source == "file":
-                provider = FileScoreLoader()
-                logger.info("Score source: file (Redpanda / local-network mode)")
-            else:
-                if not settings.gcp_project:
-                    raise ValueError(
-                        "gcp_project is required when SCORE_SOURCE=bigquery. "
-                        "Set IISA_GCP_PROJECT or use SCORE_SOURCE=file for Redpanda mode."
-                    )
-                provider = BigQueryProvider(
-                    project=settings.gcp_project,
-                    location=settings.gcp_location,
-                )
-                logger.info("Score source: BigQuery")
+            provider = FileScoreLoader()
+            logger.info("Score source: file (shared PVC)")
 
             self.data_manager = DataManager(provider)
 
@@ -196,9 +177,9 @@ class IISAState:
 
     def refresh_data(self) -> bool:
         """
-        Load pre-computed indexer scores from BigQuery.
+        Load pre-computed indexer scores from the scores file.
 
-        This method loads scores from the indexer_scores table (populated by CronJob)
+        This method loads scores from the scores JSON file (populated by CronJob)
         instead of computing them in-container. This is much faster and uses less memory.
 
         Returns True if scores were loaded successfully, False otherwise.
@@ -208,7 +189,7 @@ class IISAState:
             return False
 
         try:
-            logger.info("Loading pre-computed indexer scores from BigQuery...")
+            logger.info("Loading pre-computed indexer scores...")
             success = self.data_manager.load_scores()
 
             if success:
@@ -217,7 +198,7 @@ class IISAState:
                     logger.info(f"Scores loaded successfully: {len(self._history)} indexers")
                     return True
 
-            logger.warning("Failed to load scores from BigQuery")
+            logger.warning("Failed to load scores")
             return False
 
         except Exception as e:
@@ -251,8 +232,8 @@ async def lifespan(app: FastAPI):
 
     On startup:
     1. Load settings from environment
-    2. Initialize BigQuery provider and DataManager
-    3. Load pre-computed scores from BigQuery
+    2. Initialize FileScoreLoader and DataManager
+    3. Load pre-computed scores from the scores file
 
     If any step fails, the service continues in fallback mode with random selection.
     """
@@ -265,8 +246,6 @@ async def lifespan(app: FastAPI):
     logger.setLevel(getattr(logging, settings.log_level))
 
     logger.info("Starting IISA service...")
-    logger.info(f"GCP Project: {settings.gcp_project}")
-    logger.info(f"GCP Location: {settings.gcp_location}")
 
     # Initialize providers and load data
     if not _state.initialize(settings):
@@ -316,10 +295,9 @@ async def health_check() -> HealthResponse:
 @app.post("/refresh")
 async def refresh_data():
     """
-    Trigger a data refresh from BigQuery.
+    Trigger a data refresh from the scores file.
 
-    This endpoint fetches fresh performance data from BigQuery.
-    It can take several minutes to complete.
+    This endpoint reloads scores from the shared PVC.
     """
     if not _state._initialized:
         raise HTTPException(
@@ -332,7 +310,7 @@ async def refresh_data():
         row_count = len(_state.history) if _state.history is not None else 0
         return {"status": "success", "rows": row_count}
     else:
-        raise HTTPException(status_code=500, detail="Failed to refresh data from BigQuery")
+        raise HTTPException(status_code=500, detail="Failed to refresh data")
 
 
 @app.post("/get-score", response_model=ScoreResponse)

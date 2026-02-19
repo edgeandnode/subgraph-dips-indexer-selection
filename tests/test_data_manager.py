@@ -41,25 +41,25 @@ class TestDataManager:
         })
 
     @pytest.fixture
-    def mock_bigquery_with_scores(self, mock_scores_df):
-        """Create a mock BigQueryProvider that returns scores."""
-        mock_bq = MagicMock()
-        mock_bq.fetch_indexer_scores.return_value = (
+    def mock_provider_with_scores(self, mock_scores_df):
+        """Create a mock provider that returns scores."""
+        mock_provider = MagicMock()
+        mock_provider.fetch_indexer_scores.return_value = (
             mock_scores_df,
             datetime(2024, 1, 15, 12, 0),
         )
-        return mock_bq
+        return mock_provider
 
     @pytest.fixture
-    def mock_bigquery_empty_scores(self):
-        """Create a mock BigQueryProvider that returns empty scores."""
-        mock_bq = MagicMock()
-        mock_bq.fetch_indexer_scores.return_value = (pd.DataFrame(), None)
-        return mock_bq
+    def mock_provider_empty_scores(self):
+        """Create a mock provider that returns empty scores."""
+        mock_provider = MagicMock()
+        mock_provider.fetch_indexer_scores.return_value = (pd.DataFrame(), None)
+        return mock_provider
 
-    def test_load_scores_success(self, mock_bigquery_with_scores):
+    def test_load_scores_success(self, mock_provider_with_scores):
         """Test that load_scores() successfully loads and transforms data."""
-        data_manager = DataManager(mock_bigquery_with_scores)
+        data_manager = DataManager(mock_provider_with_scores)
 
         result = data_manager.load_scores()
 
@@ -68,9 +68,9 @@ class TestDataManager:
         assert data is not None
         assert len(data) == 3
 
-    def test_load_scores_column_transformation(self, mock_bigquery_with_scores):
+    def test_load_scores_column_transformation(self, mock_provider_with_scores):
         """Test that load_scores() correctly transforms column names."""
-        data_manager = DataManager(mock_bigquery_with_scores)
+        data_manager = DataManager(mock_provider_with_scores)
         data_manager.load_scores()
 
         data = data_manager.get_data()
@@ -82,9 +82,9 @@ class TestDataManager:
         assert "norm_lat_lin_reg_coefficient" in data.columns
         assert "norm_stake_to_fees_iqr_deviation" in data.columns
 
-    def test_load_scores_uptime_conversion(self, mock_bigquery_with_scores):
+    def test_load_scores_uptime_conversion(self, mock_provider_with_scores):
         """Test that uptime is converted from 0-1 to percentage."""
-        data_manager = DataManager(mock_bigquery_with_scores)
+        data_manager = DataManager(mock_provider_with_scores)
         data_manager.load_scores()
 
         data = data_manager.get_data()
@@ -94,9 +94,9 @@ class TestDataManager:
         assert data["% up_x"].iloc[1] == pytest.approx(95.0)
         assert data["% up_x"].iloc[2] == pytest.approx(99.0)
 
-    def test_load_scores_destination_loc_creation(self, mock_bigquery_with_scores):
+    def test_load_scores_destination_loc_creation(self, mock_provider_with_scores):
         """Test that destination_loc is created from lat/lon."""
-        data_manager = DataManager(mock_bigquery_with_scores)
+        data_manager = DataManager(mock_provider_with_scores)
         data_manager.load_scores()
 
         data = data_manager.get_data()
@@ -105,23 +105,23 @@ class TestDataManager:
         assert data["destination_loc"].iloc[1] == "40.0,-74.0"
         assert data["destination_loc"].iloc[2] == "35.0,139.0"
 
-    def test_load_scores_empty_table(self, mock_bigquery_empty_scores):
+    def test_load_scores_empty_table(self, mock_provider_empty_scores):
         """Test that load_scores() returns False when table is empty."""
-        data_manager = DataManager(mock_bigquery_empty_scores)
+        data_manager = DataManager(mock_provider_empty_scores)
 
         result = data_manager.load_scores()
 
         assert result is False
         assert data_manager.get_data() is None
 
-    def test_load_scores_staleness_check(self, mock_bigquery_with_scores, caplog):
+    def test_load_scores_staleness_check(self, mock_provider_with_scores, caplog):
         """Test that staleness warnings are logged for old scores."""
         old_timestamp = datetime.now(timezone.utc) - timedelta(hours=100)
-        mock_bigquery_with_scores.fetch_indexer_scores.return_value = (
-            mock_bigquery_with_scores.fetch_indexer_scores.return_value[0],
+        mock_provider_with_scores.fetch_indexer_scores.return_value = (
+            mock_provider_with_scores.fetch_indexer_scores.return_value[0],
             old_timestamp,
         )
-        data_manager = DataManager(mock_bigquery_with_scores)
+        data_manager = DataManager(mock_provider_with_scores)
 
         import logging
         with caplog.at_level(logging.WARNING):
@@ -129,9 +129,9 @@ class TestDataManager:
 
         assert any("stale" in record.message.lower() for record in caplog.records)
 
-    def test_get_scores_age(self, mock_bigquery_with_scores):
+    def test_get_scores_age(self, mock_provider_with_scores):
         """Test that get_scores_age() returns correct age."""
-        data_manager = DataManager(mock_bigquery_with_scores)
+        data_manager = DataManager(mock_provider_with_scores)
 
         assert data_manager.get_scores_age() is None
 
@@ -142,10 +142,10 @@ class TestDataManager:
         assert isinstance(age, timedelta)
 
     def test_load_scores_preserves_precomputed_normalized_values(
-        self, mock_bigquery_with_scores
+        self, mock_provider_with_scores
     ):
         """Test that pre-computed normalized values are preserved."""
-        data_manager = DataManager(mock_bigquery_with_scores)
+        data_manager = DataManager(mock_provider_with_scores)
         data_manager.load_scores()
 
         data = data_manager.get_data()
