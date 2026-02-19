@@ -272,8 +272,7 @@ class RedpandaProvider:
     def _ensure_count_cache(self, start_date: date, num_days: int) -> None:
         """Trigger a count pass only if the cache doesn't cover this window."""
         if (
-            self._count_cache
-            and self._count_cache_start_date == start_date
+            self._count_cache_start_date == start_date
             and self._count_cache_num_days == num_days
         ):
             return
