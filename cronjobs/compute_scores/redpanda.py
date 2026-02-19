@@ -688,8 +688,10 @@ def _build_dataframe(rows: List[dict]) -> pd.DataFrame:
     """
     df = pd.DataFrame(rows)
 
-    df["deployment_hash"] = df["deployment_bytes"].apply(_bytes_to_cid)
-    df["indexer"] = df["indexer_bytes"].apply(_bytes_to_hex)
+    dep_map = {b: _bytes_to_cid(b) for b in df["deployment_bytes"].unique()}
+    idx_map = {b: _bytes_to_hex(b) for b in df["indexer_bytes"].unique()}
+    df["deployment_hash"] = df["deployment_bytes"].map(dep_map)
+    df["indexer"] = df["indexer_bytes"].map(idx_map)
     df["timestamp"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True)
     df["day_partition"] = df["timestamp"].dt.date
 
