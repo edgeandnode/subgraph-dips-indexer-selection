@@ -63,6 +63,18 @@ spec:
               value: "gateway_queries"
             - name: GRAPH_NETWORK_SUBGRAPH_URL
               value: ""  # e.g. http://graph-node:8000/subgraphs/name/graph-network
+            - name: REDPANDA_SASL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: iisa-redpanda-credentials
+                  key: sasl_username
+                  optional: true
+            - name: REDPANDA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: iisa-redpanda-credentials
+                  key: sasl_password
+                  optional: true
             - name: SCORES_FILE_PATH
               value: "/app/scores/indexer_scores.json"
             securityContext:

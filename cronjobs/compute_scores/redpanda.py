@@ -93,6 +93,10 @@ class RedpandaProvider:
         self._graph_network_url = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
         self._scores_path = SCORES_FILE_PATH
 
+        # SASL authentication (optional — omit for plaintext local-network)
+        self._sasl_username = os.environ.get("REDPANDA_SASL_USERNAME", "")
+        self._sasl_password = os.environ.get("REDPANDA_SASL_PASSWORD", "")
+
         # Count cache — populated by _count_pass
         self._count_cache: Dict[Tuple[str, str], int] = {}
         self._fees_per_indexer: Dict[str, float] = {}
@@ -107,6 +111,22 @@ class RedpandaProvider:
 
         # Partition offsets cached between passes
         self._cached_partitions: Optional[list] = None
+
+    def _consumer_config(self) -> dict:
+        """Base librdkafka config shared by all consumers."""
+        config = {
+            "bootstrap.servers": self._bootstrap_servers,
+            "group.id": "iisa-score-computation-replay",
+            "enable.auto.commit": False,
+        }
+        if self._sasl_username and self._sasl_password:
+            config.update({
+                "security.protocol": "SASL_SSL",
+                "sasl.mechanism": "SCRAM-SHA-256",
+                "sasl.username": self._sasl_username,
+                "sasl.password": self._sasl_password,
+            })
+        return config
 
     # -----------------------------------------------------------------------
     # Public interface
@@ -302,13 +322,7 @@ class RedpandaProvider:
         """
         from confluent_kafka import Consumer, TopicPartition
 
-        consumer = Consumer(
-            {
-                "bootstrap.servers": self._bootstrap_servers,
-                "group.id": "iisa-score-computation-replay",
-                "enable.auto.commit": False,
-            }
-        )
+        consumer = Consumer(self._consumer_config())
         try:
             meta = consumer.list_topics(self._topic, timeout=30)
             if self._topic not in meta.topics:
@@ -366,13 +380,7 @@ class RedpandaProvider:
         # Consume partitions in parallel
         def count_partition(tp):
             from confluent_kafka import Consumer, TopicPartition as TP
-            consumer = Consumer(
-                {
-                    "bootstrap.servers": self._bootstrap_servers,
-                    "group.id": "iisa-score-computation-replay",
-                    "enable.auto.commit": False,
-                }
-            )
+            consumer = Consumer(self._consumer_config())
             try:
                 consumer.assign([TP(tp.topic, tp.partition, tp.offset)])
                 return self._count_partition_loop(consumer, end_ts_ms)
@@ -505,13 +513,7 @@ class RedpandaProvider:
         def sample_partition(tp):
             from confluent_kafka import Consumer, TopicPartition as TP
             rng = random.Random()
-            consumer = Consumer(
-                {
-                    "bootstrap.servers": self._bootstrap_servers,
-                    "group.id": "iisa-score-computation-replay",
-                    "enable.auto.commit": False,
-                }
-            )
+            consumer = Consumer(self._consumer_config())
             try:
                 consumer.assign([TP(tp.topic, tp.partition, tp.offset)])
                 return self._sample_partition_loop(consumer, end_ts_ms, rows_to_use, rng)
