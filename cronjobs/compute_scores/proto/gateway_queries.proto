@@ -1,6 +1,7 @@
 syntax = "proto3";
 
 // Transcribed from titorelli's src/messages.rs prost field tags.
+// Last verified against titorelli source: 2026-02-19 (all 23 fields match).
 // Each ClientQueryProtobuf message corresponds to one gateway query.
 // The indexer_queries repeated field contains one entry per indexer attempt.
 
