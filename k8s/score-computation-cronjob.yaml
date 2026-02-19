@@ -36,10 +36,10 @@ spec:
             imagePullPolicy: Always
             resources:
               requests:
-                memory: "64Gi"
+                memory: "50Gi"
                 cpu: "2"
               limits:
-                memory: "64Gi"
+                memory: "50Gi"
                 cpu: "8"
             env:
             - name: DATA_SOURCE

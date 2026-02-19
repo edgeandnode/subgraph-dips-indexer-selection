@@ -6,6 +6,7 @@ metadata:
   labels:
     app: iisa
 spec:
+  storageClassName: standard-rwx
   accessModes:
     - ReadWriteMany
   resources:
