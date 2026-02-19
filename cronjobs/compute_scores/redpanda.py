@@ -624,7 +624,7 @@ class RedpandaProvider:
                     if n < rows_to_use:
                         reservoirs[key].append(row)
                     else:
-                        j = rng.randint(0, n - 1)
+                        j = rng.randint(0, n)
                         if j < rows_to_use:
                             reservoirs[key][j] = row
 
