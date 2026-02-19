@@ -222,8 +222,7 @@ class RedpandaProvider:
         """
         Return True if the scores file already contains today's computation.
 
-        Reads only the first record's computed_at field to avoid loading the
-        full file.
+        Loads the full JSON file and checks the first record's computed_at field.
         """
         try:
             with open(self._scores_path, "r") as f:
