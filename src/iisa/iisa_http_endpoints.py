@@ -171,6 +171,11 @@ class IISAState:
                 provider = FileScoreLoader()
                 logger.info("Score source: file (Redpanda / local-network mode)")
             else:
+                if not settings.gcp_project:
+                    raise ValueError(
+                        "gcp_project is required when SCORE_SOURCE=bigquery. "
+                        "Set IISA_GCP_PROJECT or use SCORE_SOURCE=file for Redpanda mode."
+                    )
                 provider = BigQueryProvider(
                     project=settings.gcp_project,
                     location=settings.gcp_location,
