@@ -379,7 +379,6 @@ class TestRedpandaProviderCaching:
             {
                 "REDPANDA_BOOTSTRAP_SERVERS": "localhost:9092",
                 "REDPANDA_TOPIC": "gateway_queries",
-                "REDPANDA_CONSUMER_GROUP": "test-group",
             },
         ):
             return RedpandaProvider()

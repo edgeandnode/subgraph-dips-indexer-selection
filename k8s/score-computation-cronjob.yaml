@@ -61,8 +61,6 @@ spec:
               value: ""  # e.g. redpanda:9092
             - name: REDPANDA_TOPIC
               value: "gateway_queries"
-            - name: REDPANDA_CONSUMER_GROUP
-              value: "iisa-score-computation"
             - name: GRAPH_NETWORK_SUBGRAPH_URL
               value: ""  # e.g. http://graph-node:8000/subgraphs/name/graph-network
             - name: SCORES_FILE_PATH

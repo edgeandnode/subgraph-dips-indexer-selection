@@ -79,9 +79,6 @@ class RedpandaProvider:
     def __init__(self) -> None:
         self._bootstrap_servers = os.environ.get("REDPANDA_BOOTSTRAP_SERVERS", "")
         self._topic = os.environ.get("REDPANDA_TOPIC", "gateway_queries")
-        self._consumer_group = os.environ.get(
-            "REDPANDA_CONSUMER_GROUP", "iisa-score-computation"
-        )
         self._graph_network_url = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
         self._scores_path = SCORES_FILE_PATH
 
@@ -281,11 +278,11 @@ class RedpandaProvider:
         consumer = Consumer(
             {
                 "bootstrap.servers": self._bootstrap_servers,
-                "group.id": self._consumer_group,
-                "auto.offset.reset": "earliest",
+                # group.id is required by confluent-kafka but unused — we call
+                # assign() for manual partition assignment, bypassing group
+                # coordination entirely.
+                "group.id": "iisa-score-computation-replay",
                 "enable.auto.commit": False,
-                "session.timeout.ms": 60_000,
-                "max.poll.interval.ms": 3_600_000,  # 1 hour — replay is slow
             }
         )
 
