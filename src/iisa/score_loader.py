@@ -1,13 +1,17 @@
 """
-Loads pre-computed indexer scores from BigQuery.
+Loads pre-computed indexer scores from BigQuery or a local JSON file.
 
-Scores are computed daily by a CronJob (cronjobs/compute_scores/) and written to the
-indexer_scores table. IISA reads these scores on startup using DataManager.load_scores().
+Scores are computed daily by a CronJob (cronjobs/compute_scores/) and written either
+to the indexer_scores BigQuery table (bigquery mode) or to a JSON file on a shared
+PVC (redpanda mode). IISA reads these scores on startup using DataManager.load_scores().
 """
 
+import json
 import logging
+import os
 import socket
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import NewType, Optional, Tuple
 
 import pandas as pd
@@ -19,7 +23,7 @@ from tenacity import (
     wait_exponential,
 )
 
-__all__ = ["BigQueryProvider", "DataManager"]
+__all__ = ["BigQueryProvider", "FileScoreLoader", "DataManager"]
 
 QueryStr = NewType("QueryStr", str)
 
@@ -83,16 +87,69 @@ class BigQueryProvider:
         return dataframe, computed_at
 
 
+SCORES_FILE_PATH = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_scores.json")
+
+
+class FileScoreLoader:
+    """
+    Reads pre-computed indexer scores from a JSON file on a shared PVC.
+
+    Used when SCORE_SOURCE=file (Redpanda / local-network mode). The CronJob
+    writes scores via RedpandaProvider.write_scores(); this class reads them back.
+    """
+
+    def __init__(self, scores_file_path: str = SCORES_FILE_PATH) -> None:
+        self._path = scores_file_path
+
+    def fetch_indexer_scores(self) -> Tuple[pd.DataFrame, Optional[datetime]]:
+        """
+        Read the scores JSON file and return a (DataFrame, computed_at) tuple.
+
+        Returns (empty DataFrame, None) if the file doesn't exist or is unreadable.
+        """
+        logger.info(f"Reading pre-computed indexer scores from {self._path}")
+
+        try:
+            with open(self._path, "r") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            logger.warning(f"Scores file not found: {self._path}")
+            return pd.DataFrame(), None
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(f"Failed to read scores file {self._path}: {e}")
+            return pd.DataFrame(), None
+
+        if not data:
+            logger.warning("Scores file is empty")
+            return pd.DataFrame(), None
+
+        df = pd.DataFrame(data)
+
+        if "computed_at" not in df.columns:
+            logger.warning("Scores file has no computed_at column")
+            return df, None
+
+        df["computed_at"] = pd.to_datetime(df["computed_at"], utc=True, errors="coerce")
+        computed_at = df["computed_at"].iloc[0]
+        if pd.isna(computed_at):
+            computed_at = None
+
+        logger.info(f"Loaded {len(df)} indexer scores from file (computed at {computed_at})")
+        return df, computed_at
+
+
 class DataManager:
     """
-    Loads pre-computed indexer scores from BigQuery.
+    Loads pre-computed indexer scores from the configured provider.
 
     Scores are computed daily by a CronJob and include latency regression
     coefficients, uptime, success rate, and economic security metrics.
+    Accepts any object with a fetch_indexer_scores() method — currently
+    BigQueryProvider or FileScoreLoader.
     """
 
-    def __init__(self, bigquery: BigQueryProvider) -> None:
-        self._bq = bigquery
+    def __init__(self, provider) -> None:
+        self._bq = provider
         self._data: Optional[pd.DataFrame] = None
         self._scores_computed_at: Optional[datetime] = None
 

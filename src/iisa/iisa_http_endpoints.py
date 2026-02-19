@@ -11,6 +11,7 @@ Endpoints:
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Optional
@@ -21,7 +22,7 @@ from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .indexer_selection import DataProcessor
-from .score_loader import BigQueryProvider, DataManager
+from .score_loader import BigQueryProvider, DataManager, FileScoreLoader
 
 __all__ = ["app", "Settings", "get_settings"]
 
@@ -46,8 +47,8 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Google Cloud Platform
-    gcp_project: str
+    # Google Cloud Platform (required only when score_source=bigquery)
+    gcp_project: str = ""
     gcp_location: str = "US"
 
     # Service configuration
@@ -164,12 +165,19 @@ class IISAState:
         try:
             logger.info("Initializing IISA providers...")
 
-            bigquery = BigQueryProvider(
-                project=settings.gcp_project,
-                location=settings.gcp_location,
-            )
+            score_source = os.environ.get("SCORE_SOURCE", "bigquery")
 
-            self.data_manager = DataManager(bigquery)
+            if score_source == "file":
+                provider = FileScoreLoader()
+                logger.info("Score source: file (Redpanda / local-network mode)")
+            else:
+                provider = BigQueryProvider(
+                    project=settings.gcp_project,
+                    location=settings.gcp_location,
+                )
+                logger.info("Score source: BigQuery")
+
+            self.data_manager = DataManager(provider)
 
             logger.info("IISA providers initialized successfully")
             self._initialized = True
@@ -261,10 +269,10 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("Failed to initialize IISA providers")
 
     # Load data on startup - service won't accept requests until ready
-    logger.info("Loading indexer scores from BigQuery...")
+    logger.info("Loading indexer scores...")
     if not _state.refresh_data():
         logger.error("Failed to load indexer scores - cannot start service")
-        raise RuntimeError("Failed to load indexer scores from BigQuery")
+        raise RuntimeError("Failed to load indexer scores")
 
     logger.info("IISA service ready")
 

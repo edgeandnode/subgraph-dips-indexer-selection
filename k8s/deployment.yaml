@@ -45,6 +45,10 @@ spec:
                   key: gcp_location
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /app/credentials/service-account.json
+            - name: SCORE_SOURCE
+              value: "bigquery"  # Set to "file" for local-network / Redpanda mode
+            - name: SCORES_FILE_PATH
+              value: "/app/scores/indexer_scores.json"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -86,7 +90,12 @@ spec:
             - name: gcp-credentials
               mountPath: /app/credentials
               readOnly: true
+            - name: scores
+              mountPath: /app/scores
       volumes:
         - name: gcp-credentials
           secret:
             secretName: iisa-gcp-credentials
+        - name: scores
+          persistentVolumeClaim:
+            claimName: iisa-scores

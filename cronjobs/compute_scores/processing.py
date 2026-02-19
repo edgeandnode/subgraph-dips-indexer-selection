@@ -129,7 +129,7 @@ def _empty_geoip_result(ip_addr: str = None) -> dict:
 
 
 def compute_all_scores(
-    bq_client,
+    provider,
     start_date: date,
     start_ts: str,
     num_days: int,
@@ -139,7 +139,7 @@ def compute_all_scores(
     Compute all indexer scores and return as a DataFrame ready for BigQuery.
 
     This is the main orchestration function that:
-    1. Fetches raw data from BigQuery
+    1. Fetches raw data from the configured provider (BigQuery or Redpanda)
     2. Resolves GeoIP for indexers
     3. Runs latency linear regression
     4. Computes uptime, success rate, stake-to-fees
@@ -147,11 +147,11 @@ def compute_all_scores(
     6. Returns a DataFrame matching the indexer_scores schema
     """
     # Fetch initial query results to determine sampling
-    initial_query_results = bq_client.fetch_initial_query_results(start_date, num_days)
+    initial_query_results = provider.fetch_initial_query_results(start_date, num_days)
     target_rows_per_subgraph = adjust_rows(initial_query_results, target_rows)
 
     # Fetch combined query data (~20M rows)
-    combined_queries = bq_client.fetch_combined_query_results(
+    combined_queries = provider.fetch_combined_query_results(
         start_date, num_days, target_rows_per_subgraph
     )
 
@@ -247,7 +247,7 @@ def compute_all_scores(
     indexer_uptime = calculate_indexer_uptime(data_for_uptime)
 
     # Fetch and calculate stake-to-fees
-    stake_to_fees_raw = bq_client.fetch_stake_to_fees(start_ts)
+    stake_to_fees_raw = provider.fetch_stake_to_fees(start_ts)
     stake_to_fees = calculate_indexer_stake_to_fees(stake_to_fees_raw)
 
     # Aggregate indexer info (org, location)
