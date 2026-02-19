@@ -13,7 +13,7 @@ import tempfile
 from collections import namedtuple
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -23,7 +23,29 @@ import pytest
 jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
-from proto.gateway_queries_pb2 import ClientQueryProtobuf, IndexerQueryProtobuf
+import importlib.util
+import types
+
+# The installed proto-plus package claims the `proto` namespace, shadowing the
+# local cronjobs/compute_scores/proto/ directory. Pre-register the local proto
+# package and its pb2 module in sys.modules so that both this test file and
+# redpanda.py resolve `from proto.gateway_queries_pb2 import ...` correctly.
+_local_proto_pkg = types.ModuleType("proto")
+_local_proto_pkg.__path__ = [str(jobs_path / "proto")]
+_local_proto_pkg.__package__ = "proto"
+sys.modules["proto"] = _local_proto_pkg
+
+_pb2_spec = importlib.util.spec_from_file_location(
+    "proto.gateway_queries_pb2",
+    jobs_path / "proto" / "gateway_queries_pb2.py",
+)
+_pb2_mod = importlib.util.module_from_spec(_pb2_spec)
+_pb2_spec.loader.exec_module(_pb2_mod)
+sys.modules["proto.gateway_queries_pb2"] = _pb2_mod
+
+ClientQueryProtobuf = _pb2_mod.ClientQueryProtobuf
+IndexerQueryProtobuf = _pb2_mod.IndexerQueryProtobuf
+
 from redpanda import (
     MAX_RESERVOIR_PER_PAIR,
     RedpandaProvider,
@@ -582,3 +604,194 @@ class TestFieldMapping:
         cid = _bytes_to_cid(DEPLOYMENT_BYTES)
         assert cid.startswith("Qm")
         assert len(cid) == 46
+
+
+# ---------------------------------------------------------------------------
+# RedpandaProvider: fetch_stake_to_fees
+# ---------------------------------------------------------------------------
+
+INDEXER2_BYTES = bytes(20)  # 20 zero bytes
+EXPECTED_INDEXER2 = _bytes_to_hex(INDEXER2_BYTES)
+
+
+class TestFetchStakeToFees:
+    """Tests for stake-to-fees ratio computed from subgraph stake + replay fees."""
+
+    def _build_provider_with_fees(self, fees: Dict[str, float]) -> RedpandaProvider:
+        """Build a RedpandaProvider with pre-populated fee cache."""
+        with patch.dict(
+            os.environ,
+            {
+                "REDPANDA_BOOTSTRAP_SERVERS": "localhost:9092",
+                "GRAPH_NETWORK_SUBGRAPH_URL": "http://graph-node:8000/subgraphs/name/graph-network",
+            },
+        ):
+            provider = RedpandaProvider()
+        provider._fees_per_indexer = fees
+        return provider
+
+    def _mock_subgraph_response(self, indexers: List[dict]):
+        """Build a mock requests.post that returns indexer data."""
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"data": {"indexers": indexers}}
+        response.raise_for_status = MagicMock()
+        return response
+
+    def test_computes_ratio_from_stake_and_fees(self):
+        """stake_to_fees = (stakedTokens - lockedTokens) / total_fees."""
+        # Arrange
+        provider = self._build_provider_with_fees({
+            EXPECTED_INDEXER: 100.0,   # earned 100 GRT in fees
+            EXPECTED_INDEXER2: 50.0,   # earned 50 GRT in fees
+        })
+
+        subgraph_indexers = [
+            {"id": EXPECTED_INDEXER, "stakedTokens": "1000000", "lockedTokens": "0"},
+            {"id": EXPECTED_INDEXER2, "stakedTokens": "500000", "lockedTokens": "100000"},
+        ]
+
+        # Act
+        with patch("redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)):
+            result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
+
+        # Assert
+        # Indexer 1: (1000000 - 0) / 100 = 10000
+        assert abs(result.loc[EXPECTED_INDEXER, "stake_to_fees"] - 10000.0) < 1e-6
+        # Indexer 2: (500000 - 100000) / 50 = 8000
+        assert abs(result.loc[EXPECTED_INDEXER2, "stake_to_fees"] - 8000.0) < 1e-6
+
+    def test_zero_fees_produces_nan(self):
+        """Indexers with zero fees should get NaN, not infinity."""
+        # Arrange — indexer has stake but earned no fees during the window
+        provider = self._build_provider_with_fees({})
+
+        subgraph_indexers = [
+            {"id": EXPECTED_INDEXER, "stakedTokens": "1000000", "lockedTokens": "0"},
+        ]
+
+        # Act
+        with patch("redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)):
+            result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
+
+        # Assert
+        assert pd.isna(result.loc[EXPECTED_INDEXER, "stake_to_fees"])
+
+    def test_missing_subgraph_url_returns_empty(self):
+        """Without GRAPH_NETWORK_SUBGRAPH_URL, return empty DataFrame."""
+        # Arrange
+        with patch.dict(os.environ, {"REDPANDA_BOOTSTRAP_SERVERS": "localhost:9092"}, clear=False):
+            with patch.dict(os.environ, {"GRAPH_NETWORK_SUBGRAPH_URL": ""}, clear=False):
+                provider = RedpandaProvider()
+
+        # Act
+        result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
+
+        # Assert
+        assert result.empty
+        assert "stake_to_fees" in result.columns
+
+    def test_subgraph_indexer_not_in_replay_gets_nan(self):
+        """Indexers in the subgraph but absent from the replay get NaN."""
+        # Arrange — fee cache has no data for this indexer
+        provider = self._build_provider_with_fees({
+            EXPECTED_INDEXER: 100.0,
+        })
+        unknown_indexer = "0x" + "ff" * 20
+
+        subgraph_indexers = [
+            {"id": EXPECTED_INDEXER, "stakedTokens": "1000000", "lockedTokens": "0"},
+            {"id": unknown_indexer, "stakedTokens": "500000", "lockedTokens": "0"},
+        ]
+
+        # Act
+        with patch("redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)):
+            result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
+
+        # Assert
+        assert result.loc[EXPECTED_INDEXER, "stake_to_fees"] == 10000.0
+        assert pd.isna(result.loc[unknown_indexer, "stake_to_fees"])
+
+    def test_output_schema_matches_bigquery(self):
+        """Output must be indexed by 'indexer' with a 'stake_to_fees' column."""
+        # Arrange
+        provider = self._build_provider_with_fees({EXPECTED_INDEXER: 50.0})
+
+        subgraph_indexers = [
+            {"id": EXPECTED_INDEXER, "stakedTokens": "1000", "lockedTokens": "0"},
+        ]
+
+        # Act
+        with patch("redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)):
+            result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
+
+        # Assert
+        assert result.index.name == "indexer"
+        assert list(result.columns) == ["stake_to_fees"]
+
+
+class TestFeesAccumulatedDuringConsume:
+    """Verify that _fees_per_indexer is populated during the Kafka replay."""
+
+    def _build_provider(self) -> RedpandaProvider:
+        with patch.dict(
+            os.environ,
+            {
+                "REDPANDA_BOOTSTRAP_SERVERS": "localhost:9092",
+                "REDPANDA_TOPIC": "gateway_queries",
+            },
+        ):
+            return RedpandaProvider()
+
+    def test_fees_accumulated_across_messages(self):
+        """Total fees per indexer should sum across all consumed attempts."""
+        # Arrange
+        provider = self._build_provider()
+        start_date = date(2024, 1, 1)
+        num_days = 1
+        base_ts_ms = int(datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+
+        deployment = bytes(range(32))
+
+        # Three messages: indexer1 earns 0.001 + 0.003 = 0.004, indexer2 earns 0.002
+        a1 = _build_indexer_attempt(
+            indexer=INDEXER_BYTES, deployment=deployment,
+            indexed_chain="mainnet", url="https://i1.example.com/",
+            fee_grt=0.001, response_time_ms=50, result="success", blocks_behind=0,
+        )
+        a2 = _build_indexer_attempt(
+            indexer=INDEXER2_BYTES, deployment=deployment,
+            indexed_chain="mainnet", url="https://i2.example.com/",
+            fee_grt=0.002, response_time_ms=80, result="success", blocks_behind=0,
+        )
+        a3 = _build_indexer_attempt(
+            indexer=INDEXER_BYTES, deployment=deployment,
+            indexed_chain="mainnet", url="https://i1.example.com/",
+            fee_grt=0.003, response_time_ms=60, result="success", blocks_behind=0,
+        )
+
+        msg1 = _fake_kafka_message(base_ts_ms, _build_client_query("q1-JFK", [a1, a2]))
+        msg2 = _fake_kafka_message(base_ts_ms + 1000, _build_client_query("q2-JFK", [a3]))
+
+        MockConsumer = MagicMock()
+        mock_consumer = MockConsumer.return_value
+
+        mock_topic_meta = MagicMock()
+        mock_topic_meta.partitions = {0: MagicMock()}
+        mock_consumer.list_topics.return_value.topics = {"gateway_queries": mock_topic_meta}
+
+        mock_tp = MagicMock()
+        mock_tp.topic = "gateway_queries"
+        mock_tp.partition = 0
+        mock_tp.offset = 0
+        mock_consumer.offsets_for_times.return_value = [mock_tp]
+
+        mock_consumer.poll.side_effect = [msg1, msg2, None, None, None]
+
+        # Act
+        with patch("confluent_kafka.Consumer", MockConsumer):
+            provider.fetch_initial_query_results(start_date, num_days)
+
+        # Assert
+        assert abs(provider._fees_per_indexer[EXPECTED_INDEXER] - 0.004) < 1e-9
+        assert abs(provider._fees_per_indexer[EXPECTED_INDEXER2] - 0.002) < 1e-9

@@ -85,6 +85,7 @@ class RedpandaProvider:
         # Reservoir cache — populated by _stream_and_cache
         self._count_cache: Dict[Tuple[str, str], int] = {}
         self._row_cache_df: Optional[pd.DataFrame] = None
+        self._fees_per_indexer: Dict[str, float] = {}
         self._cache_start_date: Optional[date] = None
         self._cache_num_days: Optional[int] = None
 
@@ -153,13 +154,17 @@ class RedpandaProvider:
 
     def fetch_stake_to_fees(self, start_ts: str) -> pd.DataFrame:
         """
-        Fetch stake data from the Graph Network subgraph via GraphQL.
+        Compute stake-to-fees ratio by combining subgraph stake data with
+        fee totals accumulated during the Redpanda replay.
 
-        Returns a DataFrame indexed by 'indexer' with a 'stake_to_fees' column.
-        stake_to_fees is NaN because query fee data is not available from the
-        subgraph; processing.py handles missing stake data gracefully with NaN.
+        stake_to_fees = (staked_tokens - locked_tokens) / total_fees_earned
 
-        If GRAPH_NETWORK_SUBGRAPH_URL is not set, returns an empty DataFrame.
+        Stake comes from The Graph Network subgraph (current on-chain state).
+        Fees come from self._fees_per_indexer, populated during _stream_and_cache
+        by summing fee_grt across all indexer attempts in the 28-day window.
+
+        Returns a DataFrame indexed by 'indexer' with a 'stake_to_fees' column,
+        matching the schema BigQueryClient.fetch_stake_to_fees returns.
         """
         if not self._graph_network_url:
             logger.warning(
@@ -180,15 +185,28 @@ class RedpandaProvider:
             return pd.DataFrame(columns=["stake_to_fees"])
 
         df = pd.DataFrame(indexers)
+        df = df.rename(columns={"id": "indexer"})
         df["recent_slashable_stake"] = (
             df["stakedTokens"].astype(float) - df["lockedTokens"].astype(float)
         )
-        # Query fees are not available from the subgraph, so stake_to_fees is NaN.
-        df["stake_to_fees"] = float("nan")
-        df = df.rename(columns={"id": "indexer"})[["indexer", "stake_to_fees"]]
+
+        # Map fee totals from the Redpanda replay onto subgraph indexers.
+        df["total_query_fees"] = df["indexer"].map(self._fees_per_indexer).fillna(0.0)
+
+        # stake_to_fees = slashable_stake / total_fees. Indexers with zero fees
+        # get NaN (matches BigQuery behaviour where SQL division by zero produces NULL).
+        df["stake_to_fees"] = (
+            df["recent_slashable_stake"] / df["total_query_fees"].replace(0.0, float("nan"))
+        )
+
+        df = df[["indexer", "stake_to_fees"]]
         df.set_index("indexer", inplace=True)
 
-        logger.info(f"Fetched stake data for {len(df)} indexers")
+        matched = df["stake_to_fees"].notna().sum()
+        logger.info(
+            f"Computed stake-to-fees for {len(df)} indexers "
+            f"({matched} with fee data from replay)"
+        )
         return df
 
     def write_scores(self, scores_df: pd.DataFrame) -> None:
@@ -260,8 +278,9 @@ class RedpandaProvider:
         per (deployment_hash, indexer) pair.
 
         After completion, populates:
-          self._count_cache  — true per-pair message counts (for adjust_rows)
-          self._row_cache_df — reservoir DataFrame (for fetch_combined_query_results)
+          self._count_cache      — true per-pair message counts (for adjust_rows)
+          self._row_cache_df     — reservoir DataFrame (for fetch_combined_query_results)
+          self._fees_per_indexer — total fee_grt earned per indexer (for stake_to_fees)
         """
         from confluent_kafka import Consumer, TopicPartition, KafkaException
 
@@ -324,6 +343,7 @@ class RedpandaProvider:
                 f"start_ts_ms={start_ts_ms}"
             )
             self._count_cache = {}
+            self._fees_per_indexer = {}
             self._row_cache_df = _empty_combined_df()
             return
 
@@ -332,6 +352,7 @@ class RedpandaProvider:
         # Reservoir state: {(deployment_hash, indexer): list of row dicts}
         reservoirs: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
         counts: Dict[Tuple[str, str], int] = defaultdict(int)
+        fees_per_indexer: Dict[str, float] = defaultdict(float)
 
         total_messages = 0
         total_attempts = 0
@@ -414,6 +435,7 @@ class RedpandaProvider:
                         reservoirs[key][j] = row
 
                 counts[key] += 1
+                fees_per_indexer[indexer] += attempt.fee_grt
 
             if total_messages % 100_000 == 0:
                 logger.info(
@@ -427,6 +449,7 @@ class RedpandaProvider:
         )
 
         self._count_cache = dict(counts)
+        self._fees_per_indexer = dict(fees_per_indexer)
 
         all_rows: List[dict] = []
         for rows in reservoirs.values():
