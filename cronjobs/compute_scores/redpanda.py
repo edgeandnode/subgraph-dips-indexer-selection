@@ -28,6 +28,13 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
 # Cap parallel partition consumers to avoid unbounded thread/connection creation.
 # The CronJob runs with 8 CPUs; one consumer per core saturates throughput
 # without excessive Kafka connections on topics with many partitions.
@@ -634,11 +641,26 @@ class RedpandaProvider:
     # Internal: GraphQL pagination
     # -----------------------------------------------------------------------
 
+    @retry(
+        retry=retry_if_exception_type((
+            ConnectionError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.HTTPError,
+        )),
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=2, max=60),
+        reraise=True,
+    )
     def _paginate_graphql_indexers(self) -> List[dict]:
-        """Paginate through all indexers from the Graph Network subgraph."""
+        """Paginate through all indexers from the Graph Network subgraph.
+
+        Uses cursor-based pagination (id_gt) instead of skip-based to avoid
+        progressively slower queries as the offset grows.
+        """
         query = """
-        query($first: Int!, $skip: Int!) {
-          indexers(first: $first, skip: $skip) {
+        query($first: Int!, $lastId: String!) {
+          indexers(first: $first, where: { id_gt: $lastId }, orderBy: id) {
             id
             stakedTokens
             lockedTokens
@@ -646,13 +668,13 @@ class RedpandaProvider:
         }
         """
         page_size = 1000
-        skip = 0
+        last_id = ""
         all_indexers: List[dict] = []
 
         while True:
             response = requests.post(
                 self._graph_network_url,
-                json={"query": query, "variables": {"first": page_size, "skip": skip}},
+                json={"query": query, "variables": {"first": page_size, "lastId": last_id}},
                 timeout=30,
             )
             response.raise_for_status()
@@ -668,7 +690,7 @@ class RedpandaProvider:
             all_indexers.extend(page)
             if len(page) < page_size:
                 break
-            skip += page_size
+            last_id = page[-1]["id"]
 
         return all_indexers
 
