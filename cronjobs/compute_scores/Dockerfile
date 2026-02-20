@@ -1,16 +1,21 @@
-# Build stage - install dependencies with gcc
+# Build stage - install dependencies with gcc and generate protobuf code
 FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-# Install build dependencies
+# Install build dependencies (gcc for C extensions, protobuf-compiler for proto codegen)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# Generate protobuf Python code from .proto schema
+COPY proto/ proto/
+RUN protoc -I proto --python_out=. proto/gateway_queries.proto
 
 # Runtime stage - clean image without gcc
 FROM python:3.11-slim
@@ -37,8 +42,9 @@ RUN if [ -n "$MAXMIND_LICENSE_KEY" ]; then \
 # Copy installed packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy application code
+# Copy application code, then overlay with builder-generated protobuf
 COPY *.py .
+COPY --from=builder /app/gateway_queries_pb2.py .
 
 # Run as non-root user
 RUN useradd -m appuser && chown appuser:appuser /app/*.mmdb

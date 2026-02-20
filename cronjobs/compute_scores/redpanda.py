@@ -5,10 +5,10 @@ A daily batch replay consumes the gateway_queries topic for the 28-day
 regression window using a two-pass architecture:
 
   Pass 1 (count): lightweight scan counting (deployment, indexer) pairs and
-  accumulating fees. Uses minimal proto parsing (keys + fee only).
+  accumulating fees.
 
   Pass 2 (sample): reservoir sampling with cap = rows_to_use (from adjust_rows).
-  Uses selective proto parsing, raw byte keys, and deferred string conversion.
+  Uses raw byte keys and deferred string conversion.
 
 Both passes consume partitions in parallel via ThreadPoolExecutor with batch
 polling (consumer.consume). Partition offsets resolved in pass 1 are cached
@@ -44,7 +44,7 @@ import base58
 import pandas as pd
 import requests
 
-from proto.gateway_queries_pb2 import extract_keys_and_fees, extract_sample_fields
+from gateway_queries_pb2 import ClientQueryProtobuf
 
 logger = logging.getLogger(__name__)
 
@@ -466,14 +466,17 @@ class RedpandaProvider:
                 total_messages += 1
 
                 try:
-                    attempts = extract_keys_and_fees(msg.value())
+                    query = ClientQueryProtobuf()
+                    query.ParseFromString(msg.value())
                 except Exception:
                     continue
 
-                for idx_bytes, dep_bytes, fee_grt in attempts:
+                for attempt in query.indexer_queries:
+                    idx_bytes = bytes(attempt.indexer)
+                    dep_bytes = bytes(attempt.deployment)
                     if len(dep_bytes) == 32 and len(idx_bytes) == 20:
                         counts[(dep_bytes, idx_bytes)] += 1
-                        fees[idx_bytes] += fee_grt
+                        fees[idx_bytes] += attempt.fee_grt
 
         return (counts, fees, total_messages)
 
@@ -598,14 +601,15 @@ class RedpandaProvider:
                     return (reservoirs, counts)
 
                 try:
-                    query_id, attempts = extract_sample_fields(msg.value())
+                    query = ClientQueryProtobuf()
+                    query.ParseFromString(msg.value())
                 except Exception:
                     continue
 
-                for attempt in attempts:
-                    idx_bytes = attempt["indexer_bytes"]
-                    dep_bytes = attempt["deployment_bytes"]
-                    url = attempt["url"]
+                for attempt in query.indexer_queries:
+                    idx_bytes = bytes(attempt.indexer)
+                    dep_bytes = bytes(attempt.deployment)
+                    url = attempt.url
 
                     if len(dep_bytes) != 32 or len(idx_bytes) != 20 or not url:
                         continue
@@ -614,15 +618,15 @@ class RedpandaProvider:
                     n = counts[key]
 
                     row = {
-                        "query_id": query_id,
+                        "query_id": query.query_id,
                         "indexer_bytes": idx_bytes,
                         "deployment_bytes": dep_bytes,
-                        "fee": attempt["fee_grt"],
+                        "fee": attempt.fee_grt,
                         "ts_ms": ts_ms,
-                        "blocks_behind": attempt["blocks_behind"],
-                        "response_time_ms": attempt["response_time_ms"],
-                        "status": _map_result_to_status(attempt["result"]),
-                        "subgraph_network": attempt["indexed_chain"],
+                        "blocks_behind": attempt.blocks_behind,
+                        "response_time_ms": attempt.response_time_ms,
+                        "status": _map_result_to_status(attempt.result),
+                        "subgraph_network": attempt.indexed_chain,
                         "url": url if url.endswith("/") else url + "/",
                     }
 

@@ -7,7 +7,6 @@ so that imports resolve correctly without installing the cronjob package.
 
 import json
 import os
-import struct
 import sys
 import tempfile
 from collections import namedtuple
@@ -23,30 +22,7 @@ import pytest
 jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
-import importlib.util
-import types
-
-# The installed proto-plus package claims the `proto` namespace, shadowing the
-# local cronjobs/compute_scores/proto/ directory. Pre-register the local proto
-# package and its pb2 module in sys.modules so that both this test file and
-# redpanda.py resolve `from proto.gateway_queries_pb2 import ...` correctly.
-_local_proto_pkg = types.ModuleType("proto")
-_local_proto_pkg.__path__ = [str(jobs_path / "proto")]
-_local_proto_pkg.__package__ = "proto"
-sys.modules["proto"] = _local_proto_pkg
-
-_pb2_spec = importlib.util.spec_from_file_location(
-    "proto.gateway_queries_pb2",
-    jobs_path / "proto" / "gateway_queries_pb2.py",
-)
-_pb2_mod = importlib.util.module_from_spec(_pb2_spec)
-_pb2_spec.loader.exec_module(_pb2_mod)
-sys.modules["proto.gateway_queries_pb2"] = _pb2_mod
-
-ClientQueryProtobuf = _pb2_mod.ClientQueryProtobuf
-IndexerQueryProtobuf = _pb2_mod.IndexerQueryProtobuf
-extract_keys_and_fees = _pb2_mod.extract_keys_and_fees
-extract_sample_fields = _pb2_mod.extract_sample_fields
+from gateway_queries_pb2 import ClientQueryProtobuf, IndexerQueryProtobuf
 
 from redpanda import (
     RedpandaProvider,
@@ -57,41 +33,8 @@ from redpanda import (
 
 
 # ---------------------------------------------------------------------------
-# Proto binary helpers — encode simple protobuf messages for testing
+# Proto helpers — build test messages using generated protobuf classes
 # ---------------------------------------------------------------------------
-
-
-def _encode_varint(value: int) -> bytes:
-    """Encode an integer as a protobuf varint."""
-    buf = bytearray()
-    while True:
-        bits = value & 0x7F
-        value >>= 7
-        if value:
-            buf.append(bits | 0x80)
-        else:
-            buf.append(bits)
-            break
-    return bytes(buf)
-
-
-def _encode_field_varint(field_number: int, value: int) -> bytes:
-    tag = (field_number << 3) | 0  # wire type 0
-    return _encode_varint(tag) + _encode_varint(value)
-
-
-def _encode_field_double(field_number: int, value: float) -> bytes:
-    tag = (field_number << 3) | 1  # wire type 1
-    return _encode_varint(tag) + struct.pack("<d", value)
-
-
-def _encode_field_bytes(field_number: int, data: bytes) -> bytes:
-    tag = (field_number << 3) | 2  # wire type 2
-    return _encode_varint(tag) + _encode_varint(len(data)) + data
-
-
-def _encode_field_str(field_number: int, text: str) -> bytes:
-    return _encode_field_bytes(field_number, text.encode("utf-8"))
 
 
 def _build_indexer_attempt(
@@ -103,31 +46,31 @@ def _build_indexer_attempt(
     response_time_ms: int,
     result: str,
     blocks_behind: int,
-) -> bytes:
-    """Encode an IndexerQueryProtobuf message."""
-    buf = b""
-    buf += _encode_field_bytes(1, indexer)       # indexer
-    buf += _encode_field_bytes(2, deployment)    # deployment
-    buf += _encode_field_bytes(3, b"\x00" * 20) # allocation (unused)
-    buf += _encode_field_str(4, indexed_chain)  # indexed_chain
-    buf += _encode_field_str(5, url)             # url
-    buf += _encode_field_double(6, fee_grt)      # fee_grt
-    buf += _encode_field_varint(7, response_time_ms)  # response_time_ms
-    buf += _encode_field_str(9, result)          # result
-    buf += _encode_field_varint(11, blocks_behind)    # blocks_behind
-    return buf
+) -> IndexerQueryProtobuf:
+    """Build an IndexerQueryProtobuf message."""
+    msg = IndexerQueryProtobuf()
+    msg.indexer = indexer
+    msg.deployment = deployment
+    msg.allocation = b"\x00" * 20
+    msg.indexed_chain = indexed_chain
+    msg.url = url
+    msg.fee_grt = fee_grt
+    msg.response_time_ms = response_time_ms
+    msg.result = result
+    msg.blocks_behind = blocks_behind
+    return msg
 
 
 def _build_client_query(
     query_id: str,
-    attempts: List[bytes],
+    attempts: List[IndexerQueryProtobuf],
 ) -> bytes:
-    """Encode a ClientQueryProtobuf message."""
-    buf = b""
-    buf += _encode_field_str(3, query_id)  # query_id
-    for attempt_bytes in attempts:
-        buf += _encode_field_bytes(10, attempt_bytes)  # indexer_queries
-    return buf
+    """Encode a ClientQueryProtobuf message and return serialized bytes."""
+    msg = ClientQueryProtobuf()
+    msg.query_id = query_id
+    for attempt in attempts:
+        msg.indexer_queries.append(attempt)
+    return msg.SerializeToString()
 
 
 # ---------------------------------------------------------------------------
@@ -197,14 +140,14 @@ class TestMapResultToStatus:
 
 
 # ---------------------------------------------------------------------------
-# Proto parser tests (existing class-based)
+# Proto round-trip tests (generated classes)
 # ---------------------------------------------------------------------------
 
 
-class TestIndexerQueryProtobufParsing:
-    def test_round_trip(self):
+class TestProtobufRoundTrip:
+    def test_indexer_query_round_trip(self):
         # Arrange
-        raw = _build_indexer_attempt(
+        attempt = _build_indexer_attempt(
             indexer=INDEXER_BYTES,
             deployment=DEPLOYMENT_BYTES,
             indexed_chain="mainnet",
@@ -215,29 +158,24 @@ class TestIndexerQueryProtobufParsing:
             blocks_behind=0,
         )
 
-        # Act
-        msg = IndexerQueryProtobuf.FromString(raw)
+        # Act — serialize and re-parse
+        raw = attempt.SerializeToString()
+        parsed = IndexerQueryProtobuf()
+        parsed.ParseFromString(raw)
 
         # Assert
-        assert msg.indexer == INDEXER_BYTES
-        assert msg.deployment == DEPLOYMENT_BYTES
-        assert msg.indexed_chain == "mainnet"
-        assert msg.url == "https://indexer.example.com/"
-        assert abs(msg.fee_grt - 0.001) < 1e-9
-        assert msg.response_time_ms == 42
-        assert msg.result == "success"
-        assert msg.blocks_behind == 0
+        assert bytes(parsed.indexer) == INDEXER_BYTES
+        assert bytes(parsed.deployment) == DEPLOYMENT_BYTES
+        assert parsed.indexed_chain == "mainnet"
+        assert parsed.url == "https://indexer.example.com/"
+        assert abs(parsed.fee_grt - 0.001) < 1e-9
+        assert parsed.response_time_ms == 42
+        assert parsed.result == "success"
+        assert parsed.blocks_behind == 0
 
-    def test_empty_bytes_parse_without_error(self):
-        msg = IndexerQueryProtobuf.FromString(b"")
-        assert msg.indexer == b""
-        assert msg.result == ""
-
-
-class TestClientQueryProtobufParsing:
-    def test_round_trip_with_attempts(self):
+    def test_client_query_with_attempts(self):
         # Arrange
-        attempt_raw = _build_indexer_attempt(
+        attempt = _build_indexer_attempt(
             indexer=INDEXER_BYTES,
             deployment=DEPLOYMENT_BYTES,
             indexed_chain="mainnet",
@@ -247,179 +185,51 @@ class TestClientQueryProtobufParsing:
             result="success",
             blocks_behind=5,
         )
-        raw = _build_client_query(
-            query_id="abc123def456-JFK",
-            attempts=[attempt_raw],
-        )
+        raw = _build_client_query("abc123def456-JFK", [attempt])
 
         # Act
-        msg = ClientQueryProtobuf.FromString(raw)
+        msg = ClientQueryProtobuf()
+        msg.ParseFromString(raw)
 
         # Assert
         assert msg.query_id == "abc123def456-JFK"
         assert len(msg.indexer_queries) == 1
-        attempt = msg.indexer_queries[0]
-        assert attempt.result == "success"
-        assert attempt.response_time_ms == 100
-        assert attempt.blocks_behind == 5
+        assert msg.indexer_queries[0].result == "success"
+        assert msg.indexer_queries[0].response_time_ms == 100
+        assert msg.indexer_queries[0].blocks_behind == 5
 
     def test_multiple_attempts(self):
         # Arrange
-        attempts = [
-            _build_indexer_attempt(
-                indexer=INDEXER_BYTES,
-                deployment=DEPLOYMENT_BYTES,
-                indexed_chain="mainnet",
-                url="https://a.example.com/",
-                fee_grt=0.001,
-                response_time_ms=100,
-                result="success",
-                blocks_behind=0,
-            ),
-            _build_indexer_attempt(
-                indexer=bytes(20),  # second indexer
-                deployment=DEPLOYMENT_BYTES,
-                indexed_chain="mainnet",
-                url="https://b.example.com/",
-                fee_grt=0.002,
-                response_time_ms=200,
-                result="Timeout",
-                blocks_behind=10,
-            ),
-        ]
-        raw = _build_client_query("qid-001-LAX", attempts)
+        a1 = _build_indexer_attempt(
+            indexer=INDEXER_BYTES,
+            deployment=DEPLOYMENT_BYTES,
+            indexed_chain="mainnet",
+            url="https://a.example.com/",
+            fee_grt=0.001,
+            response_time_ms=100,
+            result="success",
+            blocks_behind=0,
+        )
+        a2 = _build_indexer_attempt(
+            indexer=bytes(20),
+            deployment=DEPLOYMENT_BYTES,
+            indexed_chain="mainnet",
+            url="https://b.example.com/",
+            fee_grt=0.002,
+            response_time_ms=200,
+            result="Timeout",
+            blocks_behind=10,
+        )
+        raw = _build_client_query("qid-001-LAX", [a1, a2])
 
         # Act
-        msg = ClientQueryProtobuf.FromString(raw)
+        msg = ClientQueryProtobuf()
+        msg.ParseFromString(raw)
 
         # Assert
         assert len(msg.indexer_queries) == 2
         assert msg.indexer_queries[0].result == "success"
         assert msg.indexer_queries[1].result == "Timeout"
-
-
-# ---------------------------------------------------------------------------
-# Proto extraction function tests (optimized parsers)
-# ---------------------------------------------------------------------------
-
-
-class TestExtractKeysAndFees:
-    """Tests for the pass 1 minimal parser."""
-
-    def test_returns_correct_tuples(self):
-        # Arrange — two-attempt message
-        a1 = _build_indexer_attempt(
-            indexer=INDEXER_BYTES, deployment=DEPLOYMENT_BYTES,
-            indexed_chain="mainnet", url="https://a.example.com/",
-            fee_grt=0.001, response_time_ms=50, result="success", blocks_behind=0,
-        )
-        a2 = _build_indexer_attempt(
-            indexer=bytes(20), deployment=DEPLOYMENT_BYTES,
-            indexed_chain="mainnet", url="https://b.example.com/",
-            fee_grt=0.002, response_time_ms=80, result="Timeout", blocks_behind=3,
-        )
-        raw = _build_client_query("qid-001-JFK", [a1, a2])
-
-        # Act
-        results = extract_keys_and_fees(raw)
-
-        # Assert
-        assert len(results) == 2
-        idx1, dep1, fee1 = results[0]
-        assert idx1 == INDEXER_BYTES
-        assert dep1 == DEPLOYMENT_BYTES
-        assert abs(fee1 - 0.001) < 1e-9
-
-        idx2, dep2, fee2 = results[1]
-        assert idx2 == bytes(20)
-        assert dep2 == DEPLOYMENT_BYTES
-        assert abs(fee2 - 0.002) < 1e-9
-
-    def test_empty_message_returns_empty_list(self):
-        # A message with no indexer_queries field
-        raw = _encode_field_str(3, "qid-empty")
-
-        # Act
-        results = extract_keys_and_fees(raw)
-
-        # Assert
-        assert results == []
-
-    def test_empty_bytes_returns_empty_list(self):
-        assert extract_keys_and_fees(b"") == []
-
-
-class TestExtractSampleFields:
-    """Tests for the pass 2 selective parser."""
-
-    def test_returns_query_id_and_attempts(self):
-        # Arrange
-        a1 = _build_indexer_attempt(
-            indexer=INDEXER_BYTES, deployment=DEPLOYMENT_BYTES,
-            indexed_chain="mainnet", url="https://indexer.example.com/",
-            fee_grt=0.001, response_time_ms=42, result="success", blocks_behind=5,
-        )
-        raw = _build_client_query("abc123-JFK", [a1])
-
-        # Act
-        query_id, attempts = extract_sample_fields(raw)
-
-        # Assert
-        assert query_id == "abc123-JFK"
-        assert len(attempts) == 1
-
-        att = attempts[0]
-        assert att["indexer_bytes"] == INDEXER_BYTES
-        assert att["deployment_bytes"] == DEPLOYMENT_BYTES
-        assert att["indexed_chain"] == "mainnet"
-        assert att["url"] == "https://indexer.example.com/"
-        assert abs(att["fee_grt"] - 0.001) < 1e-9
-        assert att["response_time_ms"] == 42
-        assert att["result"] == "success"
-        assert att["blocks_behind"] == 5
-
-    def test_skipped_fields_not_present(self):
-        """allocation (field 3), seconds_behind (8), indexer_errors (10) are skipped."""
-        a1 = _build_indexer_attempt(
-            indexer=INDEXER_BYTES, deployment=DEPLOYMENT_BYTES,
-            indexed_chain="mainnet", url="https://indexer.example.com/",
-            fee_grt=0.001, response_time_ms=42, result="success", blocks_behind=0,
-        )
-        raw = _build_client_query("qid-skip", [a1])
-
-        query_id, attempts = extract_sample_fields(raw)
-        att = attempts[0]
-
-        # These keys should NOT be in the dict
-        assert "allocation" not in att
-        assert "seconds_behind" not in att
-        assert "indexer_errors" not in att
-
-    def test_multiple_attempts(self):
-        a1 = _build_indexer_attempt(
-            indexer=INDEXER_BYTES, deployment=DEPLOYMENT_BYTES,
-            indexed_chain="mainnet", url="https://a.example.com/",
-            fee_grt=0.001, response_time_ms=50, result="success", blocks_behind=0,
-        )
-        a2 = _build_indexer_attempt(
-            indexer=bytes(20), deployment=DEPLOYMENT_BYTES,
-            indexed_chain="arbitrum-one", url="https://b.example.com/",
-            fee_grt=0.002, response_time_ms=80, result="Timeout", blocks_behind=10,
-        )
-        raw = _build_client_query("qid-multi", [a1, a2])
-
-        query_id, attempts = extract_sample_fields(raw)
-
-        assert query_id == "qid-multi"
-        assert len(attempts) == 2
-        assert attempts[0]["indexed_chain"] == "mainnet"
-        assert attempts[1]["indexed_chain"] == "arbitrum-one"
-        assert attempts[1]["result"] == "Timeout"
-
-    def test_empty_bytes(self):
-        query_id, attempts = extract_sample_fields(b"")
-        assert query_id == ""
-        assert attempts == []
 
 
 # ---------------------------------------------------------------------------
@@ -856,7 +666,6 @@ class TestParallelMerge:
 
 class TestFieldMapping:
     def test_success_result_produces_200_ok_status(self):
-        # Encode a single-attempt message with result="success"
         attempt = _build_indexer_attempt(
             indexer=INDEXER_BYTES,
             deployment=DEPLOYMENT_BYTES,
@@ -867,8 +676,7 @@ class TestFieldMapping:
             result="success",
             blocks_behind=0,
         )
-        msg = IndexerQueryProtobuf.FromString(attempt)
-        status = _map_result_to_status(msg.result)
+        status = _map_result_to_status(attempt.result)
         assert status == "200 OK"
 
     def test_non_success_result_passes_through(self):
@@ -882,8 +690,7 @@ class TestFieldMapping:
             result="Unavailable(MissingBlock)",
             blocks_behind=0,
         )
-        msg = IndexerQueryProtobuf.FromString(attempt)
-        status = _map_result_to_status(msg.result)
+        status = _map_result_to_status(attempt.result)
         assert status == "Unavailable(MissingBlock)"
 
     def test_indexer_hex_encoding(self):
