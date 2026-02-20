@@ -743,7 +743,7 @@ class TestPerformLinearRegression:
         numeric = ["distance_miles", "fee"]
 
         # Act & Assert
-        with pytest.raises(ValueError):
+        with pytest.raises(RuntimeError):
             perform_latency_linear_regression(empty_df, predictor, categorical, numeric)
 
     def test_perform_latency_linear_regression_with_missing_columns(self, sample_df):

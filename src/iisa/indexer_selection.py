@@ -543,9 +543,9 @@ class DataProcessor:
         This method is intended to have only one of [indexer_to_exclude, indexer_to_include] passed
         into it at a time, at most.
         """
+        original_data = self.data.copy()
         try:
             if indexer_to_exclude:
-                # Temporarily adjust the data to reflect the indexer losing an agreement
                 self.data.loc[
                     self.data["indexer"] == indexer_to_exclude,
                     "existing_dips_agreements",
@@ -553,32 +553,15 @@ class DataProcessor:
                 self._recalculate_metrics_and_scores()
 
             if indexer_to_include:
-                # Temporarily adjust the data to reflect the indexer gaining an agreement
                 self.data.loc[
                     self.data["indexer"] == indexer_to_include,
                     "existing_dips_agreements",
                 ] += 1
                 self._recalculate_metrics_and_scores()
 
-            # Calculate the average weighted score of the new indexer group
             score = self.data[self.data["indexer"].isin(group)]["weighted_score"].mean()
-
         finally:
-            if indexer_to_exclude:
-                # Revert the temporary change
-                self.data.loc[
-                    self.data["indexer"] == indexer_to_exclude,
-                    "existing_dips_agreements",
-                ] += 1
-                self._recalculate_metrics_and_scores()
-
-            if indexer_to_include:
-                # Revert the temporary change
-                self.data.loc[
-                    self.data["indexer"] == indexer_to_include,
-                    "existing_dips_agreements",
-                ] -= 1
-                self._recalculate_metrics_and_scores()
+            self.data = original_data
 
         return score
 
