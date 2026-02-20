@@ -51,7 +51,11 @@ spec:
             - name: REDPANDA_TOPIC
               value: "gateway_queries"
             - name: GRAPH_NETWORK_SUBGRAPH_URL
-              value: ""  # e.g. http://graph-node:8000/subgraphs/name/graph-network
+              valueFrom:
+                secretKeyRef:
+                  name: iisa-graph-network-credentials
+                  key: subgraph_url
+                  optional: true
             - name: REDPANDA_SASL_USERNAME
               valueFrom:
                 secretKeyRef:
