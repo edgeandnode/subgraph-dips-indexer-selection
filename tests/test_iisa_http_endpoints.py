@@ -119,17 +119,22 @@ class TestPydanticModels:
     def test_selection_response(self):
         """deployment_id and indexers fields."""
         # Arrange & Act
-        from iisa.iisa_http_endpoints import SelectionResponse
+        from iisa.iisa_http_endpoints import SelectedIndexer, SelectionResponse
 
         response = SelectionResponse(
             deployment_id="Qm123",
-            indexers=["0xABC", "0xXYZ", "0x123"],
+            indexers=[
+                SelectedIndexer(id="0xABC", min_grt_per_30_days="450"),
+                SelectedIndexer(id="0xXYZ"),
+                SelectedIndexer(id="0x123"),
+            ],
         )
 
         # Assert
         assert response.deployment_id == "Qm123"
-        assert response.indexers == ["0xABC", "0xXYZ", "0x123"]
         assert len(response.indexers) == 3
+        assert response.indexers[0].id == "0xABC"
+        assert response.indexers[0].min_grt_per_30_days == "450"
 
     def test_selection_response_empty_indexers(self):
         """Verify empty indexers list is valid."""
@@ -353,8 +358,13 @@ def mock_history_df():
         "norm_uptime_score": [0.9, 0.7, 0.95],
         "norm_success_rate": [0.85, 0.6, 0.9],
         "norm_stake_to_fees_iqr_deviation": [0.5, 0.8, 0.65],
-        "norm_avg_sync_duration": [0.7, 0.8, 0.9],
+        "norm_base_price_per_epoch": [0.7, 0.8, 0.9],
+        "norm_price_per_entity": [0.6, 0.7, 0.8],
         "existing_dips_agreements": [2, 1, 0],
+        "dips_info_available": [True, True, False],
+        "dips_min_grt_per_30_days": ['{"arbitrum-one": "450"}', '{"arbitrum-one": "500"}', "{}"],
+        "dips_min_grt_per_million_entities_per_30_days": ["0.2", "0.3", None],
+        "dips_supported_networks": ['["arbitrum-one"]', '["arbitrum-one"]', "[]"],
     })
 
 
@@ -579,7 +589,9 @@ class TestSelectIndexersEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["deployment_id"] == "Qm123"
-        assert data["indexers"] == ["0xABC", "0xXYZ", "0x123"]
+        assert len(data["indexers"]) == 3
+        indexer_ids = [i["id"] for i in data["indexers"]]
+        assert indexer_ids == ["0xABC", "0xXYZ", "0x123"]
 
     def test_select_indexers_no_data_returns_503(self):
         """Without data loaded, verify 503 returned."""
@@ -659,7 +671,7 @@ class TestSelectIndexersEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["deployment_id"] == "Qm123"
-        assert data["indexers"] == []
+        assert len(data["indexers"]) == 0
         mock_processor_class.assert_not_called()
 
     @patch("iisa.iisa_http_endpoints.DataProcessor")
@@ -691,7 +703,7 @@ class TestSelectIndexersEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["deployment_id"] == "Qm123"
-        assert data["indexers"] == []
+        assert len(data["indexers"]) == 0
 
     @patch("iisa.iisa_http_endpoints.DataProcessor")
     def test_select_indexers_passes_target_size(self, mock_processor_class, mock_history_df):
@@ -701,7 +713,7 @@ class TestSelectIndexersEndpoint:
         from iisa.iisa_http_endpoints import app
 
         mock_processor = MagicMock()
-        mock_processor.current_group = ["0xABC"]
+        mock_processor.current_group = ["0xabc"]
         mock_processor_class.return_value = mock_processor
 
         iisa_http_endpoints._state._history = mock_history_df
@@ -757,7 +769,8 @@ class TestSelectWithProcessor:
         # Assert
         assert isinstance(result, SelectionResponse)
         assert result.deployment_id == "Qm123"
-        assert result.indexers == ["0xABC", "0xXYZ", "0x123"]
+        assert len(result.indexers) == 3
+        assert [i.id for i in result.indexers] == ["0xABC", "0xXYZ", "0x123"]
         mock_processor_class.assert_called_once()
 
     def test_select_with_processor_no_history(self):

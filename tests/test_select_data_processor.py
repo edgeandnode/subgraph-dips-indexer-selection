@@ -176,7 +176,8 @@ class TestDataProcessor:
                 "uptime_score": [0.9, 0.8, 0.7],
                 "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3],
                 "success_rate": [0.95, 0.90, 0.85],
-                "avg_sync_duration": [100, 200, 300],
+                "base_price_per_epoch": [100, 200, 300],
+                "price_per_entity": [0.1, 0.2, 0.3],
             }
         )
 
@@ -532,14 +533,14 @@ class TestDataProcessor:
         # Set up mock return values
         normalized_data = sample_data.copy()
         for metric in [
+            "stake_to_fees_iqr_deviation",
+            "base_price_per_epoch",
             "lat_lin_reg_coefficient",
             "uptime_score",
-            "existing_dips_agreements",
-            "stake_to_fees_iqr_deviation",
             "success_rate",
-            "avg_sync_duration",
+            "price_per_entity",
         ]:
-            normalized_data[f"norm_{metric}"] = normalized_data[metric]
+            normalized_data[f"norm_{metric}"] = normalized_data.get(metric, 0.5)
         mock_normalize.return_value = normalized_data
         mock_calculate_score.return_value = 0.8
 
@@ -560,12 +561,12 @@ class TestDataProcessor:
             assert isinstance(args[1], dict)
             weights = args[1]
             expected_metrics = [
+                "stake_to_fees_iqr_deviation",
+                "base_price_per_epoch",
                 "lat_lin_reg_coefficient",
                 "uptime_score",
-                "existing_dips_agreements",
-                "stake_to_fees_iqr_deviation",
                 "success_rate",
-                "avg_sync_duration",
+                "price_per_entity",
             ]
             assert all(metric in weights for metric in expected_metrics)
             assert pytest.approx(sum(weights.values())) == 1.0
@@ -1013,7 +1014,8 @@ class TestDataProcessor:
                 "uptime_score": [0.9, 0.8, 0.7, 0.6],
                 "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3, 0.4],
                 "success_rate": [0.95, 0.90, 0.85, 0.80],
-                "avg_sync_duration": [100, 200, 300, 400],
+                "base_price_per_epoch": [100, 200, 300, 400],
+                "price_per_entity": [0.1, 0.2, 0.3, 0.4],
             }
         )
 
@@ -1023,12 +1025,12 @@ class TestDataProcessor:
         )
 
         processor.weights = {
-            "lat_lin_reg_coefficient": 0.3199,
-            "uptime_score": 0.2200,
-            "existing_dips_agreements": 0.1600,
-            "stake_to_fees_iqr_deviation": 0.1350,
-            "success_rate": 0.0825,
-            "avg_sync_duration": 0.0826,
+            "stake_to_fees_iqr_deviation": 0.30,
+            "base_price_per_epoch": 0.25,
+            "lat_lin_reg_coefficient": 0.20,
+            "uptime_score": 0.15,
+            "success_rate": 0.05,
+            "price_per_entity": 0.05,
         }
 
         original_data = processor.data.copy()
@@ -1132,10 +1134,10 @@ class TestNormalizeMetrics:
                     12.121212,
                 ],
                 "% up_x": [0, 10, 50, 75.7575, 99.9],
-                "existing_dips_agreements": [0, 100, 31, 35, 50],
                 "stake_to_fees_iqr_deviation": [-5.15, 0, 1.125, 3, 120],
                 "average_status": [0, 1, 50, 75.7575, 99.9],
-                "avg_sync_duration": [10, 200, 300, 400.457, 1000],
+                "base_price_per_epoch": [10, 200, 300, 400.457, 1000],
+                "price_per_entity": [0.1, 0.2, 0.3, 0.4, 0.5],
                 "other_column": ["A", 1, "B", 12.12, np.nan],
             }
         )
@@ -1149,18 +1151,18 @@ class TestNormalizeMetrics:
             # Original columns
             "Latency Coefficient + Error Confidence Interval",
             "% up_x",
-            "existing_dips_agreements",
             "stake_to_fees_iqr_deviation",
             "average_status",
-            "avg_sync_duration",
+            "base_price_per_epoch",
+            "price_per_entity",
             "other_column",
             # New columns
             "norm_lat_lin_reg_coefficient",
             "norm_uptime_score",
-            "norm_existing_dips_agreements",
             "norm_stake_to_fees_iqr_deviation",
             "norm_success_rate",
-            "norm_avg_sync_duration",
+            "norm_base_price_per_epoch",
+            "norm_price_per_entity",
         ]
         for col in expected_columns:
             assert col in result.columns
@@ -1169,10 +1171,10 @@ class TestNormalizeMetrics:
         normalized_columns = [
             "norm_lat_lin_reg_coefficient",
             "norm_uptime_score",
-            "norm_existing_dips_agreements",
             "norm_stake_to_fees_iqr_deviation",
             "norm_success_rate",
-            "norm_avg_sync_duration",
+            "norm_base_price_per_epoch",
+            "norm_price_per_entity",
         ]
         for col in normalized_columns:
             assert result[col].between(0, 1).all()
@@ -1201,10 +1203,10 @@ class TestNormalizeMetrics:
         expected_columns = list(empty_df.columns) + [
             "norm_lat_lin_reg_coefficient",
             "norm_uptime_score",
-            "norm_existing_dips_agreements",
             "norm_stake_to_fees_iqr_deviation",
             "norm_success_rate",
-            "norm_avg_sync_duration",
+            "norm_base_price_per_epoch",
+            "norm_price_per_entity",
         ]
         assert set(result.columns) == set(expected_columns)
 
@@ -1218,10 +1220,10 @@ class TestNormalizeMetrics:
         norm_columns = [
             "norm_lat_lin_reg_coefficient",
             "norm_uptime_score",
-            "norm_existing_dips_agreements",
             "norm_stake_to_fees_iqr_deviation",
             "norm_success_rate",
-            "norm_avg_sync_duration",
+            "norm_base_price_per_epoch",
+            "norm_price_per_entity",
         ]
 
         # Check for normalization results where input values are the same
@@ -1234,21 +1236,19 @@ class TestNormalizeMetrics:
                 )
 
             elif column in [
-                "norm_existing_dips_agreements",
-                "norm_avg_sync_duration",
                 "norm_lat_lin_reg_coefficient",
             ]:
                 assert (result[column] == 1).all(), (
-                    f"Column {column} is not 0 for identical input values"
+                    f"Column {column} is not 1 for identical input values"
                 )
 
     def test_negative_values(self, sample_df):
-        # Test with negative values (7 columns after removing acceptance_latency)
+        # Test with negative values (7 columns)
         sample_df.loc[0] = [-1, -1, -1, -1, -1, -1, -1]
-        sample_df.loc[1] = [-100, -50, -75, -25, -10, -5, -1]
+        sample_df.loc[1] = [-100, -50, -25, -10, -5, -1, -1]
         sample_df.loc[2] = [0, 0, 0, 0, 0, 0, 0]
         sample_df.loc[3] = [1, 1, 1, 1, 1, 1, 1]
-        sample_df.loc[4] = [-1000, 0, 1000, -500, 500, -250, 250]
+        sample_df.loc[4] = [-1000, 0, -500, 500, -250, 250, 250]
 
         # Compute result
         result = _normalize_metrics(sample_df)
@@ -1295,41 +1295,25 @@ class TestNormalizeMetrics:
             .any()
         )
 
-    def test_all_na_avg_sync_duration(self):
-        """Test that all-NA avg_sync_duration column gets optimistic score 1.0."""
+    def test_price_normalization(self):
+        """Test that price columns normalize correctly (lower is better)."""
         df = pd.DataFrame(
             {
-                "avg_sync_duration": [pd.NA, pd.NA, pd.NA],
                 "Latency Coefficient + Error Confidence Interval": [1, 2, 3],
                 "% up_x": [99, 100, 98],
-                "existing_dips_agreements": [1, 2, 3],
                 "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3],
                 "average_status": [99, 100, 98],
+                "base_price_per_epoch": [100, 500, 1000],
+                "price_per_entity": [0.1, 0.5, 1.0],
             }
         )
         result = _normalize_metrics(df)
-        # All-NA column should result in optimistic score of 1.0
-        assert (result["norm_avg_sync_duration"] == 1.0).all()
-
-    def test_partial_na_avg_sync_duration(self):
-        """Test that partial NA values in avg_sync_duration get filled with 0 (best)."""
-        df = pd.DataFrame(
-            {
-                "avg_sync_duration": [pd.NA, 100, 200, pd.NA, 300],
-                "Latency Coefficient + Error Confidence Interval": [1, 2, 3, 4, 5],
-                "% up_x": [99, 100, 98, 97, 96],
-                "existing_dips_agreements": [1, 2, 3, 4, 5],
-                "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3, 0.4, 0.5],
-                "average_status": [99, 100, 98, 97, 96],
-            }
-        )
-        result = _normalize_metrics(df)
-        # NA values (filled with 0) should get the highest score
-        assert result["norm_avg_sync_duration"].iloc[0] == result[
-            "norm_avg_sync_duration"
+        # Cheapest indexer should have highest score
+        assert result["norm_base_price_per_epoch"].iloc[0] == result[
+            "norm_base_price_per_epoch"
         ].max()
-        assert result["norm_avg_sync_duration"].iloc[3] == result[
-            "norm_avg_sync_duration"
+        assert result["norm_price_per_entity"].iloc[0] == result[
+            "norm_price_per_entity"
         ].max()
 
 
@@ -1351,7 +1335,8 @@ class TestTargetSize:
                 "uptime_score": [0.9, 0.8, 0.7, 0.6, 0.5],
                 "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3, 0.4, 0.5],
                 "success_rate": [0.95, 0.90, 0.85, 0.80, 0.75],
-                "avg_sync_duration": [100, 200, 300, 400, 500],
+                "base_price_per_epoch": [100, 200, 300, 400, 500],
+                "price_per_entity": [0.1, 0.2, 0.3, 0.4, 0.5],
             }
         )
 
@@ -1470,7 +1455,8 @@ class TestDecentralizationBestEffort:
                 "uptime_score": [0.9, 0.8, 0.7],
                 "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3],
                 "success_rate": [0.95, 0.90, 0.85],
-                "avg_sync_duration": [100, 200, 300],
+                "base_price_per_epoch": [100, 200, 300],
+                "price_per_entity": [0.1, 0.2, 0.3],
             }
         )
 

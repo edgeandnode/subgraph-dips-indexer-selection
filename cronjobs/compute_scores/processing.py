@@ -5,13 +5,15 @@ This module contains functions extracted and adapted from the IISA codebase
 for computing latency regression, uptime, success rate, and stake-to-fees metrics.
 """
 
+import json
 import logging
 import os
 import socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
 from struct import unpack
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import airportsdata
@@ -19,6 +21,7 @@ import geoip2.database
 import geoip2.errors
 import numpy as np
 import pandas as pd
+import requests
 from numpy.linalg import pinv
 from scipy.stats import t
 from sklearn.compose import ColumnTransformer
@@ -26,6 +29,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +130,85 @@ GEOIP_SRC_COLUMN_MAPPING = _geoip_column_mapping("src")
 def _empty_geoip_result(ip_addr: str = None) -> dict:
     """Return a GeoIP result dict with optional ip_addr and None for other fields."""
     return {"ip_addr": ip_addr, "org": None, "country": None, "latitude": None, "longitude": None}
+
+
+DIPS_INFO_FETCH_TIMEOUT = int(os.environ.get("DIPS_INFO_FETCH_TIMEOUT", "10"))
+DIPS_INFO_MAX_WORKERS = int(os.environ.get("DIPS_INFO_MAX_WORKERS", "16"))
+
+
+@retry(
+    retry=retry_if_exception_type((
+        ConnectionError,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+    )),
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=1, max=5),
+    reraise=True,
+)
+def _fetch_single_dips_info(url: str) -> dict:
+    """Fetch /dips/info from a single indexer URL."""
+    dips_url = url.rstrip("/") + "/dips/info"
+    resp = requests.get(dips_url, timeout=DIPS_INFO_FETCH_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_dips_info(indexer_urls: Dict[str, str]) -> pd.DataFrame:
+    """
+    Fetch /dips/info from each indexer in parallel.
+
+    Args:
+        indexer_urls: dict mapping indexer address -> URL
+
+    Returns:
+        DataFrame with columns: indexer, dips_info_available,
+        dips_min_grt_per_30_days, dips_min_grt_per_million_entities_per_30_days,
+        dips_supported_networks
+    """
+    results: List[dict] = []
+
+    def fetch_one(indexer: str, url: str) -> dict:
+        try:
+            data = _fetch_single_dips_info(url)
+            min_prices = data.get("min_grt_per_30_days", {})
+            min_entity_price = data.get("min_grt_per_million_entities_per_30_days")
+            supported_networks = data.get("supported_networks", [])
+            # If supported_networks not explicitly provided, infer from price keys
+            if not supported_networks and isinstance(min_prices, dict):
+                supported_networks = list(min_prices.keys())
+            return {
+                "indexer": indexer,
+                "dips_info_available": True,
+                "dips_min_grt_per_30_days": json.dumps(min_prices) if isinstance(min_prices, dict) else "{}",
+                "dips_min_grt_per_million_entities_per_30_days": str(min_entity_price) if min_entity_price is not None else None,
+                "dips_supported_networks": json.dumps(supported_networks),
+            }
+        except Exception as e:
+            logger.debug(f"Failed to fetch /dips/info from {url} for indexer {indexer}: {e}")
+            return {
+                "indexer": indexer,
+                "dips_info_available": False,
+                "dips_min_grt_per_30_days": "{}",
+                "dips_min_grt_per_million_entities_per_30_days": None,
+                "dips_supported_networks": "[]",
+            }
+
+    with ThreadPoolExecutor(max_workers=DIPS_INFO_MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(fetch_one, indexer, url): indexer
+            for indexer, url in indexer_urls.items()
+        }
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    available_count = sum(1 for r in results if r["dips_info_available"])
+    logger.info(f"DIP info fetched for {len(results)} indexers ({available_count} available)")
+
+    return pd.DataFrame(results) if results else pd.DataFrame(
+        columns=["indexer", "dips_info_available", "dips_min_grt_per_30_days",
+                 "dips_min_grt_per_million_entities_per_30_days", "dips_supported_networks"]
+    )
 
 
 def compute_all_scores(
@@ -263,6 +346,21 @@ def compute_all_scores(
         indexer_query_count,
     )
 
+    # Fetch DIP pricing info from indexers
+    indexer_urls = {}
+    if "url" in agg_df.columns:
+        for _, row in agg_df[["indexer", "url"]].dropna(subset=["url"]).iterrows():
+            indexer_urls[row["indexer"]] = row["url"]
+    if indexer_urls:
+        dips_info_df = fetch_dips_info(indexer_urls)
+        merged = pd.merge(merged, dips_info_df, on="indexer", how="left")
+        merged["dips_info_available"] = merged["dips_info_available"].fillna(False)
+    else:
+        merged["dips_info_available"] = False
+        merged["dips_min_grt_per_30_days"] = "{}"
+        merged["dips_min_grt_per_million_entities_per_30_days"] = None
+        merged["dips_supported_networks"] = "[]"
+
     # Transform to indexer_scores schema with pre-normalized values
     scores_df = transform_to_scores_schema(merged)
 
@@ -325,6 +423,14 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     # DIP agreement metrics (placeholders until data sources available - see #15)
     scores["existing_dips_agreements"] = merged.get("existing_dips_agreements", 0)
     scores["avg_sync_duration"] = merged.get("avg_sync_duration")
+
+    # DIP pricing info (fetched from indexer /dips/info endpoints)
+    scores["dips_info_available"] = merged.get("dips_info_available", False)
+    scores["dips_min_grt_per_30_days"] = merged.get("dips_min_grt_per_30_days", "{}")
+    scores["dips_min_grt_per_million_entities_per_30_days"] = merged.get(
+        "dips_min_grt_per_million_entities_per_30_days"
+    )
+    scores["dips_supported_networks"] = merged.get("dips_supported_networks", "[]")
 
     # Metadata
     scores["computed_at"] = datetime.now(timezone.utc)

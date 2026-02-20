@@ -10,6 +10,7 @@ Endpoints:
 - POST /select-indexers - Select optimal indexers for a deployment
 """
 
+import json
 import logging
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -80,6 +81,16 @@ class SelectionRequest(BaseModel):
     num_candidates: int  # Target group size (required)
     blocklist: Optional[list[str]] = None
     declined_indexers: Optional[dict[str, list[str]]] = None
+    chain_id: Optional[str] = None  # e.g., "arbitrum-one"
+    max_grt_per_30_days: Optional[str] = None  # e.g., "4500"
+
+
+class SelectedIndexer(BaseModel):
+    """Indexer entry in the selection response, including pricing info."""
+
+    id: str
+    min_grt_per_30_days: Optional[str] = None
+    min_grt_per_million_entities_per_30_days: Optional[str] = None
 
 
 class SelectionResponse(BaseModel):
@@ -92,7 +103,7 @@ class SelectionResponse(BaseModel):
     """
 
     deployment_id: str
-    indexers: list[str]
+    indexers: list[SelectedIndexer]
 
 
 class HealthResponse(BaseModel):
@@ -344,7 +355,8 @@ async def get_score(request: ScoreRequest) -> ScoreResponse:
         ("norm_uptime_score", "uptime"),
         ("norm_success_rate", "success_rate"),
         ("norm_stake_to_fees_iqr_deviation", "stake_to_fees"),
-        ("norm_avg_sync_duration", "sync_duration"),
+        ("norm_base_price_per_epoch", "base_price"),
+        ("norm_price_per_entity", "price_per_entity"),
     ]
 
     for col, name in component_keys:
@@ -395,9 +407,10 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
 
     try:
         response = _select_with_processor(request)
+        indexer_ids = [i.id for i in response.indexers]
         logger.info(
             f"Selected {len(response.indexers)} indexers for deployment "
-            f"{request.deployment_id}: {response.indexers}"
+            f"{request.deployment_id}: {indexer_ids}"
         )
         return response
     except Exception as e:
@@ -405,23 +418,166 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
         raise HTTPException(status_code=500, detail=f"Selection failed: {e}")
 
 
+def _extract_chain_price(dips_min_grt_json: str, chain_id: str) -> Optional[str]:
+    """Extract the price for a specific chain from the JSON price map."""
+    try:
+        prices = json.loads(dips_min_grt_json) if isinstance(dips_min_grt_json, str) else {}
+        return prices.get(chain_id)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _filter_by_price(
+    history: pd.DataFrame,
+    chain_id: Optional[str],
+    max_grt_per_30_days: Optional[str],
+) -> pd.DataFrame:
+    """
+    Filter indexers by DIP pricing constraints.
+
+    Excludes indexers that:
+    - Have dips_info_available = False
+    - Don't support the requested chain_id
+    - Have a base price exceeding max_grt_per_30_days for the chain
+    """
+    if chain_id is None:
+        return history
+
+    df = history.copy()
+
+    # Only filter if we have the DIP info columns
+    if "dips_info_available" not in df.columns:
+        return df
+
+    # Exclude indexers without DIP info
+    df = df[df["dips_info_available"] == True]  # noqa: E712
+
+    if df.empty:
+        return df
+
+    # Exclude indexers that don't support the chain
+    if "dips_supported_networks" in df.columns:
+        def supports_chain(networks_json):
+            try:
+                networks = json.loads(networks_json) if isinstance(networks_json, str) else []
+                return chain_id in networks
+            except (json.JSONDecodeError, TypeError):
+                return False
+
+        df = df[df["dips_supported_networks"].apply(supports_chain)]
+
+    if df.empty or max_grt_per_30_days is None:
+        return df
+
+    # Exclude indexers whose price exceeds the budget
+    max_budget = float(max_grt_per_30_days)
+
+    if "dips_min_grt_per_30_days" in df.columns:
+        def within_budget(prices_json):
+            price_str = _extract_chain_price(prices_json, chain_id)
+            if price_str is None:
+                return False
+            try:
+                return float(price_str) <= max_budget
+            except (ValueError, TypeError):
+                return False
+
+        df = df[df["dips_min_grt_per_30_days"].apply(within_budget)]
+
+    return df
+
+
+def _enrich_with_chain_prices(
+    history: pd.DataFrame,
+    chain_id: Optional[str],
+) -> pd.DataFrame:
+    """
+    Add base_price_per_epoch and price_per_entity columns for scoring.
+
+    Extracts the chain-specific price from the JSON fields.
+    """
+    df = history.copy()
+
+    if chain_id is None or "dips_min_grt_per_30_days" not in df.columns:
+        df["base_price_per_epoch"] = 0.0
+        df["price_per_entity"] = 0.0
+        return df
+
+    def extract_price(prices_json):
+        price_str = _extract_chain_price(prices_json, chain_id)
+        try:
+            return float(price_str) if price_str is not None else 0.0
+        except (ValueError, TypeError):
+            return 0.0
+
+    df["base_price_per_epoch"] = df["dips_min_grt_per_30_days"].apply(extract_price)
+
+    if "dips_min_grt_per_million_entities_per_30_days" in df.columns:
+        df["price_per_entity"] = pd.to_numeric(
+            df["dips_min_grt_per_million_entities_per_30_days"], errors="coerce"
+        ).fillna(0.0)
+    else:
+        df["price_per_entity"] = 0.0
+
+    return df
+
+
+def _build_selected_indexers(
+    indexer_ids: list[str],
+    history: pd.DataFrame,
+    chain_id: Optional[str],
+) -> list[SelectedIndexer]:
+    """Build SelectedIndexer entries with pricing info."""
+    results = []
+    for idx_id in indexer_ids:
+        row = history[history["indexer"] == idx_id]
+        min_grt = None
+        min_entity = None
+
+        if not row.empty and chain_id is not None:
+            if "dips_min_grt_per_30_days" in row.columns:
+                min_grt = _extract_chain_price(row.iloc[0].get("dips_min_grt_per_30_days", "{}"), chain_id)
+            if "dips_min_grt_per_million_entities_per_30_days" in row.columns:
+                val = row.iloc[0].get("dips_min_grt_per_million_entities_per_30_days")
+                min_entity = str(val) if val is not None and pd.notna(val) else None
+
+        results.append(SelectedIndexer(
+            id=idx_id,
+            min_grt_per_30_days=min_grt,
+            min_grt_per_million_entities_per_30_days=min_entity,
+        ))
+    return results
+
+
 def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     """
     Use DataProcessor for intelligent indexer selection.
 
     The DataProcessor uses weighted scoring based on:
+    - Stake to fees ratio (economic security)
+    - Base price per epoch (cheaper is better)
     - Latency linear regression coefficient
     - Uptime score
-    - Existing agreements (fewer is better for load balancing)
-    - Stake to fees ratio
     - Success rate
-    - Sync duration
-    - Agreement acceptance latency
+    - Price per entity (cheaper is better)
 
     Returns a SelectionResponse with the optimal set of indexers for the deployment.
     """
     if _state.history is None:
         return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
+
+    # Filter by price constraints before scoring
+    filtered_history = _filter_by_price(
+        _state.history,
+        request.chain_id,
+        request.max_grt_per_30_days,
+    )
+
+    if filtered_history.empty:
+        return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
+
+    # Enrich with chain-specific price columns for normalization
+    enriched_history = _enrich_with_chain_prices(filtered_history, request.chain_id)
 
     # Build existing_agreements dict from request
     existing_agreements: dict[str, list[str]] = {}
@@ -432,10 +588,8 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     pending_agreements: dict[str, list[str]] = request.pending_agreements or {}
 
     # Create DataProcessor instance with target_size from num_candidates
-    # Note: DataProcessor does its own filtering of candidates based on
-    # indexer_denylist, pending agreements, etc.
     processor = DataProcessor(
-        history=_state.history,
+        history=enriched_history,
         deployment_id=request.deployment_id,
         existing_agreements=existing_agreements,
         pending_agreements=pending_agreements,
@@ -444,10 +598,16 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
         target_size=request.num_candidates,
     )
 
-    # Return the final group of indexers (caller diffs with existing to find cancellations)
+    # Build response with pricing info
+    selected = _build_selected_indexers(
+        list(processor.current_group),
+        enriched_history,
+        request.chain_id,
+    )
+
     return SelectionResponse(
         deployment_id=request.deployment_id,
-        indexers=list(processor.current_group),
+        indexers=selected,
     )
 
 
