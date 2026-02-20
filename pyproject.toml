@@ -5,14 +5,9 @@ description = "Indexing Indexer Selection Algorithm for The Graph DIPs service"
 requires-python = ">=3.11"
 dependencies = [
     # Data processing
-    "pandas>=2.0,<3.0",
-    "pyarrow>=14.0,<18.0",
+    "pandas>=2.0,<4.0",
+    "pyarrow>=14.0,<25.0",
     "numpy>=1.24,<3.0",
-    # BigQuery
-    "bigframes>=1.0,<2.0",
-    "google-cloud-bigquery>=3.0,<4.0",
-    # HTTP/Networking
-    "tenacity>=8.2,<10.0",
     # FastAPI service
     "fastapi>=0.100,<1.0",
     "uvicorn[standard]>=0.23,<1.0",

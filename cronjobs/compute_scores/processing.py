@@ -47,7 +47,7 @@ _geoip_asn_reader: Optional[geoip2.database.Reader] = None
 def validate_geoip_databases() -> None:
     """Validate that GeoIP databases exist and are readable.
 
-    This is a fail-fast check that runs before expensive BigQuery operations.
+    This is a fail-fast check that runs before expensive operations.
     Raises FileNotFoundError if databases are missing or unreadable.
     """
     errors = []
@@ -129,17 +129,17 @@ def _empty_geoip_result(ip_addr: str = None) -> dict:
 
 
 def compute_all_scores(
-    bq_client,
+    provider,
     start_date: date,
     start_ts: str,
     num_days: int,
     target_rows: int,
 ) -> pd.DataFrame:
     """
-    Compute all indexer scores and return as a DataFrame ready for BigQuery.
+    Compute all indexer scores and return as a DataFrame.
 
     This is the main orchestration function that:
-    1. Fetches raw data from BigQuery
+    1. Fetches raw data from the configured provider
     2. Resolves GeoIP for indexers
     3. Runs latency linear regression
     4. Computes uptime, success rate, stake-to-fees
@@ -147,11 +147,11 @@ def compute_all_scores(
     6. Returns a DataFrame matching the indexer_scores schema
     """
     # Fetch initial query results to determine sampling
-    initial_query_results = bq_client.fetch_initial_query_results(start_date, num_days)
+    initial_query_results = provider.fetch_initial_query_results(start_date, num_days)
     target_rows_per_subgraph = adjust_rows(initial_query_results, target_rows)
 
     # Fetch combined query data (~20M rows)
-    combined_queries = bq_client.fetch_combined_query_results(
+    combined_queries = provider.fetch_combined_query_results(
         start_date, num_days, target_rows_per_subgraph
     )
 
@@ -179,8 +179,8 @@ def compute_all_scores(
     if dst_lat_nan_count == len(combined_queries):
         raise RuntimeError(
             "All dst_lat values are NaN - GeoIP resolution failed for all indexers. "
-            "This typically means IPINFO_AUTH is not set or invalid. "
-            "Check that the ipinfo.io API token is configured correctly."
+            "This typically means the GeoLite2 databases are missing or corrupt. "
+            "Check that the MaxMind .mmdb files are bundled in the Docker image."
         )
 
     combined_queries_filtered = filter_successful_queries(combined_queries)
@@ -247,7 +247,7 @@ def compute_all_scores(
     indexer_uptime = calculate_indexer_uptime(data_for_uptime)
 
     # Fetch and calculate stake-to-fees
-    stake_to_fees_raw = bq_client.fetch_stake_to_fees(start_ts)
+    stake_to_fees_raw = provider.fetch_stake_to_fees(start_ts)
     stake_to_fees = calculate_indexer_stake_to_fees(stake_to_fees_raw)
 
     # Aggregate indexer info (org, location)
@@ -272,7 +272,7 @@ def compute_all_scores(
 
 def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     """
-    Transform the merged DataFrame to match the indexer_scores BigQuery schema.
+    Transform the merged DataFrame to the indexer_scores output schema.
 
     Includes pre-normalizing static metrics.
     """

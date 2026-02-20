@@ -1,27 +1,20 @@
 """
-Loads pre-computed indexer scores from BigQuery.
+Loads pre-computed indexer scores from a JSON file on a shared PVC.
 
-Scores are computed daily by a CronJob (cronjobs/compute_scores/) and written to the
-indexer_scores table. IISA reads these scores on startup using DataManager.load_scores().
+Scores are computed daily by a CronJob (cronjobs/compute_scores/) and written
+to a JSON file. IISA reads these scores on startup using DataManager.load_scores().
 """
 
+import json
 import logging
-import socket
+import os
 from datetime import datetime, timedelta, timezone
-from typing import NewType, Optional, Tuple
+from pathlib import Path
+from typing import Optional, Tuple
 
 import pandas as pd
-from bigframes import pandas as bpd
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
-__all__ = ["BigQueryProvider", "DataManager"]
-
-QueryStr = NewType("QueryStr", str)
+__all__ = ["FileScoreLoader", "DataManager"]
 
 # Staleness thresholds
 STALE_SCORES_WARNING_HOURS = 48
@@ -30,84 +23,84 @@ STALE_SCORES_CRITICAL_HOURS = 168  # 7 days
 logger = logging.getLogger(__name__)
 
 
-class BigQueryProvider:
-    """Reads pre-computed indexer scores from BigQuery."""
+SCORES_FILE_PATH = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_scores.json")
 
-    def __init__(self, project: str, location: str) -> None:
-        bpd.options.bigquery.project = project
-        bpd.options.bigquery.location = location
-        bpd.options.display.progress_bar = None
 
-    @retry(
-        retry=retry_if_exception_type((ConnectionError, socket.timeout)),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, max=60),
-        reraise=True,
-    )
-    def _read_gbq_dataframe(self, query: QueryStr) -> pd.DataFrame:
-        return bpd.read_gbq(query).to_pandas()
+class FileScoreLoader:
+    """
+    Reads pre-computed indexer scores from a JSON file on a shared PVC.
 
-    def fetch_indexer_scores(
-        self, dataset: str = "iisa_data_for_dips"
-    ) -> Tuple[pd.DataFrame, Optional[datetime]]:
+    The CronJob writes scores via RedpandaProvider.write_scores(); this class
+    reads them back.
+    """
+
+    def __init__(self, scores_file_path: str = SCORES_FILE_PATH) -> None:
+        self._path = scores_file_path
+
+    def fetch_indexer_scores(self) -> Tuple[pd.DataFrame, Optional[datetime]]:
         """
-        Fetch pre-computed indexer scores from the indexer_scores table.
+        Read the scores JSON file and return a (DataFrame, computed_at) tuple.
 
-        Returns ~60 rows (one per indexer) computed daily by CronJob.
-
-        :param dataset: The BigQuery dataset containing the indexer_scores table.
-        :return: Tuple of (DataFrame with scores, timestamp when computed).
+        Returns (empty DataFrame, None) if the file doesn't exist or is unreadable.
         """
-        logger.info("Fetching pre-computed indexer scores from BigQuery")
+        logger.info(f"Reading pre-computed indexer scores from {self._path}")
 
-        project = bpd.options.bigquery.project
+        try:
+            with open(self._path, "r") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            logger.warning(f"Scores file not found: {self._path}")
+            return pd.DataFrame(), None
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(f"Failed to read scores file {self._path}: {e}")
+            return pd.DataFrame(), None
 
-        query = QueryStr(f"""
-            SELECT *
-            FROM `{project}.{dataset}.indexer_scores`
-            WHERE computed_at = (
-                SELECT MAX(computed_at)
-                FROM `{project}.{dataset}.indexer_scores`
-            )
-        """)
+        if not data:
+            logger.warning("Scores file is empty")
+            return pd.DataFrame(), None
 
-        dataframe = self._read_gbq_dataframe(query)
+        df = pd.DataFrame(data)
 
-        if dataframe.empty:
-            logger.warning("No scores found in indexer_scores table")
-            return dataframe, None
+        if "computed_at" not in df.columns:
+            logger.warning("Scores file has no computed_at column")
+            return df, None
 
-        computed_at = pd.to_datetime(dataframe["computed_at"].iloc[0])
-        logger.info(f"Fetched {len(dataframe)} indexer scores (computed at {computed_at})")
+        df["computed_at"] = pd.to_datetime(df["computed_at"], utc=True, errors="coerce")
+        computed_at = df["computed_at"].iloc[0]
+        if pd.isna(computed_at):
+            computed_at = None
 
-        return dataframe, computed_at
+        logger.info(f"Loaded {len(df)} indexer scores from file (computed at {computed_at})")
+        return df, computed_at
 
 
 class DataManager:
     """
-    Loads pre-computed indexer scores from BigQuery.
+    Loads pre-computed indexer scores from the configured provider.
 
     Scores are computed daily by a CronJob and include latency regression
     coefficients, uptime, success rate, and economic security metrics.
+    Accepts any object with a fetch_indexer_scores() method — currently
+    FileScoreLoader.
     """
 
-    def __init__(self, bigquery: BigQueryProvider) -> None:
-        self._bq = bigquery
+    def __init__(self, provider) -> None:
+        self._provider = provider
         self._data: Optional[pd.DataFrame] = None
         self._scores_computed_at: Optional[datetime] = None
 
     def load_scores(self) -> bool:
         """
-        Load pre-computed indexer scores from BigQuery.
+        Load pre-computed indexer scores from the configured provider.
 
         :return: True if scores were loaded successfully, False otherwise.
         """
-        logger.info("Loading pre-computed indexer scores from BigQuery")
+        logger.info("Loading pre-computed indexer scores")
 
-        scores_df, computed_at = self._bq.fetch_indexer_scores()
+        scores_df, computed_at = self._provider.fetch_indexer_scores()
 
         if scores_df.empty:
-            logger.warning("No pre-computed scores available in indexer_scores table")
+            logger.warning("No pre-computed scores available")
             self._data = None
             return False
 

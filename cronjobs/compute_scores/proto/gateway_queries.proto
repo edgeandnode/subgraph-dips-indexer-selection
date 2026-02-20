@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+// Transcribed from titorelli's src/messages.rs prost field tags.
+// Last verified against titorelli source: 2026-02-19 (all 23 fields match).
+// Each ClientQueryProtobuf message corresponds to one gateway query.
+// The indexer_queries repeated field contains one entry per indexer attempt.
+
+message ClientQueryProtobuf {
+  string gateway_id = 1;
+  bytes receipt_signer = 2;
+  string query_id = 3;
+  string api_key = 4;
+  string result = 5;
+  uint32 response_time_ms = 6;
+  uint32 request_bytes = 7;
+  optional uint32 response_bytes = 8;
+  double total_fees_usd = 9;
+  repeated IndexerQueryProtobuf indexer_queries = 10;
+  optional string user_id = 11;
+  optional string subgraph = 12;
+}
+
+message IndexerQueryProtobuf {
+  bytes indexer = 1;
+  bytes deployment = 2;
+  bytes allocation = 3;
+  string indexed_chain = 4;
+  string url = 5;
+  double fee_grt = 6;
+  uint32 response_time_ms = 7;
+  uint32 seconds_behind = 8;
+  string result = 9;
+  string indexer_errors = 10;
+  uint64 blocks_behind = 11;
+}
