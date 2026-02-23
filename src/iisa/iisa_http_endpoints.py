@@ -82,7 +82,7 @@ class SelectionRequest(BaseModel):
     blocklist: Optional[list[str]] = None
     declined_indexers: Optional[dict[str, list[str]]] = None
     chain_id: Optional[str] = None  # e.g., "arbitrum-one"
-    max_grt_per_30_days: Optional[str] = None  # e.g., "4500"
+    max_grt_per_30_days: Optional[float] = None  # e.g., 4500.0
 
 
 class SelectedIndexer(BaseModel):
@@ -431,7 +431,7 @@ def _extract_chain_price(dips_min_grt_json: str, chain_id: str) -> Optional[floa
 def _filter_by_price(
     history: pd.DataFrame,
     chain_id: Optional[str],
-    max_grt_per_30_days: Optional[str],
+    max_grt_per_30_days: Optional[float],
 ) -> tuple[pd.DataFrame, str]:
     """
     Filter indexers by DIP pricing constraints.
@@ -492,7 +492,7 @@ def _filter_by_price(
         return df, ""
 
     # Exclude indexers whose price exceeds the budget
-    max_budget = float(max_grt_per_30_days)
+    max_budget = max_grt_per_30_days
 
     if "dips_min_grt_per_30_days" in df.columns:
         def within_budget(prices_json):
