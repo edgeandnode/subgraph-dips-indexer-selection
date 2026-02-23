@@ -29,7 +29,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger(__name__)
 
@@ -136,12 +136,29 @@ DIPS_INFO_FETCH_TIMEOUT = int(os.environ.get("DIPS_INFO_FETCH_TIMEOUT", "10"))
 DIPS_INFO_MAX_WORKERS = int(os.environ.get("DIPS_INFO_MAX_WORKERS", "16"))
 
 
-@retry(
-    retry=retry_if_exception_type((
+class RetryableHTTPError(Exception):
+    """Wrapper for 5xx HTTP errors that should trigger retry."""
+    pass
+
+
+def _is_retryable_exception(exc: BaseException) -> bool:
+    """Check if an exception should trigger a retry."""
+    # Network/connection errors
+    if isinstance(exc, (
         ConnectionError,
         requests.exceptions.ConnectionError,
         requests.exceptions.Timeout,
-    )),
+        requests.exceptions.ChunkedEncodingError,
+    )):
+        return True
+    # Wrapped 5xx errors
+    if isinstance(exc, RetryableHTTPError):
+        return True
+    return False
+
+
+@retry(
+    retry=_is_retryable_exception,
     stop=stop_after_attempt(2),
     wait=wait_exponential(multiplier=1, max=5),
     reraise=True,
@@ -150,6 +167,9 @@ def _fetch_single_dips_info(url: str) -> dict:
     """Fetch /dips/info from a single indexer URL."""
     dips_url = url.rstrip("/") + "/dips/info"
     resp = requests.get(dips_url, timeout=DIPS_INFO_FETCH_TIMEOUT)
+    # Retry on 5xx server errors
+    if resp.status_code >= 500:
+        raise RetryableHTTPError(f"Server error {resp.status_code} from {dips_url}")
     resp.raise_for_status()
     return resp.json()
 

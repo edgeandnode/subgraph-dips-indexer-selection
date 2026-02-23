@@ -431,29 +431,36 @@ def _filter_by_price(
     history: pd.DataFrame,
     chain_id: Optional[str],
     max_grt_per_30_days: Optional[str],
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, str]:
     """
     Filter indexers by DIP pricing constraints.
 
     Excludes indexers that:
     - Have dips_info_available = False
     - Don't support the requested chain_id
+    - Don't have pricing configured for the requested chain_id
     - Have a base price exceeding max_grt_per_30_days for the chain
+
+    Returns:
+        Tuple of (filtered DataFrame, filter_reason) where filter_reason is empty
+        string if no filtering removed all candidates, otherwise describes why
+        all candidates were filtered out.
     """
     if chain_id is None:
-        return history
+        return history, ""
 
     df = history.copy()
+    initial_count = len(df)
 
     # Only filter if we have the DIP info columns
     if "dips_info_available" not in df.columns:
-        return df
+        return df, ""
 
     # Exclude indexers without DIP info
     df = df[df["dips_info_available"] == True]  # noqa: E712
 
     if df.empty:
-        return df
+        return df, f"all {initial_count} indexers lack DIP info (dips_info_available=False)"
 
     # Exclude indexers that don't support the chain
     if "dips_supported_networks" in df.columns:
@@ -464,10 +471,24 @@ def _filter_by_price(
             except (json.JSONDecodeError, TypeError):
                 return False
 
+        pre_filter = len(df)
         df = df[df["dips_supported_networks"].apply(supports_chain)]
+        if df.empty:
+            return df, f"none of {pre_filter} indexers support chain '{chain_id}'"
+
+    # Exclude indexers that don't have pricing for this chain
+    if "dips_min_grt_per_30_days" in df.columns:
+        def has_chain_price(prices_json):
+            price_str = _extract_chain_price(prices_json, chain_id)
+            return price_str is not None
+
+        pre_filter = len(df)
+        df = df[df["dips_min_grt_per_30_days"].apply(has_chain_price)]
+        if df.empty:
+            return df, f"none of {pre_filter} indexers have pricing configured for chain '{chain_id}'"
 
     if df.empty or max_grt_per_30_days is None:
-        return df
+        return df, ""
 
     # Exclude indexers whose price exceeds the budget
     max_budget = float(max_grt_per_30_days)
@@ -482,9 +503,12 @@ def _filter_by_price(
             except (ValueError, TypeError):
                 return False
 
+        pre_filter = len(df)
         df = df[df["dips_min_grt_per_30_days"].apply(within_budget)]
+        if df.empty:
+            return df, f"all {pre_filter} indexers exceed payment ceiling of {max_grt_per_30_days} GRT/30d for chain '{chain_id}'"
 
-    return df
+    return df, ""
 
 
 def _enrich_with_chain_prices(
@@ -567,13 +591,21 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
         return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
 
     # Filter by price constraints before scoring
-    filtered_history = _filter_by_price(
+    filtered_history, filter_reason = _filter_by_price(
         _state.history,
         request.chain_id,
         request.max_grt_per_30_days,
     )
 
     if filtered_history.empty:
+        if filter_reason:
+            logger.warning(
+                f"No indexers available for deployment {request.deployment_id}: {filter_reason}"
+            )
+        else:
+            logger.warning(
+                f"No indexers available for deployment {request.deployment_id} (unknown reason)"
+            )
         return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
 
     # Enrich with chain-specific price columns for normalization
