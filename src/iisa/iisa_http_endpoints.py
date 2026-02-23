@@ -89,8 +89,8 @@ class SelectedIndexer(BaseModel):
     """Indexer entry in the selection response, including pricing info."""
 
     id: str
-    min_grt_per_30_days: Optional[str] = None
-    min_grt_per_million_entities_per_30_days: Optional[str] = None
+    min_grt_per_30_days: Optional[float] = None
+    min_grt_per_million_entities_per_30_days: Optional[float] = None
 
 
 class SelectionResponse(BaseModel):
@@ -418,12 +418,13 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
         raise HTTPException(status_code=500, detail=f"Selection failed: {e}")
 
 
-def _extract_chain_price(dips_min_grt_json: str, chain_id: str) -> Optional[str]:
+def _extract_chain_price(dips_min_grt_json: str, chain_id: str) -> Optional[float]:
     """Extract the price for a specific chain from the JSON price map."""
     try:
         prices = json.loads(dips_min_grt_json) if isinstance(dips_min_grt_json, str) else {}
-        return prices.get(chain_id)
-    except (json.JSONDecodeError, TypeError):
+        val = prices.get(chain_id)
+        return float(val) if val is not None else None
+    except (json.JSONDecodeError, TypeError, ValueError):
         return None
 
 
@@ -563,7 +564,10 @@ def _build_selected_indexers(
                 min_grt = _extract_chain_price(row.iloc[0].get("dips_min_grt_per_30_days", "{}"), chain_id)
             if "dips_min_grt_per_million_entities_per_30_days" in row.columns:
                 val = row.iloc[0].get("dips_min_grt_per_million_entities_per_30_days")
-                min_entity = str(val) if val is not None and pd.notna(val) else None
+                try:
+                    min_entity = float(val) if val is not None and pd.notna(val) else None
+                except (TypeError, ValueError):
+                    min_entity = None
 
         results.append(SelectedIndexer(
             id=idx_id,

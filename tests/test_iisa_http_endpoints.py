@@ -124,7 +124,7 @@ class TestPydanticModels:
         response = SelectionResponse(
             deployment_id="Qm123",
             indexers=[
-                SelectedIndexer(id="0xABC", min_grt_per_30_days="450"),
+                SelectedIndexer(id="0xABC", min_grt_per_30_days=450.0),
                 SelectedIndexer(id="0xXYZ"),
                 SelectedIndexer(id="0x123"),
             ],
@@ -134,7 +134,7 @@ class TestPydanticModels:
         assert response.deployment_id == "Qm123"
         assert len(response.indexers) == 3
         assert response.indexers[0].id == "0xABC"
-        assert response.indexers[0].min_grt_per_30_days == "450"
+        assert response.indexers[0].min_grt_per_30_days == 450.0
 
     def test_selection_response_empty_indexers(self):
         """Verify empty indexers list is valid."""
