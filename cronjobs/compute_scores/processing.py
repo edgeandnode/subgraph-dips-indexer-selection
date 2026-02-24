@@ -5,15 +5,15 @@ This module contains functions extracted and adapted from the IISA codebase
 for computing latency regression, uptime, success rate, and stake-to-fees metrics.
 """
 
+import asyncio
 import json
 import logging
 import os
 import socket
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
 from struct import unpack
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import airportsdata
@@ -21,7 +21,6 @@ import geoip2.database
 import geoip2.errors
 import numpy as np
 import pandas as pd
-import requests
 from numpy.linalg import pinv
 from scipy.stats import t
 from sklearn.compose import ColumnTransformer
@@ -29,7 +28,9 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from tenacity import retry, stop_after_attempt, wait_exponential
+
+if TYPE_CHECKING:
+    import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -133,69 +134,45 @@ def _empty_geoip_result(ip_addr: str = None) -> dict:
 
 
 DIPS_INFO_FETCH_TIMEOUT = int(os.environ.get("DIPS_INFO_FETCH_TIMEOUT", "10"))
-DIPS_INFO_MAX_WORKERS = int(os.environ.get("DIPS_INFO_MAX_WORKERS", "16"))
+DIPS_INFO_MAX_CONCURRENCY = int(os.environ.get("DIPS_INFO_MAX_CONCURRENCY", "100"))
 DIPS_INFO_MAX_RETRIES = int(os.environ.get("DIPS_INFO_MAX_RETRIES", "5"))
 DIPS_INFO_RETRY_BACKOFF_MULTIPLIER = int(os.environ.get("DIPS_INFO_RETRY_BACKOFF_MULTIPLIER", "1"))
 DIPS_INFO_RETRY_BACKOFF_MAX = int(os.environ.get("DIPS_INFO_RETRY_BACKOFF_MAX", "5"))
 
 
-class RetryableHTTPError(Exception):
-    """Wrapper for 5xx HTTP errors that should trigger retry."""
-    pass
+async def _fetch_single_dips_info_async(
+    session: "aiohttp.ClientSession",
+    indexer: str,
+    url: str,
+    semaphore: asyncio.Semaphore,
+) -> dict:
+    """Fetch /dips/info from a single indexer URL with retry logic."""
+    import aiohttp
 
-
-def _is_retryable_exception(exc: BaseException) -> bool:
-    """Check if an exception should trigger a retry."""
-    # Network/connection errors
-    if isinstance(exc, (
-        ConnectionError,
-        requests.exceptions.ConnectionError,
-        requests.exceptions.Timeout,
-        requests.exceptions.ChunkedEncodingError,
-    )):
-        return True
-    # Wrapped 5xx errors
-    if isinstance(exc, RetryableHTTPError):
-        return True
-    return False
-
-
-@retry(
-    retry=_is_retryable_exception,
-    stop=stop_after_attempt(DIPS_INFO_MAX_RETRIES),
-    wait=wait_exponential(multiplier=DIPS_INFO_RETRY_BACKOFF_MULTIPLIER, max=DIPS_INFO_RETRY_BACKOFF_MAX),
-    reraise=True,
-)
-def _fetch_single_dips_info(url: str) -> dict:
-    """Fetch /dips/info from a single indexer URL."""
     dips_url = url.rstrip("/") + "/dips/info"
-    resp = requests.get(dips_url, timeout=DIPS_INFO_FETCH_TIMEOUT)
-    # Retry on 5xx server errors
-    if resp.status_code >= 500:
-        raise RetryableHTTPError(f"Server error {resp.status_code} from {dips_url}")
-    resp.raise_for_status()
-    return resp.json()
 
+    async def do_fetch() -> dict:
+        async with semaphore:
+            async with session.get(
+                dips_url,
+                timeout=aiohttp.ClientTimeout(total=DIPS_INFO_FETCH_TIMEOUT),
+            ) as resp:
+                if resp.status >= 500:
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info,
+                        resp.history,
+                        status=resp.status,
+                        message=f"Server error {resp.status}",
+                    )
+                resp.raise_for_status()
+                return await resp.json()
 
-def fetch_dips_info(indexer_urls: Dict[str, str]) -> pd.DataFrame:
-    """
-    Fetch /dips/info from each indexer in parallel.
-
-    Args:
-        indexer_urls: dict mapping indexer address -> URL
-
-    Returns:
-        DataFrame with columns: indexer, dips_info_available,
-        dips_min_grt_per_30_days, dips_min_grt_per_million_entities_per_30_days,
-        dips_supported_networks
-    """
-    results: List[dict] = []
-
-    def fetch_one(indexer: str, url: str) -> dict:
+    last_error: Optional[Exception] = None
+    for attempt in range(DIPS_INFO_MAX_RETRIES):
         try:
-            data = _fetch_single_dips_info(url)
-            min_prices = data.get("min_grt_per_30_days", {})
-            min_entity_price = data.get("min_grt_per_million_entities_per_30_days")
+            data = await do_fetch()
+            min_prices = data.get("pricing", {}).get("min_grt_per_30_days", {})
+            min_entity_price = data.get("pricing", {}).get("min_grt_per_million_entities_per_30_days")
             supported_networks = data.get("supported_networks", [])
             # If supported_networks not explicitly provided, infer from price keys
             if not supported_networks and isinstance(min_prices, dict):
@@ -207,31 +184,63 @@ def fetch_dips_info(indexer_urls: Dict[str, str]) -> pd.DataFrame:
                 "dips_min_grt_per_million_entities_per_30_days": str(min_entity_price) if min_entity_price is not None else None,
                 "dips_supported_networks": json.dumps(supported_networks),
             }
-        except Exception as e:
-            logger.debug(f"Failed to fetch /dips/info from {url} for indexer {indexer}: {e}")
-            return {
-                "indexer": indexer,
-                "dips_info_available": False,
-                "dips_min_grt_per_30_days": "{}",
-                "dips_min_grt_per_million_entities_per_30_days": None,
-                "dips_supported_networks": "[]",
-            }
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_error = e
+            if attempt < DIPS_INFO_MAX_RETRIES - 1:
+                delay = min(
+                    DIPS_INFO_RETRY_BACKOFF_MAX,
+                    DIPS_INFO_RETRY_BACKOFF_MULTIPLIER * (2 ** attempt),
+                )
+                await asyncio.sleep(delay)
 
-    with ThreadPoolExecutor(max_workers=DIPS_INFO_MAX_WORKERS) as pool:
-        futures = {
-            pool.submit(fetch_one, indexer, url): indexer
+    logger.debug(f"Failed to fetch /dips/info from {url} for indexer {indexer}: {last_error}")
+    return {
+        "indexer": indexer,
+        "dips_info_available": False,
+        "dips_min_grt_per_30_days": "{}",
+        "dips_min_grt_per_million_entities_per_30_days": None,
+        "dips_supported_networks": "[]",
+    }
+
+
+async def _fetch_all_dips_info_async(indexer_urls: Dict[str, str]) -> List[dict]:
+    """Fetch /dips/info from all indexers concurrently."""
+    import aiohttp
+
+    semaphore = asyncio.Semaphore(DIPS_INFO_MAX_CONCURRENCY)
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            _fetch_single_dips_info_async(session, indexer, url, semaphore)
             for indexer, url in indexer_urls.items()
-        }
-        for future in as_completed(futures):
-            results.append(future.result())
+        ]
+        return await asyncio.gather(*tasks)
+
+
+def fetch_dips_info(indexer_urls: Dict[str, str]) -> pd.DataFrame:
+    """
+    Fetch /dips/info from each indexer concurrently using asyncio.
+
+    Args:
+        indexer_urls: dict mapping indexer address -> URL
+
+    Returns:
+        DataFrame with columns: indexer, dips_info_available,
+        dips_min_grt_per_30_days, dips_min_grt_per_million_entities_per_30_days,
+        dips_supported_networks
+    """
+    if not indexer_urls:
+        return pd.DataFrame(
+            columns=["indexer", "dips_info_available", "dips_min_grt_per_30_days",
+                     "dips_min_grt_per_million_entities_per_30_days", "dips_supported_networks"]
+        )
+
+    results = asyncio.run(_fetch_all_dips_info_async(indexer_urls))
 
     available_count = sum(1 for r in results if r["dips_info_available"])
     logger.info(f"DIP info fetched for {len(results)} indexers ({available_count} available)")
 
-    return pd.DataFrame(results) if results else pd.DataFrame(
-        columns=["indexer", "dips_info_available", "dips_min_grt_per_30_days",
-                 "dips_min_grt_per_million_entities_per_30_days", "dips_supported_networks"]
-    )
+    return pd.DataFrame(results)
 
 
 def compute_all_scores(
