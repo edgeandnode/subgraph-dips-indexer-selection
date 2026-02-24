@@ -647,10 +647,13 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
     if "norm_base_price_per_epoch" not in merged.columns:
         if "base_price_per_epoch" in merged.columns:
             prices = pd.to_numeric(merged["base_price_per_epoch"], errors="coerce").fillna(0.0).clip(lower=0)
+            floor = prices.min()
             ceiling = prices.max()
-            if ceiling > 0:
+            if ceiling > 0 and ceiling > floor:
+                # Normal case: spread of prices, cheaper = higher score
                 merged["norm_base_price_per_epoch"] = 1 - (prices / ceiling)
             else:
+                # Uniform prices or all zero: use neutral score (price not a differentiator)
                 merged["norm_base_price_per_epoch"] = 0.5
         else:
             merged["norm_base_price_per_epoch"] = np.nan
@@ -659,10 +662,13 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
     if "norm_price_per_entity" not in merged.columns:
         if "price_per_entity" in merged.columns:
             prices = pd.to_numeric(merged["price_per_entity"], errors="coerce").fillna(0.0).clip(lower=0)
+            floor = prices.min()
             ceiling = prices.max()
-            if ceiling > 0:
+            if ceiling > 0 and ceiling > floor:
+                # Normal case: spread of prices, cheaper = higher score
                 merged["norm_price_per_entity"] = 1 - (prices / ceiling)
             else:
+                # Uniform prices or all zero: use neutral score (price not a differentiator)
                 merged["norm_price_per_entity"] = 0.5
         else:
             merged["norm_price_per_entity"] = np.nan
