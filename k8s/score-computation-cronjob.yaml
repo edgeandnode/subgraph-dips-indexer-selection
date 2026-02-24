@@ -47,27 +47,27 @@ spec:
             - name: TARGET_ROWS
               value: "20000000"
             - name: REDPANDA_BOOTSTRAP_SERVERS
-              value: ""  # e.g. redpanda:9092
+              valueFrom:
+                secretKeyRef:
+                  name: iisa-redpanda-credentials
+                  key: REDPANDA_BOOTSTRAP_SERVERS
             - name: REDPANDA_TOPIC
               value: "gateway_queries"
             - name: GRAPH_NETWORK_SUBGRAPH_URL
               valueFrom:
                 secretKeyRef:
-                  name: iisa-graph-network-credentials
-                  key: subgraph_url
-                  optional: true
+                  name: iisa-redpanda-credentials
+                  key: GRAPH_NETWORK_SUBGRAPH_URL
             - name: REDPANDA_SASL_USERNAME
               valueFrom:
                 secretKeyRef:
                   name: iisa-redpanda-credentials
-                  key: sasl_username
-                  optional: true
+                  key: REDPANDA_SASL_USERNAME
             - name: REDPANDA_SASL_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: iisa-redpanda-credentials
-                  key: sasl_password
-                  optional: true
+                  key: REDPANDA_SASL_PASSWORD
             - name: SCORES_FILE_PATH
               value: "/app/scores/indexer_scores.json"
             securityContext:
