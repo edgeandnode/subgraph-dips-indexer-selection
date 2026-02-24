@@ -8,6 +8,7 @@ on:
       - 'src/**'
       - 'Dockerfile'
       - 'pyproject.toml'
+      - 'uv.lock'
       - '.github/workflows/build-service-image.yml'
   workflow_dispatch:
 
