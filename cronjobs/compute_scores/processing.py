@@ -5,13 +5,15 @@ This module contains functions extracted and adapted from the IISA codebase
 for computing latency regression, uptime, success rate, and stake-to-fees metrics.
 """
 
+import asyncio
+import json
 import logging
 import os
 import socket
 from datetime import date, datetime, timezone
 from pathlib import Path
 from struct import unpack
-from typing import Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import airportsdata
@@ -26,6 +28,9 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+if TYPE_CHECKING:
+    import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +131,116 @@ GEOIP_SRC_COLUMN_MAPPING = _geoip_column_mapping("src")
 def _empty_geoip_result(ip_addr: str = None) -> dict:
     """Return a GeoIP result dict with optional ip_addr and None for other fields."""
     return {"ip_addr": ip_addr, "org": None, "country": None, "latitude": None, "longitude": None}
+
+
+DIPS_INFO_FETCH_TIMEOUT = int(os.environ.get("DIPS_INFO_FETCH_TIMEOUT", "10"))
+DIPS_INFO_MAX_CONCURRENCY = int(os.environ.get("DIPS_INFO_MAX_CONCURRENCY", "100"))
+DIPS_INFO_MAX_RETRIES = int(os.environ.get("DIPS_INFO_MAX_RETRIES", "5"))
+DIPS_INFO_RETRY_BACKOFF_MULTIPLIER = int(os.environ.get("DIPS_INFO_RETRY_BACKOFF_MULTIPLIER", "1"))
+DIPS_INFO_RETRY_BACKOFF_MAX = int(os.environ.get("DIPS_INFO_RETRY_BACKOFF_MAX", "5"))
+
+
+async def _fetch_single_dips_info_async(
+    session: "aiohttp.ClientSession",
+    indexer: str,
+    url: str,
+    semaphore: asyncio.Semaphore,
+) -> dict:
+    """Fetch /dips/info from a single indexer URL with retry logic."""
+    import aiohttp
+
+    dips_url = url.rstrip("/") + "/dips/info"
+
+    async def do_fetch() -> dict:
+        async with semaphore:
+            async with session.get(
+                dips_url,
+                timeout=aiohttp.ClientTimeout(total=DIPS_INFO_FETCH_TIMEOUT),
+            ) as resp:
+                if resp.status >= 500:
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info,
+                        resp.history,
+                        status=resp.status,
+                        message=f"Server error {resp.status}",
+                    )
+                resp.raise_for_status()
+                return await resp.json()
+
+    last_error: Optional[Exception] = None
+    for attempt in range(DIPS_INFO_MAX_RETRIES):
+        try:
+            data = await do_fetch()
+            min_prices = data.get("pricing", {}).get("min_grt_per_30_days", {})
+            min_entity_price = data.get("pricing", {}).get("min_grt_per_million_entities_per_30_days")
+            supported_networks = data.get("supported_networks", [])
+            # If supported_networks not explicitly provided, infer from price keys
+            if not supported_networks and isinstance(min_prices, dict):
+                supported_networks = list(min_prices.keys())
+            return {
+                "indexer": indexer,
+                "dips_info_available": True,
+                "dips_min_grt_per_30_days": json.dumps(min_prices) if isinstance(min_prices, dict) else "{}",
+                "dips_min_grt_per_million_entities_per_30_days": str(min_entity_price) if min_entity_price is not None else None,
+                "dips_supported_networks": json.dumps(supported_networks),
+            }
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_error = e
+            if attempt < DIPS_INFO_MAX_RETRIES - 1:
+                delay = min(
+                    DIPS_INFO_RETRY_BACKOFF_MAX,
+                    DIPS_INFO_RETRY_BACKOFF_MULTIPLIER * (2 ** attempt),
+                )
+                await asyncio.sleep(delay)
+
+    logger.debug(f"Failed to fetch /dips/info from {url} for indexer {indexer}: {last_error}")
+    return {
+        "indexer": indexer,
+        "dips_info_available": False,
+        "dips_min_grt_per_30_days": "{}",
+        "dips_min_grt_per_million_entities_per_30_days": None,
+        "dips_supported_networks": "[]",
+    }
+
+
+async def _fetch_all_dips_info_async(indexer_urls: Dict[str, str]) -> List[dict]:
+    """Fetch /dips/info from all indexers concurrently."""
+    import aiohttp
+
+    semaphore = asyncio.Semaphore(DIPS_INFO_MAX_CONCURRENCY)
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            _fetch_single_dips_info_async(session, indexer, url, semaphore)
+            for indexer, url in indexer_urls.items()
+        ]
+        return await asyncio.gather(*tasks)
+
+
+def fetch_dips_info(indexer_urls: Dict[str, str]) -> pd.DataFrame:
+    """
+    Fetch /dips/info from each indexer concurrently using asyncio.
+
+    Args:
+        indexer_urls: dict mapping indexer address -> URL
+
+    Returns:
+        DataFrame with columns: indexer, dips_info_available,
+        dips_min_grt_per_30_days, dips_min_grt_per_million_entities_per_30_days,
+        dips_supported_networks
+    """
+    if not indexer_urls:
+        return pd.DataFrame(
+            columns=["indexer", "dips_info_available", "dips_min_grt_per_30_days",
+                     "dips_min_grt_per_million_entities_per_30_days", "dips_supported_networks"]
+        )
+
+    results = asyncio.run(_fetch_all_dips_info_async(indexer_urls))
+
+    available_count = sum(1 for r in results if r["dips_info_available"])
+    logger.info(f"DIP info fetched for {len(results)} indexers ({available_count} available)")
+
+    return pd.DataFrame(results)
 
 
 def compute_all_scores(
@@ -263,6 +378,21 @@ def compute_all_scores(
         indexer_query_count,
     )
 
+    # Fetch DIP pricing info from indexers
+    indexer_urls = {}
+    if "url" in agg_df.columns:
+        for _, row in agg_df[["indexer", "url"]].dropna(subset=["url"]).iterrows():
+            indexer_urls[row["indexer"]] = row["url"]
+    if indexer_urls:
+        dips_info_df = fetch_dips_info(indexer_urls)
+        merged = pd.merge(merged, dips_info_df, on="indexer", how="left")
+        merged["dips_info_available"] = merged["dips_info_available"].fillna(False)
+    else:
+        merged["dips_info_available"] = False
+        merged["dips_min_grt_per_30_days"] = "{}"
+        merged["dips_min_grt_per_million_entities_per_30_days"] = None
+        merged["dips_supported_networks"] = "[]"
+
     # Transform to indexer_scores schema with pre-normalized values
     scores_df = transform_to_scores_schema(merged)
 
@@ -325,6 +455,14 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     # DIP agreement metrics (placeholders until data sources available - see #15)
     scores["existing_dips_agreements"] = merged.get("existing_dips_agreements", 0)
     scores["avg_sync_duration"] = merged.get("avg_sync_duration")
+
+    # DIP pricing info (fetched from indexer /dips/info endpoints)
+    scores["dips_info_available"] = merged.get("dips_info_available", False)
+    scores["dips_min_grt_per_30_days"] = merged.get("dips_min_grt_per_30_days", "{}")
+    scores["dips_min_grt_per_million_entities_per_30_days"] = merged.get(
+        "dips_min_grt_per_million_entities_per_30_days"
+    )
+    scores["dips_supported_networks"] = merged.get("dips_supported_networks", "[]")
 
     # Metadata
     scores["computed_at"] = datetime.now(timezone.utc)

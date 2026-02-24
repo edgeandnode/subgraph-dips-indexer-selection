@@ -47,24 +47,24 @@ class WeightsDict(TypedDict, total=False):
     A dictionary containing weights for each metric used in the weighted score calculation.
     """
 
+    stake_to_fees_iqr_deviation: float
+    base_price_per_epoch: float
     lat_lin_reg_coefficient: float
     uptime_score: float
-    existing_dips_agreements: float
-    stake_to_fees_iqr_deviation: float
     success_rate: float
-    avg_sync_duration: float
+    price_per_entity: float
 
 
 DEFAULT_WEIGHTS = cast(
     WeightsDict,
     MappingProxyType(
         {
-            "lat_lin_reg_coefficient": 0.32,
-            "uptime_score": 0.22,
-            "existing_dips_agreements": 0.16,
-            "stake_to_fees_iqr_deviation": 0.135,
-            "success_rate": 0.0825,
-            "avg_sync_duration": 0.0825,
+            "stake_to_fees_iqr_deviation": 0.30,
+            "base_price_per_epoch": 0.25,
+            "lat_lin_reg_coefficient": 0.20,
+            "uptime_score": 0.15,
+            "success_rate": 0.05,
+            "price_per_entity": 0.05,
         }
     ),
 )
@@ -585,38 +585,29 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
 
     Note:
     - Each metric is normalized to a scale of 0 to 1, where 1 represents better performance.
-    - Some metrics are inverted (1 - normalized value) if lower values are better (e.g., latency).
-    - Missing data uses optimistic initialization: NA values in time-based metrics
-      (avg_sync_duration) are filled with 0, giving new indexers the best possible score
-      to encourage exploration.
+    - Some metrics are inverted (1 - normalized value) if lower values are better (e.g., latency, price).
     - Different normalization techniques are used based on the nature of each metric:
         - Generic min-max normalization for most metrics
         - Special normalization for uptime and success rate to emphasize high performance
+        - Price normalization: 1 - (price / ceiling) so cheaper = higher score
 
     :param merged: The input DataFrame containing various indexer metrics.
-    :return: The input DataFrame with additional columns for normalized metrics:
-        - 'norm_lat_lin_reg_coefficient': Normalized latency linear regression coefficient
-        - 'norm_uptime_score': Normalized uptime score
-        - 'norm_existing_dips_agreements': Normalized score for existing DIP agreements
-        - 'norm_stake_to_fees_iqr_deviation': Normalized stake-to-fees ratio deviation
-        - 'norm_success_rate': Normalized success rate
-        - 'norm_avg_sync_duration': Normalized average sync duration
+    :return: The input DataFrame with additional columns for normalized metrics.
     """
     if merged.empty:
         new_columns = [
             "norm_lat_lin_reg_coefficient",
             "norm_uptime_score",
-            "norm_existing_dips_agreements",
             "norm_stake_to_fees_iqr_deviation",
             "norm_success_rate",
-            "norm_avg_sync_duration",
+            "norm_base_price_per_epoch",
+            "norm_price_per_entity",
         ]
         for col in new_columns:
             merged[col] = pd.Series(dtype=float)
         return merged
 
     # Normalise latency linear regression score
-    # Use pre-computed if available (from CronJob), otherwise compute
     if "norm_lat_lin_reg_coefficient" not in merged.columns:
         if "Latency Coefficient + Error Confidence Interval" in merged.columns:
             merged["norm_lat_lin_reg_coefficient"] = 1 - _normalize_generic(
@@ -626,7 +617,6 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
             merged["norm_lat_lin_reg_coefficient"] = np.nan
 
     # Normalise uptime score
-    # Use pre-computed if available, otherwise compute
     if "norm_uptime_score" not in merged.columns:
         if "% up_x" in merged.columns:
             merged["norm_uptime_score"] = _normalize_uptime_and_success_rate(
@@ -635,17 +625,7 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
         else:
             merged["norm_uptime_score"] = np.nan
 
-    # Normalise the number of indexing agreements each indexer has
-    # ALWAYS normalize fresh - this is dynamic and changes per request
-    if "existing_dips_agreements" in merged.columns:
-        merged["norm_existing_dips_agreements"] = 1 - _normalize_generic(
-            merged["existing_dips_agreements"]
-        )  # lower is better
-    else:
-        merged["norm_existing_dips_agreements"] = np.nan
-
     # Normalise stake to fees ratio
-    # Use pre-computed if available, otherwise compute
     if "norm_stake_to_fees_iqr_deviation" not in merged.columns:
         if "stake_to_fees_iqr_deviation" in merged.columns:
             merged["norm_stake_to_fees_iqr_deviation"] = _normalize_generic(
@@ -655,7 +635,6 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
             merged["norm_stake_to_fees_iqr_deviation"] = np.nan
 
     # Normalise success rate score
-    # Use pre-computed if available, otherwise compute
     if "norm_success_rate" not in merged.columns:
         if "average_status" in merged.columns:
             merged["norm_success_rate"] = _normalize_uptime_and_success_rate(
@@ -664,19 +643,35 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
         else:
             merged["norm_success_rate"] = np.nan
 
-    # Normalize avg_sync_duration
-    # Use pre-computed if available, otherwise compute
-    if "norm_avg_sync_duration" not in merged.columns:
-        if "avg_sync_duration" in merged.columns:
-            # Fill NA with 0 (optimistic: best sync duration) before normalization
-            merged["avg_sync_duration"] = pd.to_numeric(
-                merged["avg_sync_duration"], errors="coerce"
-            ).fillna(0.0)
-            merged["norm_avg_sync_duration"] = 1 - _normalize_generic(
-                merged["avg_sync_duration"]
-            )  # lower is better
+    # Normalize base price per epoch (lower is better)
+    if "norm_base_price_per_epoch" not in merged.columns:
+        if "base_price_per_epoch" in merged.columns:
+            prices = pd.to_numeric(merged["base_price_per_epoch"], errors="coerce").fillna(0.0).clip(lower=0)
+            floor = prices.min()
+            ceiling = prices.max()
+            if ceiling > 0 and ceiling > floor:
+                # Normal case: spread of prices, cheaper = higher score
+                merged["norm_base_price_per_epoch"] = 1 - (prices / ceiling)
+            else:
+                # Uniform prices or all zero: use neutral score (price not a differentiator)
+                merged["norm_base_price_per_epoch"] = 0.5
         else:
-            merged["norm_avg_sync_duration"] = np.nan
+            merged["norm_base_price_per_epoch"] = np.nan
+
+    # Normalize price per entity (lower is better)
+    if "norm_price_per_entity" not in merged.columns:
+        if "price_per_entity" in merged.columns:
+            prices = pd.to_numeric(merged["price_per_entity"], errors="coerce").fillna(0.0).clip(lower=0)
+            floor = prices.min()
+            ceiling = prices.max()
+            if ceiling > 0 and ceiling > floor:
+                # Normal case: spread of prices, cheaper = higher score
+                merged["norm_price_per_entity"] = 1 - (prices / ceiling)
+            else:
+                # Uniform prices or all zero: use neutral score (price not a differentiator)
+                merged["norm_price_per_entity"] = 0.5
+        else:
+            merged["norm_price_per_entity"] = np.nan
 
     # Fill NaN values with 0 for all norm_ columns
     norm_columns = [col for col in merged.columns if col.startswith("norm_")]
