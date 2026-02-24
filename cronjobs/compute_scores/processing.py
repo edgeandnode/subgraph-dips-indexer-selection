@@ -172,7 +172,7 @@ async def _fetch_single_dips_info_async(
         try:
             data = await do_fetch()
             min_prices = data.get("pricing", {}).get("min_grt_per_30_days", {})
-            min_entity_price = data.get("pricing", {}).get("min_grt_per_million_entities_per_30_days")
+            min_entity_price = data.get("pricing", {}).get("min_grt_per_billion_entities_per_30_days")
             supported_networks = data.get("supported_networks", [])
             # If supported_networks not explicitly provided, infer from price keys
             if not supported_networks and isinstance(min_prices, dict):
@@ -181,7 +181,7 @@ async def _fetch_single_dips_info_async(
                 "indexer": indexer,
                 "dips_info_available": True,
                 "dips_min_grt_per_30_days": json.dumps(min_prices) if isinstance(min_prices, dict) else "{}",
-                "dips_min_grt_per_million_entities_per_30_days": str(min_entity_price) if min_entity_price is not None else None,
+                "dips_min_grt_per_billion_entities_per_30_days": str(min_entity_price) if min_entity_price is not None else None,
                 "dips_supported_networks": json.dumps(supported_networks),
             }
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -198,7 +198,7 @@ async def _fetch_single_dips_info_async(
         "indexer": indexer,
         "dips_info_available": False,
         "dips_min_grt_per_30_days": "{}",
-        "dips_min_grt_per_million_entities_per_30_days": None,
+        "dips_min_grt_per_billion_entities_per_30_days": None,
         "dips_supported_networks": "[]",
     }
 
@@ -226,13 +226,13 @@ def fetch_dips_info(indexer_urls: Dict[str, str]) -> pd.DataFrame:
 
     Returns:
         DataFrame with columns: indexer, dips_info_available,
-        dips_min_grt_per_30_days, dips_min_grt_per_million_entities_per_30_days,
+        dips_min_grt_per_30_days, dips_min_grt_per_billion_entities_per_30_days,
         dips_supported_networks
     """
     if not indexer_urls:
         return pd.DataFrame(
             columns=["indexer", "dips_info_available", "dips_min_grt_per_30_days",
-                     "dips_min_grt_per_million_entities_per_30_days", "dips_supported_networks"]
+                     "dips_min_grt_per_billion_entities_per_30_days", "dips_supported_networks"]
         )
 
     results = asyncio.run(_fetch_all_dips_info_async(indexer_urls))
@@ -390,7 +390,7 @@ def compute_all_scores(
     else:
         merged["dips_info_available"] = False
         merged["dips_min_grt_per_30_days"] = "{}"
-        merged["dips_min_grt_per_million_entities_per_30_days"] = None
+        merged["dips_min_grt_per_billion_entities_per_30_days"] = None
         merged["dips_supported_networks"] = "[]"
 
     # Transform to indexer_scores schema with pre-normalized values
@@ -459,8 +459,8 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     # DIP pricing info (fetched from indexer /dips/info endpoints)
     scores["dips_info_available"] = merged.get("dips_info_available", False)
     scores["dips_min_grt_per_30_days"] = merged.get("dips_min_grt_per_30_days", "{}")
-    scores["dips_min_grt_per_million_entities_per_30_days"] = merged.get(
-        "dips_min_grt_per_million_entities_per_30_days"
+    scores["dips_min_grt_per_billion_entities_per_30_days"] = merged.get(
+        "dips_min_grt_per_billion_entities_per_30_days"
     )
     scores["dips_supported_networks"] = merged.get("dips_supported_networks", "[]")
 

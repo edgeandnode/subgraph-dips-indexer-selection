@@ -90,7 +90,7 @@ class SelectedIndexer(BaseModel):
 
     id: str
     min_grt_per_30_days: Optional[float] = None
-    min_grt_per_million_entities_per_30_days: Optional[float] = None
+    min_grt_per_billion_entities_per_30_days: Optional[float] = None
 
 
 class SelectionResponse(BaseModel):
@@ -537,9 +537,9 @@ def _enrich_with_chain_prices(
 
     df["base_price_per_epoch"] = df["dips_min_grt_per_30_days"].apply(extract_price)
 
-    if "dips_min_grt_per_million_entities_per_30_days" in df.columns:
+    if "dips_min_grt_per_billion_entities_per_30_days" in df.columns:
         df["price_per_entity"] = pd.to_numeric(
-            df["dips_min_grt_per_million_entities_per_30_days"], errors="coerce"
+            df["dips_min_grt_per_billion_entities_per_30_days"], errors="coerce"
         ).fillna(0.0)
     else:
         df["price_per_entity"] = 0.0
@@ -562,8 +562,8 @@ def _build_selected_indexers(
         if not row.empty and chain_id is not None:
             if "dips_min_grt_per_30_days" in row.columns:
                 min_grt = _extract_chain_price(row.iloc[0].get("dips_min_grt_per_30_days", "{}"), chain_id)
-            if "dips_min_grt_per_million_entities_per_30_days" in row.columns:
-                val = row.iloc[0].get("dips_min_grt_per_million_entities_per_30_days")
+            if "dips_min_grt_per_billion_entities_per_30_days" in row.columns:
+                val = row.iloc[0].get("dips_min_grt_per_billion_entities_per_30_days")
                 try:
                     min_entity = float(val) if val is not None and pd.notna(val) else None
                 except (TypeError, ValueError):
@@ -572,7 +572,7 @@ def _build_selected_indexers(
         results.append(SelectedIndexer(
             id=idx_id,
             min_grt_per_30_days=min_grt,
-            min_grt_per_million_entities_per_30_days=min_entity,
+            min_grt_per_billion_entities_per_30_days=min_entity,
         ))
     return results
 

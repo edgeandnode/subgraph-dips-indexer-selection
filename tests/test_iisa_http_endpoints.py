@@ -363,7 +363,7 @@ def mock_history_df():
         "existing_dips_agreements": [2, 1, 0],
         "dips_info_available": [True, True, False],
         "dips_min_grt_per_30_days": ['{"arbitrum-one": "450"}', '{"arbitrum-one": "500"}', "{}"],
-        "dips_min_grt_per_million_entities_per_30_days": ["0.2", "0.3", None],
+        "dips_min_grt_per_billion_entities_per_30_days": ["200", "300", None],
         "dips_supported_networks": ['["arbitrum-one"]', '["arbitrum-one"]', "[]"],
     })
 
