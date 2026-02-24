@@ -134,6 +134,9 @@ def _empty_geoip_result(ip_addr: str = None) -> dict:
 
 DIPS_INFO_FETCH_TIMEOUT = int(os.environ.get("DIPS_INFO_FETCH_TIMEOUT", "10"))
 DIPS_INFO_MAX_WORKERS = int(os.environ.get("DIPS_INFO_MAX_WORKERS", "16"))
+DIPS_INFO_MAX_RETRIES = int(os.environ.get("DIPS_INFO_MAX_RETRIES", "5"))
+DIPS_INFO_RETRY_BACKOFF_MULTIPLIER = int(os.environ.get("DIPS_INFO_RETRY_BACKOFF_MULTIPLIER", "1"))
+DIPS_INFO_RETRY_BACKOFF_MAX = int(os.environ.get("DIPS_INFO_RETRY_BACKOFF_MAX", "5"))
 
 
 class RetryableHTTPError(Exception):
@@ -159,8 +162,8 @@ def _is_retryable_exception(exc: BaseException) -> bool:
 
 @retry(
     retry=_is_retryable_exception,
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=1, max=5),
+    stop=stop_after_attempt(DIPS_INFO_MAX_RETRIES),
+    wait=wait_exponential(multiplier=DIPS_INFO_RETRY_BACKOFF_MULTIPLIER, max=DIPS_INFO_RETRY_BACKOFF_MAX),
     reraise=True,
 )
 def _fetch_single_dips_info(url: str) -> dict:
