@@ -119,6 +119,12 @@ class DataProcessor:
         # or get_indexer_selections later after this constructor has finished running.
         self._process_data()
 
+        logger.info(
+            "DataProcessor completed: deployment=%s target=%d initial=%d final=%d",
+            self.deployment_id, self.target_size,
+            len(self.initial_group), len(self.current_group),
+        )
+
     def update_indexer_denylist_cancel_indexing_agreements(self, indexer_denylist):
         """
         Cancels all outstanding indexing agreements for indexers on the denylist.
@@ -189,9 +195,24 @@ class DataProcessor:
         # Get the current group of indexers for the subgraph using '_get_current_group'
         self.current_group = self._get_current_group()
         self.initial_group = list(self.current_group)
+        logger.debug(
+            "deployment=%s current_group=%s (%d indexers)",
+            self.deployment_id,
+            [addr[:10] for addr in self.current_group],
+            len(self.current_group),
+        )
 
         # Normalize metrics and calculate scores
         self.data = self._normalize_and_score()
+
+        if not self.data.empty and "weighted_score" in self.data.columns:
+            top = self.data.nlargest(5, "weighted_score")[["indexer", "weighted_score"]]
+            logger.debug(
+                "deployment=%s top_5_scores: %s",
+                self.deployment_id,
+                [(row["indexer"][:10], round(row["weighted_score"], 4))
+                 for _, row in top.iterrows()],
+            )
 
         # Call _assign_indexers_to_subgraph to assign/replace/remove an indexer on the subgraph.
         self._assign_indexers_to_subgraph()
@@ -216,6 +237,11 @@ class DataProcessor:
         self.data["existing_dips_agreements"] = (
             self.data["indexer"].map(agreement_counts).fillna(0).astype(int)
         )
+        logger.debug(
+            "deployment=%s agreement_counts: %d indexers have existing agreements",
+            self.deployment_id,
+            sum(1 for v in agreement_counts.values() if v > 0),
+        )
 
         return self.data
 
@@ -238,6 +264,10 @@ class DataProcessor:
         """
         try:
             normalized_data = _normalize_metrics(self.data)
+            logger.debug(
+                "deployment=%s normalized %d indexers",
+                self.deployment_id, len(normalized_data),
+            )
         except Exception as e:
             logger.error(
                 f"Unexpected error when trying normalize_metrics(self.data): {e}"
@@ -261,6 +291,15 @@ class DataProcessor:
         Use the methods _add_indexers_to_group and _replace_underperforming_indexers to
         assign indexers to the subgraph in question.
         """
+        action = (
+            "add" if len(self.current_group) < self.target_size
+            else "remove" if len(self.current_group) > self.target_size
+            else "replace_check"
+        )
+        logger.info(
+            "deployment=%s assigning: current_size=%d target_size=%d action=%s",
+            self.deployment_id, len(self.current_group), self.target_size, action,
+        )
         # If the current indexer group has less than target_size indexers, call '_add_indexers_to_group'
         if len(self.current_group) < self.target_size:
             self._add_indexers_to_group()
@@ -284,9 +323,18 @@ class DataProcessor:
             # Add the best indexer to the group
             if next_indexer:
                 self.current_group.append(next_indexer)
+                logger.info(
+                    "deployment=%s added indexer %s to group (%d/%d)",
+                    self.deployment_id, next_indexer[:10],
+                    len(self.current_group), self.target_size,
+                )
 
             # If there are no indexers available, do nothing.
             else:
+                logger.info(
+                    "deployment=%s no more candidates available, group is %d/%d",
+                    self.deployment_id, len(self.current_group), self.target_size,
+                )
                 break
 
     def _meets_decentralization_requirements(
@@ -329,7 +377,14 @@ class DataProcessor:
         orgs = self.data[self.data["indexer"].isin(new_group)]["org"].unique()
 
         # Return True if decentralisation requirements are met
-        return len(locations) >= 2 and len(orgs) >= 2
+        meets = len(locations) >= 2 and len(orgs) >= 2
+        if not meets:
+            logger.debug(
+                "deployment=%s decentralization check failed for %s: "
+                "locations=%d orgs=%d (need 2 each)",
+                self.deployment_id, new_indexer[:10], len(locations), len(orgs),
+            )
+        return meets
 
     def _remove_indexers_from_group(self):
         """
@@ -345,7 +400,7 @@ class DataProcessor:
             # Sort indexers by score, worst (lowest score) first
             indexer_scores.sort(key=lambda x: x[1], reverse=False)
 
-            for indexer, _ in indexer_scores:
+            for indexer, score in indexer_scores:
                 temp_group = self.current_group.copy()
                 temp_group.remove(indexer)
 
@@ -353,6 +408,11 @@ class DataProcessor:
                     temp_group
                 ):
                     self.current_group.remove(indexer)
+                    logger.info(
+                        "deployment=%s removed worst indexer %s (score=%.4f, group now %d/%d)",
+                        self.deployment_id, indexer[:10], score,
+                        len(self.current_group), self.target_size,
+                    )
                     break
             else:
                 break
@@ -444,6 +504,11 @@ class DataProcessor:
 
                 # Only consider replacing indexers below the minimum threshold
                 if current_score >= MIN_INDEXER_SCORE:
+                    logger.debug(
+                        "deployment=%s indexer %s score=%.4f >= threshold=%.2f, no replacement needed",
+                        self.deployment_id, existing_indexer[:10],
+                        current_score, MIN_INDEXER_SCORE,
+                    )
                     continue
 
                 # Find best candidate for replacing this specific indexer
@@ -468,11 +533,19 @@ class DataProcessor:
                         best_swap = (existing_indexer, candidate, improvement)
 
             if best_swap:
-                old_indexer, new_indexer, _ = best_swap
+                old_indexer, new_indexer, improvement = best_swap
                 self.current_group.remove(old_indexer)
                 self.current_group.append(new_indexer)
                 added_this_call.add(new_indexer)
+                logger.info(
+                    "deployment=%s replaced indexer %s with %s (improvement=%.4f)",
+                    self.deployment_id, old_indexer[:10], new_indexer[:10], improvement,
+                )
             else:
+                logger.debug(
+                    "deployment=%s no more beneficial replacements found",
+                    self.deployment_id,
+                )
                 break  # No more beneficial replacements available
 
     def _find_best_replacement_or_select_best_indexer(
@@ -512,25 +585,51 @@ class DataProcessor:
             + flatten_list_of_lists(self.pending_agreements.values())
             + self.declined_indexers.get(self.deployment_id, [])
         )
+        logger.debug(
+            "deployment=%s unpickable: %d in_group, %d denylisted, %d pending, %d declined",
+            self.deployment_id, len(self.current_group), len(self.indexer_denylist),
+            sum(len(v) for v in self.pending_agreements.values()),
+            len(self.declined_indexers.get(self.deployment_id, [])),
+        )
 
         # The candidates we could select are those that are not unpickable
         candidates = self.data[~self.data["indexer"].isin(unpickable_indexers)].copy()
 
         # Sort the candidates by weighted score, highest score first
         candidates.sort_values(by="weighted_score", ascending=False, inplace=True)
+        logger.debug(
+            "deployment=%s candidates: %d eligible out of %d total (excluded %d unpickable)",
+            self.deployment_id, len(candidates), len(self.data), len(unpickable_indexers),
+        )
 
         # Iterate through candidates, prefer one that meets decentralization requirements
         for indexer in candidates["indexer"]:
             if self._meets_decentralization_requirements(
                 indexer, replacing_indexer=replacing_indexer
             ):
+                score = candidates[candidates["indexer"] == indexer]["weighted_score"].iloc[0]
+                logger.debug(
+                    "deployment=%s selected %s (score=%.4f, meets decentralization)",
+                    self.deployment_id, indexer[:10], score,
+                )
                 return indexer
 
         # Fallback: return best candidate even if it doesn't meet decentralization
         # Decentralization is best-effort - if constraints cannot be met, still return an indexer
         if not candidates.empty:
-            return candidates["indexer"].iloc[0]
+            fallback = candidates["indexer"].iloc[0]
+            fallback_score = candidates["weighted_score"].iloc[0]
+            logger.debug(
+                "deployment=%s no candidate meets decentralization, "
+                "falling back to best scorer %s (score=%.4f)",
+                self.deployment_id, fallback[:10], fallback_score,
+            )
+            return fallback
 
+        logger.info(
+            "deployment=%s zero candidates remain after filtering %d total indexers",
+            self.deployment_id, len(self.data),
+        )
         return None  # Only when truly zero candidates available
 
     def _calculate_group_score(

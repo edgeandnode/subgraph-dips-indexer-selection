@@ -405,6 +405,14 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
     if request.num_candidates <= 0:
         return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
 
+    logger.info(
+        "select-indexers request: deployment=%s chain=%s num_candidates=%d "
+        "existing=%d blocked=%d budget=%s",
+        request.deployment_id, request.chain_id, request.num_candidates,
+        len(request.existing_indexers or []), len(request.blocklist or []),
+        f"{request.max_grt_per_30_days} GRT/30d" if request.max_grt_per_30_days else "none",
+    )
+
     try:
         response = _select_with_processor(request)
         indexer_ids = [i.id for i in response.indexers]
@@ -459,6 +467,7 @@ def _filter_by_price(
 
     # Exclude indexers without DIP info
     df = df[df["dips_info_available"] == True]  # noqa: E712
+    logger.debug("price filter: %d/%d indexers have DIP info", len(df), initial_count)
 
     if df.empty:
         return df, f"all {initial_count} indexers lack DIP info (dips_info_available=False)"
@@ -474,6 +483,7 @@ def _filter_by_price(
 
         pre_filter = len(df)
         df = df[df["dips_supported_networks"].apply(supports_chain)]
+        logger.debug("price filter: %d/%d indexers support chain '%s'", len(df), pre_filter, chain_id)
         if df.empty:
             return df, f"none of {pre_filter} indexers support chain '{chain_id}'"
 
@@ -506,6 +516,10 @@ def _filter_by_price(
 
         pre_filter = len(df)
         df = df[df["dips_min_grt_per_30_days"].apply(within_budget)]
+        logger.debug(
+            "price filter: %d/%d indexers within budget of %s GRT/30d for chain '%s'",
+            len(df), pre_filter, max_grt_per_30_days, chain_id,
+        )
         if df.empty:
             return df, f"all {pre_filter} indexers exceed payment ceiling of {max_grt_per_30_days} GRT/30d for chain '{chain_id}'"
 
@@ -611,6 +625,12 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
                 f"No indexers available for deployment {request.deployment_id} (unknown reason)"
             )
         return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
+
+    logger.info(
+        "deployment=%s proceeding with %d candidates after price filtering (from %d total)",
+        request.deployment_id, len(filtered_history),
+        len(_state.history) if _state.history is not None else 0,
+    )
 
     # Enrich with chain-specific price columns for normalization
     enriched_history = _enrich_with_chain_prices(filtered_history, request.chain_id)
