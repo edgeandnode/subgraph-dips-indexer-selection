@@ -45,6 +45,7 @@ import pandas as pd
 import requests
 
 from gateway_queries_pb2 import ClientQueryProtobuf
+from subgraph import paginate_subgraph_query
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,7 @@ class RedpandaProvider:
     def __init__(self) -> None:
         self._bootstrap_servers = os.environ.get("REDPANDA_BOOTSTRAP_SERVERS", "")
         self._topic = os.environ.get("REDPANDA_TOPIC", "gateway_queries")
-        self._graph_network_url = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
+        self.graph_network_url = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
         self._scores_path = SCORES_FILE_PATH
 
         # SASL authentication (optional — omit for plaintext local-network)
@@ -205,14 +206,14 @@ class RedpandaProvider:
         Returns a DataFrame indexed by 'indexer' with a 'stake_to_fees' column,
         matching the schema expected by compute_all_scores.
         """
-        if not self._graph_network_url:
+        if not self.graph_network_url:
             logger.warning(
                 "GRAPH_NETWORK_SUBGRAPH_URL not set — returning empty stake data. "
                 "stake_to_fees will be NaN for all indexers."
             )
             return pd.DataFrame(columns=["stake_to_fees"])
 
-        logger.info(f"Fetching stake data from {self._graph_network_url}")
+        logger.info(f"Fetching stake data from {self.graph_network_url}")
         try:
             indexers = self._paginate_graphql_indexers()
         except Exception:
@@ -671,32 +672,7 @@ class RedpandaProvider:
           }
         }
         """
-        page_size = 1000
-        last_id = ""
-        all_indexers: List[dict] = []
-
-        while True:
-            response = requests.post(
-                self._graph_network_url,
-                json={"query": query, "variables": {"first": page_size, "lastId": last_id}},
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            if "errors" in data:
-                raise RuntimeError(f"GraphQL errors: {data['errors']}")
-
-            page = data.get("data", {}).get("indexers", [])
-            if not page:
-                break
-
-            all_indexers.extend(page)
-            if len(page) < page_size:
-                break
-            last_id = page[-1]["id"]
-
-        return all_indexers
+        return paginate_subgraph_query(self.graph_network_url, query, entity="indexers")
 
 
 # ---------------------------------------------------------------------------
