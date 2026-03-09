@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 import requests
 
 import airportsdata
+from subgraph import paginate_subgraph_query
 import geoip2.database
 import geoip2.errors
 import numpy as np
@@ -141,9 +142,6 @@ DIPS_INFO_MAX_RETRIES = int(os.environ.get("DIPS_INFO_MAX_RETRIES", "5"))
 DIPS_INFO_RETRY_BACKOFF_MULTIPLIER = int(os.environ.get("DIPS_INFO_RETRY_BACKOFF_MULTIPLIER", "1"))
 DIPS_INFO_RETRY_BACKOFF_MAX = int(os.environ.get("DIPS_INFO_RETRY_BACKOFF_MAX", "5"))
 
-# Network subgraph URL for indexer discovery
-GRAPH_NETWORK_SUBGRAPH_URL = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
-
 
 def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[str, str]:
     """Query the Graph Network subgraph for indexer addresses and service URLs.
@@ -154,7 +152,8 @@ def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[s
     would be invisible to a Redpanda-only discovery path.
 
     Returns a dict mapping indexer address to service URL for indexers that have
-    a registered URL.
+    a registered URL. Returns an empty dict on any failure so callers can
+    degrade gracefully.
     """
     if not network_subgraph_url:
         logger.warning("GRAPH_NETWORK_SUBGRAPH_URL not set, cannot discover indexers from subgraph")
@@ -168,39 +167,17 @@ def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[s
       }
     }
     """
+    try:
+        raw_indexers = paginate_subgraph_query(network_subgraph_url, query, entity="indexers")
+    except Exception as e:
+        logger.warning(f"Failed to query network subgraph: {e}")
+        return {}
+
     all_indexers: Dict[str, str] = {}
-    last_id = ""
-    page_size = 1000
-
-    while True:
-        try:
-            response = requests.post(
-                network_subgraph_url,
-                json={"query": query, "variables": {"first": page_size, "lastId": last_id}},
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            if "errors" in data:
-                logger.warning(f"Network subgraph query errors: {data['errors']}")
-                break
-
-            page = data.get("data", {}).get("indexers", [])
-            if not page:
-                break
-
-            for indexer in page:
-                url = indexer.get("url", "")
-                if url:
-                    all_indexers[indexer["id"]] = url
-
-            if len(page) < page_size:
-                break
-            last_id = page[-1]["id"]
-        except Exception as e:
-            logger.warning(f"Failed to query network subgraph: {e}")
-            break
+    for indexer in raw_indexers:
+        url = indexer.get("url", "")
+        if url:
+            all_indexers[indexer["id"]] = url
 
     logger.info(f"Discovered {len(all_indexers)} indexers from network subgraph")
     return all_indexers
@@ -448,7 +425,7 @@ def compute_all_scores(
     # The network subgraph is the source of truth for which indexers exist.
     # Redpanda only contains indexers that the gateway has routed queries to,
     # so newly registered indexers would be missed without this lookup.
-    indexer_urls = discover_indexers_from_network_subgraph(GRAPH_NETWORK_SUBGRAPH_URL)
+    indexer_urls = discover_indexers_from_network_subgraph(provider.graph_network_url)
     if indexer_urls:
         dips_info_df = fetch_dips_info(indexer_urls)
         merged = pd.merge(merged, dips_info_df, on="indexer", how="left")
