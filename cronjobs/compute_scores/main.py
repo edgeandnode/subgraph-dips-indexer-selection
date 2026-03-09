@@ -46,6 +46,11 @@ class ConfigurationError(Exception):
     pass
 
 
+# Scoring modes
+MODE_FULL = "full"
+MODE_DEGRADED = "degraded"
+MODE_FAILED = "failed"
+
 # Shared state
 _status_lock = threading.Lock()
 _last_run: dict = {}
@@ -114,7 +119,7 @@ def run_scoring() -> bool:
 
     provider = RedpandaProvider()
     scores_df = None
-    mode = "failed"
+    mode = MODE_FAILED
 
     if geoip_available:
         try:
@@ -134,7 +139,7 @@ def run_scoring() -> bool:
                 logger.warning("Full pipeline returned empty results")
                 scores_df = None
             else:
-                mode = "full"
+                mode = MODE_FULL
         except Exception as e:
             logger.warning(f"Full pipeline failed: {e}")
             scores_df = None
@@ -144,7 +149,7 @@ def run_scoring() -> bool:
         try:
             scores_df = compute_degraded_scores(GRAPH_NETWORK_SUBGRAPH_URL)
             if scores_df is not None and not scores_df.empty:
-                mode = "degraded"
+                mode = MODE_DEGRADED
             else:
                 scores_df = None
         except Exception as e:
@@ -157,31 +162,18 @@ def run_scoring() -> bool:
     if success:
         provider.write_scores(scores_df)
 
-    # Track consecutive non-full runs
-    if mode == "full":
-        _consecutive_degraded = 0
-        _consecutive_failed = 0
-    elif mode == "degraded":
-        _consecutive_degraded += 1
-        _consecutive_failed = 0
-        if _consecutive_degraded >= DEGRADED_THRESHOLD:
-            logger.error(
-                f"Scoring has been degraded for {_consecutive_degraded} consecutive runs. "
-                f"Full pipeline is not functioning — investigate GeoIP databases and Redpanda data availability."
-            )
-        else:
-            logger.warning(f"Scoring degraded ({_consecutive_degraded}/{DEGRADED_THRESHOLD} before alert)")
-    else:
-        _consecutive_failed += 1
-        _consecutive_degraded = 0
-        logger.error(f"Scoring failed completely for {_consecutive_failed} consecutive runs")
-
-    logger.info(
-        f"Scoring complete: mode={mode}, indexers={len(scores_df) if success else 0}, "
-        f"elapsed={elapsed:.1f}s, peak_memory={get_peak_memory_mb():.0f}MB"
-    )
-
+    # Track consecutive non-full runs (under lock — health endpoint reads these)
     with _status_lock:
+        if mode == MODE_FULL:
+            _consecutive_degraded = 0
+            _consecutive_failed = 0
+        elif mode == MODE_DEGRADED:
+            _consecutive_degraded += 1
+            _consecutive_failed = 0
+        else:
+            _consecutive_failed += 1
+            _consecutive_degraded = 0
+
         _last_run.update({
             "time": datetime.now(timezone.utc).isoformat(),
             "success": success,
@@ -192,6 +184,23 @@ def run_scoring() -> bool:
             "consecutive_failed": _consecutive_failed,
         })
 
+    # Log outside the lock
+    if mode == MODE_DEGRADED:
+        if _consecutive_degraded >= DEGRADED_THRESHOLD:
+            logger.error(
+                f"Scoring has been degraded for {_consecutive_degraded} consecutive runs. "
+                f"Full pipeline is not functioning — investigate GeoIP databases and Redpanda data availability."
+            )
+        else:
+            logger.warning(f"Scoring degraded ({_consecutive_degraded}/{DEGRADED_THRESHOLD} before alert)")
+    elif mode == MODE_FAILED:
+        logger.error(f"Scoring failed completely for {_consecutive_failed} consecutive runs")
+
+    logger.info(
+        f"Scoring complete: mode={mode}, indexers={len(scores_df) if success else 0}, "
+        f"elapsed={elapsed:.1f}s, peak_memory={get_peak_memory_mb():.0f}MB"
+    )
+
     return success
 
 
@@ -200,15 +209,19 @@ class RequestHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             if not os.path.exists(SCORES_FILE_PATH):
                 self._json_response(503, {"status": "waiting_for_first_run"})
-            elif _consecutive_failed > 0:
+                return
+            with _status_lock:
+                degraded = _consecutive_degraded
+                failed = _consecutive_failed
+            if failed > 0:
                 self._json_response(503, {
                     "status": "failing",
-                    "consecutive_failed": _consecutive_failed,
+                    "consecutive_failed": failed,
                 })
-            elif _consecutive_degraded >= DEGRADED_THRESHOLD:
+            elif degraded >= DEGRADED_THRESHOLD:
                 self._json_response(200, {
                     "status": "degraded",
-                    "consecutive_degraded": _consecutive_degraded,
+                    "consecutive_degraded": degraded,
                     "message": "Full pipeline not functioning, serving degraded scores",
                 })
             else:

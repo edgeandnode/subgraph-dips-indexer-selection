@@ -16,8 +16,6 @@ from struct import unpack
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-import requests
-
 import airportsdata
 from subgraph import paginate_subgraph_query
 import geoip2.database
