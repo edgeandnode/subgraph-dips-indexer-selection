@@ -30,14 +30,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Download MaxMind GeoLite2 databases
 # Attribution: This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com
 ARG MAXMIND_LICENSE_KEY
-RUN if [ -n "$MAXMIND_LICENSE_KEY" ]; then \
-    curl -fsSL "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz" | \
-    tar -xzf - --strip-components=1 -C /app --wildcards "*/GeoLite2-City.mmdb" && \
-    echo "Downloaded GeoLite2-City database" && \
-    curl -fsSL "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-ASN&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz" | \
-    tar -xzf - --strip-components=1 -C /app --wildcards "*/GeoLite2-ASN.mmdb" && \
-    echo "Downloaded GeoLite2-ASN database"; \
-    else echo "Error: MAXMIND_LICENSE_KEY required" && exit 1; fi
+RUN if [ -z "$MAXMIND_LICENSE_KEY" ]; then \
+        echo "ERROR: MAXMIND_LICENSE_KEY build arg is required." && \
+        echo "  Pass a valid MaxMind license key for full scoring." && \
+        echo "  Pass 'skip' to opt into degraded scoring mode (no GeoIP)." && \
+        exit 1; \
+    elif [ "$MAXMIND_LICENSE_KEY" = "skip" ]; then \
+        echo "WARNING: MAXMIND_LICENSE_KEY=skip, GeoIP databases skipped (degraded scoring mode)"; \
+    else \
+        curl -fsSL "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz" | \
+        tar -xzf - --strip-components=1 -C /app --wildcards "*/GeoLite2-City.mmdb" && \
+        echo "Downloaded GeoLite2-City database" && \
+        curl -fsSL "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-ASN&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz" | \
+        tar -xzf - --strip-components=1 -C /app --wildcards "*/GeoLite2-ASN.mmdb" && \
+        echo "Downloaded GeoLite2-ASN database" \
+        || echo "WARNING: GeoIP database download failed (degraded scoring mode)"; \
+    fi
 
 # Copy installed packages from builder
 COPY --from=builder /install /usr/local
@@ -47,7 +55,7 @@ COPY *.py .
 COPY --from=builder /app/gateway_queries_pb2.py .
 
 # Run as non-root user
-RUN useradd -m appuser && chown appuser:appuser /app/*.mmdb
+RUN useradd -m appuser
 USER appuser
 
 # Entry point

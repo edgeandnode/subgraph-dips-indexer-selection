@@ -1,23 +1,28 @@
-"""
-Entry point for the score computation CronJob.
+"""Score computation service.
 
-This script:
-1. Validates configuration (fail-fast)
-2. Checks if scores have already been computed today (idempotency)
-3. Fetches raw data from Redpanda
-4. Runs linear regression and computes all metrics
-5. Pre-normalizes static metrics
-6. Writes results to a JSON file on the shared PVC
+Long-running service that periodically computes indexer quality scores.
+When the full scoring pipeline can't run (no GeoIP databases, insufficient
+Redpanda data), falls back to degraded mode: equal quality metrics with
+real pricing data from indexer /dips/info endpoints.
+
+HTTP endpoints:
+  POST /run    -- trigger immediate scoring run
+  GET /health  -- healthcheck (503 until first scores written)
+  GET /status  -- last run info and next scheduled run
 """
 
+import json
 import logging
 import os
 import resource
+import signal
 import sys
+import threading
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from processing import compute_all_scores, validate_geoip_databases
+from processing import compute_all_scores, compute_degraded_scores, validate_geoip_databases
 from redpanda import RedpandaProvider
 
 logging.basicConfig(
@@ -29,6 +34,10 @@ logger = logging.getLogger(__name__)
 # Configuration from environment
 NUM_DAYS = int(os.environ.get("NUM_DAYS", "28"))
 TARGET_ROWS = int(os.environ.get("TARGET_ROWS", "20000000"))
+SCORING_INTERVAL = int(os.environ.get("SCORING_INTERVAL", "86400"))
+HTTP_PORT = int(os.environ.get("SCORING_HTTP_PORT", "9090"))
+SCORES_FILE_PATH = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_scores.json")
+GRAPH_NETWORK_SUBGRAPH_URL = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
 
 
 class ConfigurationError(Exception):
@@ -37,11 +46,38 @@ class ConfigurationError(Exception):
     pass
 
 
+# Scoring modes
+MODE_FULL = "full"
+MODE_DEGRADED = "degraded"
+MODE_FAILED = "failed"
+
+# Shared state
+_status_lock = threading.Lock()
+_last_run: dict = {}
+_next_run_time: datetime | None = None
+_consecutive_degraded: int = 0
+_consecutive_failed: int = 0
+_run_event = threading.Event()
+_shutdown = threading.Event()
+
+# After this many consecutive non-full runs, /health returns 503
+DEGRADED_THRESHOLD = int(os.environ.get("DEGRADED_ALERT_THRESHOLD", "3"))
+
+
+def _handle_signal(signum, frame):
+    logger.info(f"Received signal {signum}, shutting down")
+    _shutdown.set()
+    _run_event.set()
+
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT, _handle_signal)
+
+
 def validate_configuration() -> None:
-    """Validate all required configuration before starting expensive operations.
+    """Validate required configuration before starting.
 
     Raises ConfigurationError if any required config is missing or invalid.
-    This implements fail-fast principle - better to fail in 1 second than 30 minutes.
     """
     errors = []
 
@@ -64,19 +100,172 @@ def validate_configuration() -> None:
 
 def get_peak_memory_mb() -> float:
     """Get peak memory usage in MB."""
-    # ru_maxrss is in bytes on Linux, KB on macOS
     usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     if sys.platform == "darwin":
-        return usage / 1024 / 1024  # macOS: bytes -> MB
-    return usage / 1024  # Linux: KB -> MB
+        return usage / 1024 / 1024
+    return usage / 1024
+
+
+def run_scoring() -> bool:
+    """Run one scoring cycle. Returns True on success."""
+    global _consecutive_degraded, _consecutive_failed
+
+    pipeline_start = time.time()
+    logger.info("Starting score computation")
+
+    geoip_available = validate_geoip_databases()
+    if not geoip_available:
+        logger.warning("GeoIP databases unavailable, full pipeline disabled")
+
+    provider = RedpandaProvider()
+    scores_df = None
+    mode = MODE_FAILED
+
+    if geoip_available:
+        try:
+            end_date = date.today()
+            start_date = end_date - timedelta(days=NUM_DAYS)
+            start_ts = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            logger.info(f"Attempting full pipeline for {start_date} to {end_date}")
+            scores_df = compute_all_scores(
+                provider=provider,
+                start_date=start_date,
+                start_ts=start_ts,
+                num_days=NUM_DAYS,
+                target_rows=TARGET_ROWS,
+            )
+            if scores_df.empty:
+                logger.warning("Full pipeline returned empty results")
+                scores_df = None
+            else:
+                mode = MODE_FULL
+        except Exception as e:
+            logger.warning(f"Full pipeline failed: {e}")
+            scores_df = None
+
+    if scores_df is None:
+        logger.info("Running degraded scoring (equal quality + real pricing)")
+        try:
+            scores_df = compute_degraded_scores(GRAPH_NETWORK_SUBGRAPH_URL)
+            if scores_df is not None and not scores_df.empty:
+                mode = MODE_DEGRADED
+            else:
+                scores_df = None
+        except Exception as e:
+            logger.exception(f"Degraded scoring also failed: {e}")
+            scores_df = None
+
+    elapsed = time.time() - pipeline_start
+    success = scores_df is not None and not scores_df.empty
+
+    if success:
+        provider.write_scores(scores_df)
+
+    # Track consecutive non-full runs (under lock — health endpoint reads these)
+    with _status_lock:
+        if mode == MODE_FULL:
+            _consecutive_degraded = 0
+            _consecutive_failed = 0
+        elif mode == MODE_DEGRADED:
+            _consecutive_degraded += 1
+            _consecutive_failed = 0
+        else:
+            _consecutive_failed += 1
+            _consecutive_degraded = 0
+
+        _last_run.update({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "success": success,
+            "indexers": len(scores_df) if success else 0,
+            "elapsed_seconds": round(elapsed, 1),
+            "mode": mode,
+            "consecutive_degraded": _consecutive_degraded,
+            "consecutive_failed": _consecutive_failed,
+        })
+
+    # Log outside the lock
+    if mode == MODE_DEGRADED:
+        if _consecutive_degraded >= DEGRADED_THRESHOLD:
+            logger.error(
+                f"Scoring has been degraded for {_consecutive_degraded} consecutive runs. "
+                f"Full pipeline is not functioning — investigate GeoIP databases and Redpanda data availability."
+            )
+        else:
+            logger.warning(f"Scoring degraded ({_consecutive_degraded}/{DEGRADED_THRESHOLD} before alert)")
+    elif mode == MODE_FAILED:
+        logger.error(f"Scoring failed completely for {_consecutive_failed} consecutive runs")
+
+    logger.info(
+        f"Scoring complete: mode={mode}, indexers={len(scores_df) if success else 0}, "
+        f"elapsed={elapsed:.1f}s, peak_memory={get_peak_memory_mb():.0f}MB"
+    )
+
+    return success
+
+
+class RequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            if not os.path.exists(SCORES_FILE_PATH):
+                self._json_response(503, {"status": "waiting_for_first_run"})
+                return
+            with _status_lock:
+                degraded = _consecutive_degraded
+                failed = _consecutive_failed
+            if failed > 0:
+                self._json_response(503, {
+                    "status": "failing",
+                    "consecutive_failed": failed,
+                })
+            elif degraded >= DEGRADED_THRESHOLD:
+                self._json_response(200, {
+                    "status": "degraded",
+                    "consecutive_degraded": degraded,
+                    "message": "Full pipeline not functioning, serving degraded scores",
+                })
+            else:
+                self._json_response(200, {"status": "ok"})
+        elif self.path == "/status":
+            with _status_lock:
+                status = {
+                    "last_run": dict(_last_run),
+                    "next_run_time": _next_run_time.isoformat() if _next_run_time else None,
+                    "scoring_interval_seconds": SCORING_INTERVAL,
+                    "consecutive_degraded": _consecutive_degraded,
+                    "consecutive_failed": _consecutive_failed,
+                    "degraded_threshold": DEGRADED_THRESHOLD,
+                }
+            self._json_response(200, status)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/run":
+            _run_event.set()
+            self._json_response(202, {"status": "run_triggered"})
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _json_response(self, code: int, body: dict):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+
+    def log_message(self, format, *args):
+        pass
 
 
 def main() -> int:
-    """Main entry point for the score computation job."""
-    pipeline_start = time.time()
-    logger.info("Starting score computation job")
+    """Main entry point for the score computation service."""
+    global _next_run_time
+
     logger.info(
-        f"Configuration: num_days={NUM_DAYS}, target_rows={TARGET_ROWS}"
+        f"Score computation service starting "
+        f"(interval={SCORING_INTERVAL}s, http_port={HTTP_PORT})"
     )
 
     try:
@@ -84,54 +273,32 @@ def main() -> int:
     except ConfigurationError:
         return 1
 
-    try:
-        validate_geoip_databases()
-    except FileNotFoundError as e:
-        logger.error(f"GeoIP database validation failed: {e}")
-        return 1
+    # Start HTTP server in background thread
+    server = HTTPServer(("0.0.0.0", HTTP_PORT), RequestHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    logger.info(f"HTTP server listening on port {HTTP_PORT}")
 
-    provider = RedpandaProvider()
+    # Initial scoring run
+    run_scoring()
 
-    # Check idempotency — skip if already computed today.
-    if provider.scores_exist_for_today():
-        logger.info("Scores already computed for today, skipping")
-        return 0
+    # Scheduling loop — runs until shutdown signal
+    while not _shutdown.is_set():
+        _next_run_time = datetime.now(timezone.utc) + timedelta(seconds=SCORING_INTERVAL)
+        triggered = _run_event.wait(timeout=SCORING_INTERVAL)
 
-    end_date = date.today()
-    start_date = end_date - timedelta(days=NUM_DAYS)
-    start_ts = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if _shutdown.is_set():
+            break
 
-    logger.info(f"Computing scores for period: {start_date} to {end_date}")
+        if triggered:
+            _run_event.clear()
+            logger.info("Manual scoring run triggered via HTTP")
 
-    try:
-        scores_df = compute_all_scores(
-            provider=provider,
-            start_date=start_date,
-            start_ts=start_ts,
-            num_days=NUM_DAYS,
-            target_rows=TARGET_ROWS,
-        )
+        run_scoring()
 
-        if scores_df.empty:
-            logger.warning("No scores computed - empty result")
-            return 1
-
-        logger.info(f"Computed scores for {len(scores_df)} indexers")
-
-        provider.write_scores(scores_df)
-
-        elapsed = time.time() - pipeline_start
-        logger.info(
-            f"Pipeline completed in {elapsed:.1f}s ({elapsed/60:.1f}m), "
-            f"peak memory: {get_peak_memory_mb():.0f} MB"
-        )
-        return 0
-
-    except Exception as e:
-        elapsed = time.time() - pipeline_start
-        logger.exception(f"Failed to compute scores after {elapsed:.1f}s: {e}")
-        logger.info(f"Peak memory at failure: {get_peak_memory_mb():.0f} MB")
-        return 1
+    server.shutdown()
+    logger.info("Score computation service stopped")
+    return 0
 
 
 if __name__ == "__main__":
