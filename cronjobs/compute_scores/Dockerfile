@@ -37,7 +37,7 @@ RUN if [ -n "$MAXMIND_LICENSE_KEY" ]; then \
     curl -fsSL "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-ASN&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz" | \
     tar -xzf - --strip-components=1 -C /app --wildcards "*/GeoLite2-ASN.mmdb" && \
     echo "Downloaded GeoLite2-ASN database"; \
-    else echo "Error: MAXMIND_LICENSE_KEY required" && exit 1; fi
+    else echo "MAXMIND_LICENSE_KEY not set, GeoIP databases skipped (degraded scoring mode)"; fi
 
 # Copy installed packages from builder
 COPY --from=builder /install /usr/local
@@ -47,7 +47,7 @@ COPY *.py .
 COPY --from=builder /app/gateway_queries_pb2.py .
 
 # Run as non-root user
-RUN useradd -m appuser && chown appuser:appuser /app/*.mmdb
+RUN useradd -m appuser
 USER appuser
 
 # Entry point

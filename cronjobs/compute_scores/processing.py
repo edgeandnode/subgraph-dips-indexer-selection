@@ -24,6 +24,7 @@ import geoip2.database
 import geoip2.errors
 import numpy as np
 import pandas as pd
+import requests
 from numpy.linalg import pinv
 from scipy.stats import t
 from sklearn.compose import ColumnTransformer
@@ -52,11 +53,11 @@ _geoip_city_reader: Optional[geoip2.database.Reader] = None
 _geoip_asn_reader: Optional[geoip2.database.Reader] = None
 
 
-def validate_geoip_databases() -> None:
+def validate_geoip_databases() -> bool:
     """Validate that GeoIP databases exist and are readable.
 
-    This is a fail-fast check that runs before expensive operations.
-    Raises FileNotFoundError if databases are missing or unreadable.
+    Returns True if databases are available, False otherwise.
+    Logs warnings for missing or unreadable databases instead of raising.
     """
     errors = []
 
@@ -83,11 +84,12 @@ def validate_geoip_databases() -> None:
             errors.append(f"GeoLite2-ASN database unreadable: {e}")
 
     if errors:
-        raise FileNotFoundError(
-            "GeoIP database validation failed:\n  - " + "\n  - ".join(errors)
-        )
+        for error in errors:
+            logger.warning(f"GeoIP validation: {error}")
+        return False
 
     logger.info("GeoIP database validation passed")
+    return True
 
 
 def get_geoip_city_reader() -> geoip2.database.Reader:
@@ -1060,3 +1062,63 @@ def merge_and_prepare_dataframes(
     merged["avg_sync_duration"] = np.nan
 
     return merged
+
+
+def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
+    """Produce scores with equal quality metrics and real pricing from /dips/info.
+
+    Used when the full scoring pipeline can't run (no GeoIP databases,
+    insufficient Redpanda data). Discovers indexers from the network subgraph,
+    fetches pricing from each indexer's /dips/info endpoint, and returns a
+    scores DataFrame with uniform quality metrics and real per-indexer pricing.
+    """
+    indexer_urls = discover_indexers_from_network_subgraph(graph_network_subgraph_url)
+    if not indexer_urls:
+        return pd.DataFrame()
+
+    dips_info_df = fetch_dips_info(indexer_urls)
+    now = datetime.now(timezone.utc)
+
+    scores = pd.DataFrame({
+        "indexer": list(indexer_urls.keys()),
+        "url": list(indexer_urls.values()),
+    })
+
+    # Equal quality metrics — all indexers treated identically
+    scores["lat_lin_reg_coefficient"] = 0.0
+    scores["lat_coefficient_std_error"] = 0.0
+    scores["lat_coefficient_upper_bound"] = 0.0
+    scores["lat_normalized_score"] = 0.5
+    scores["uptime_score"] = 0.5
+    scores["observed_duration_seconds"] = None
+    scores["uptime_duration_seconds"] = None
+    scores["success_rate"] = 0.5
+    scores["stake_to_fees"] = None
+    scores["stake_to_fees_iqr_deviation"] = None
+    scores["norm_uptime_score"] = 0.5
+    scores["norm_success_rate"] = 0.5
+    scores["norm_stake_to_fees"] = 0.5
+    scores["org"] = None
+    scores["dst_lat"] = None
+    scores["dst_lon"] = None
+    scores["existing_dips_agreements"] = 0
+    scores["avg_sync_duration"] = None
+    scores["computed_at"] = now
+    scores["query_count"] = 0
+
+    # Merge real pricing data from /dips/info
+    if not dips_info_df.empty:
+        scores = pd.merge(scores, dips_info_df, on="indexer", how="left")
+        scores["dips_info_available"] = scores["dips_info_available"].fillna(False)
+    else:
+        scores["dips_info_available"] = False
+        scores["dips_min_grt_per_30_days"] = "{}"
+        scores["dips_min_grt_per_billion_entities_per_30_days"] = None
+        scores["dips_supported_networks"] = "[]"
+
+    available = scores["dips_info_available"].sum() if "dips_info_available" in scores.columns else 0
+    logger.info(
+        f"Degraded scoring complete: {len(scores)} indexers, "
+        f"{available} with pricing data"
+    )
+    return scores
