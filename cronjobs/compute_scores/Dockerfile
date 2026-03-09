@@ -29,9 +29,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Download MaxMind GeoLite2 databases
 # Attribution: This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com
-ARG MAXMIND_LICENSE_KEY
-RUN if [ -z "$MAXMIND_LICENSE_KEY" ]; then \
-        echo "WARNING: MAXMIND_LICENSE_KEY not set, GeoIP databases skipped (degraded scoring mode)"; \
+ARG MAXMIND_LICENSE_KEY=UNSET
+RUN if [ "$MAXMIND_LICENSE_KEY" = "UNSET" ]; then \
+        echo "ERROR: MAXMIND_LICENSE_KEY build arg is required." && \
+        echo "  Use a valid key for full scoring, or pass empty string for degraded mode:" && \
+        echo "  --build-arg MAXMIND_LICENSE_KEY=\"\"" && \
+        exit 1; \
+    elif [ -z "$MAXMIND_LICENSE_KEY" ]; then \
+        echo "WARNING: MAXMIND_LICENSE_KEY is empty, GeoIP databases skipped (degraded scoring mode)"; \
     else \
         curl -fsSL "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz" | \
         tar -xzf - --strip-components=1 -C /app --wildcards "*/GeoLite2-City.mmdb" && \
