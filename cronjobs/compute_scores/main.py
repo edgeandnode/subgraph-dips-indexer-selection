@@ -48,6 +48,7 @@ class ConfigurationError(Exception):
 
 # Scoring modes
 MODE_FULL = "full"
+MODE_PARTIAL = "partial"
 MODE_DEGRADED = "degraded"
 MODE_FAILED = "failed"
 
@@ -55,6 +56,7 @@ MODE_FAILED = "failed"
 _status_lock = threading.Lock()
 _last_run: dict = {}
 _next_run_time: datetime | None = None
+_consecutive_partial: int = 0
 _consecutive_degraded: int = 0
 _consecutive_failed: int = 0
 _run_event = threading.Event()
@@ -108,42 +110,44 @@ def get_peak_memory_mb() -> float:
 
 def run_scoring() -> bool:
     """Run one scoring cycle. Returns True on success."""
-    global _consecutive_degraded, _consecutive_failed
+    global _consecutive_partial, _consecutive_degraded, _consecutive_failed
 
     pipeline_start = time.time()
     logger.info("Starting score computation")
 
     geoip_available = validate_geoip_databases()
     if not geoip_available:
-        logger.warning("GeoIP databases unavailable, full pipeline disabled")
+        logger.warning("GeoIP databases unavailable, latency scores will be neutral")
 
     provider = RedpandaProvider()
     scores_df = None
     mode = MODE_FAILED
 
-    if geoip_available:
-        try:
-            end_date = date.today()
-            start_date = end_date - timedelta(days=NUM_DAYS)
-            start_ts = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Always attempt compute_all_scores — it handles both full and partial (no GeoIP) modes
+    try:
+        end_date = date.today()
+        start_date = end_date - timedelta(days=NUM_DAYS)
+        start_ts = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-            logger.info(f"Attempting full pipeline for {start_date} to {end_date}")
-            scores_df = compute_all_scores(
-                provider=provider,
-                start_date=start_date,
-                start_ts=start_ts,
-                num_days=NUM_DAYS,
-                target_rows=TARGET_ROWS,
-            )
-            if scores_df.empty:
-                logger.warning("Full pipeline returned empty results")
-                scores_df = None
-            else:
-                mode = MODE_FULL
-        except Exception as e:
-            logger.warning(f"Full pipeline failed: {e}")
+        logger.info(f"Attempting {'full' if geoip_available else 'partial (no GeoIP)'} pipeline for {start_date} to {end_date}")
+        scores_df = compute_all_scores(
+            provider=provider,
+            start_date=start_date,
+            start_ts=start_ts,
+            num_days=NUM_DAYS,
+            target_rows=TARGET_ROWS,
+            geoip_available=geoip_available,
+        )
+        if scores_df.empty:
+            logger.warning("Pipeline returned empty results")
             scores_df = None
+        else:
+            mode = MODE_FULL if geoip_available else MODE_PARTIAL
+    except Exception as e:
+        logger.warning(f"Pipeline failed: {e}")
+        scores_df = None
 
+    # Degraded fallback: equal quality metrics + real pricing (no Redpanda data needed)
     if scores_df is None:
         logger.info("Running degraded scoring (equal quality + real pricing)")
         try:
@@ -165,14 +169,21 @@ def run_scoring() -> bool:
     # Track consecutive non-full runs (under lock — health endpoint reads these)
     with _status_lock:
         if mode == MODE_FULL:
+            _consecutive_partial = 0
+            _consecutive_degraded = 0
+            _consecutive_failed = 0
+        elif mode == MODE_PARTIAL:
+            _consecutive_partial += 1
             _consecutive_degraded = 0
             _consecutive_failed = 0
         elif mode == MODE_DEGRADED:
+            _consecutive_partial = 0
             _consecutive_degraded += 1
             _consecutive_failed = 0
         else:
-            _consecutive_failed += 1
+            _consecutive_partial = 0
             _consecutive_degraded = 0
+            _consecutive_failed += 1
 
         _last_run.update({
             "time": datetime.now(timezone.utc).isoformat(),
@@ -180,12 +191,18 @@ def run_scoring() -> bool:
             "indexers": len(scores_df) if success else 0,
             "elapsed_seconds": round(elapsed, 1),
             "mode": mode,
+            "consecutive_partial": _consecutive_partial,
             "consecutive_degraded": _consecutive_degraded,
             "consecutive_failed": _consecutive_failed,
         })
 
     # Log outside the lock
-    if mode == MODE_DEGRADED:
+    if mode == MODE_PARTIAL:
+        logger.warning(
+            f"Scoring ran without GeoIP ({_consecutive_partial} consecutive partial run(s)). "
+            f"Latency scores are neutral (0.5). Install MaxMind GeoLite2 databases for full scoring."
+        )
+    elif mode == MODE_DEGRADED:
         if _consecutive_degraded >= DEGRADED_THRESHOLD:
             logger.error(
                 f"Scoring has been degraded for {_consecutive_degraded} consecutive runs. "
@@ -232,6 +249,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "last_run": dict(_last_run),
                     "next_run_time": _next_run_time.isoformat() if _next_run_time else None,
                     "scoring_interval_seconds": SCORING_INTERVAL,
+                    "consecutive_partial": _consecutive_partial,
                     "consecutive_degraded": _consecutive_degraded,
                     "consecutive_failed": _consecutive_failed,
                     "degraded_threshold": DEGRADED_THRESHOLD,

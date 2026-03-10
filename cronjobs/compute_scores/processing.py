@@ -292,17 +292,21 @@ def compute_all_scores(
     start_ts: str,
     num_days: int,
     target_rows: int,
+    geoip_available: bool = True,
 ) -> pd.DataFrame:
     """
     Compute all indexer scores and return as a DataFrame.
 
     This is the main orchestration function that:
     1. Fetches raw data from the configured provider
-    2. Resolves GeoIP for indexers
-    3. Runs latency linear regression
+    2. Resolves GeoIP for indexers (when available)
+    3. Runs latency linear regression (when GeoIP available)
     4. Computes uptime, success rate, stake-to-fees
     5. Pre-normalizes static metrics
     6. Returns a DataFrame matching the indexer_scores schema
+
+    When geoip_available=False, latency scores are set to neutral (0.5) while
+    uptime, success rate, and stake-to-fees are computed from real Redpanda data.
     """
     # Fetch initial query results to determine sampling
     initial_query_results = provider.fetch_initial_query_results(start_date, num_days)
@@ -313,102 +317,111 @@ def compute_all_scores(
         start_date, num_days, target_rows_per_subgraph
     )
 
-    # Get unique indexers and resolve GeoIP
-    indexers_df = resolve_indexer_geoip(combined_queries)
-
-    # Merge indexer info into combined queries
-    combined_queries = merge_in_indexers_info(combined_queries, indexers_df)
-
-    # Merge in query geolocation info (IATA codes)
-    combined_queries = merge_in_query_geolocation_info(combined_queries)
+    if geoip_available:
+        # Full path: resolve GeoIP and merge into queries
+        indexers_df = resolve_indexer_geoip(combined_queries)
+        combined_queries = merge_in_indexers_info(combined_queries, indexers_df)
+        combined_queries = merge_in_query_geolocation_info(combined_queries)
+    else:
+        # No GeoIP: add expected columns as NaN so downstream functions don't crash
+        logger.warning("GeoIP unavailable, skipping geo resolution. Latency scores will be neutral.")
+        for col in ["dst_lat", "dst_lon", "dst_country", "org", "ip_addr"]:
+            combined_queries[col] = np.nan
+        combined_queries["indexer_network"] = "arbitrum"
+        # Source geo columns from merge_in_query_geolocation_info
+        combined_queries["IATA_code"] = combined_queries["query_id"].str[-3:]
+        for col in ["src_lat", "src_lon", "src_country"]:
+            combined_queries[col] = np.nan
 
     # Save data for uptime calculations before filtering
     data_for_uptime = combined_queries[["indexer", "status", "timestamp"]].copy()
 
-    # Calculate distances
-    combined_queries = calculate_distances(combined_queries)
+    if geoip_available:
+        # Full path: distance calculation, regression, fail-fast checks
+        combined_queries = calculate_distances(combined_queries)
 
-    # Filter to successful queries for regression
-    logger.info(f"Before filter_successful_queries: {len(combined_queries)} rows")
-    dst_lat_nan_count = combined_queries["dst_lat"].isna().sum()
-    logger.info(f"  src_lat NaN: {combined_queries['src_lat'].isna().sum()}, dst_lat NaN: {dst_lat_nan_count}")
+        logger.info(f"Before filter_successful_queries: {len(combined_queries)} rows")
+        dst_lat_nan_count = combined_queries["dst_lat"].isna().sum()
+        logger.info(f"  src_lat NaN: {combined_queries['src_lat'].isna().sum()}, dst_lat NaN: {dst_lat_nan_count}")
 
-    # Fail-fast: if ALL dst_lat values are NaN, GeoIP resolution failed completely
-    if dst_lat_nan_count == len(combined_queries):
-        raise RuntimeError(
-            "All dst_lat values are NaN - GeoIP resolution failed for all indexers. "
-            "This typically means the GeoLite2 databases are missing or corrupt. "
-            "Check that the MaxMind .mmdb files are bundled in the Docker image."
+        if dst_lat_nan_count == len(combined_queries):
+            raise RuntimeError(
+                "All dst_lat values are NaN - GeoIP resolution failed for all indexers. "
+                "This typically means the GeoLite2 databases are missing or corrupt. "
+                "Check that the MaxMind .mmdb files are bundled in the Docker image."
+            )
+
+        combined_queries_filtered = filter_successful_queries(combined_queries)
+        logger.info(f"After filter_successful_queries: {len(combined_queries_filtered)} rows")
+
+        predictor = ["response_time_ms"]
+        categorical = ["indexer", "deployment_hash", "indexer_network", "query_id"]
+        numeric = ["distance_miles", "fee"]
+
+        filtered_data = combined_queries_filtered[predictor + categorical + numeric]
+        logger.info(f"After column selection: {len(filtered_data)} rows")
+        logger.info(f"  NaN counts - distance_miles: {filtered_data['distance_miles'].isna().sum()}, fee: {filtered_data['fee'].isna().sum()}")
+        filtered_data = filtered_data.dropna(subset=numeric)
+        logger.info(f"After dropna(numeric): {len(filtered_data)} rows")
+
+        if len(filtered_data) == 0:
+            raise RuntimeError(
+                "No rows remain after dropping NaN values in numeric columns (distance_miles, fee). "
+                "This typically means GeoIP resolution failed (all distances are NaN) or "
+                "there's a data quality issue with the source tables."
+            )
+
+        filtered_data = iterative_filter(
+            filtered_data,
+            ITERATIVE_FILTER_MIN_DEPLOYMENT_INDEXERS,
+            ITERATIVE_FILTER_MIN_DEPLOYMENTS_PER_INDEXER,
+            ITERATIVE_FILTER_MIN_QUERIES_PER_INDEXER,
+            ITERATIVE_FILTER_MIN_QUERIES_PER_DEPLOYMENT,
         )
 
-    combined_queries_filtered = filter_successful_queries(combined_queries)
-    logger.info(f"After filter_successful_queries: {len(combined_queries_filtered)} rows")
+        if len(filtered_data) == 0:
+            raise RuntimeError(
+                "No rows remain after iterative filtering. Either the data volume is too low "
+                "or the filter thresholds are too strict for the current dataset."
+            )
 
-    # Prepare for regression
-    predictor = ["response_time_ms"]
-    categorical = ["indexer", "deployment_hash", "indexer_network", "query_id"]
-    numeric = ["distance_miles", "fee"]
+        filtered_data, integer_root = strategic_sample(filtered_data, target_rows_per_subgraph)
+        filtered_data = hash_sampled_queries(filtered_data, integer_root)
 
-    filtered_data = combined_queries_filtered[predictor + categorical + numeric]
-    logger.info(f"After column selection: {len(filtered_data)} rows")
-    logger.info(f"  NaN counts - distance_miles: {filtered_data['distance_miles'].isna().sum()}, fee: {filtered_data['fee'].isna().sum()}")
-    filtered_data = filtered_data.dropna(subset=numeric)
-    logger.info(f"After dropna(numeric): {len(filtered_data)} rows")
+        categorical = [
+            "indexer",
+            "deployment_hash",
+            "indexer_network",
+            "sampled_query_id_hashed_mod_integer_root",
+        ]
 
-    # Fail-fast: if no rows remain after dropping NaN, something is wrong with the data
-    if len(filtered_data) == 0:
-        raise RuntimeError(
-            "No rows remain after dropping NaN values in numeric columns (distance_miles, fee). "
-            "This typically means GeoIP resolution failed (all distances are NaN) or "
-            "there's a data quality issue with the source tables."
+        latency_rankings, latency_results = perform_latency_linear_regression(
+            filtered_data, predictor, categorical, numeric
         )
+        indexer_query_count = filtered_data.groupby("indexer").size().reset_index(name="query_count")
+    else:
+        # No GeoIP: synthetic neutral latency rankings for all indexers
+        unique_indexers = combined_queries["indexer"].unique()
+        latency_rankings = pd.DataFrame({
+            "indexer": unique_indexers,
+            "Latency Coefficient": 0.0,
+            "Standard Error": 0.0,
+            "p-value": 1.0,
+            "Latency Coefficient + Error Confidence Interval": 0.0,
+            "Robust Normalized Latency Coefficient + Error Confidence Interval": 0.0,
+        })
+        indexer_query_count = pd.DataFrame({
+            "indexer": unique_indexers,
+            "query_count": 0,
+        })
 
-    # Apply iterative filtering
-    filtered_data = iterative_filter(
-        filtered_data,
-        ITERATIVE_FILTER_MIN_DEPLOYMENT_INDEXERS,
-        ITERATIVE_FILTER_MIN_DEPLOYMENTS_PER_INDEXER,
-        ITERATIVE_FILTER_MIN_QUERIES_PER_INDEXER,
-        ITERATIVE_FILTER_MIN_QUERIES_PER_DEPLOYMENT,
-    )
-
-    # Fail-fast: if iterative filtering removed all data, thresholds may be too strict
-    if len(filtered_data) == 0:
-        raise RuntimeError(
-            "No rows remain after iterative filtering. Either the data volume is too low "
-            "or the filter thresholds are too strict for the current dataset."
-        )
-
-    # Strategic sampling
-    filtered_data, integer_root = strategic_sample(filtered_data, target_rows_per_subgraph)
-
-    # Hash sampled queries
-    filtered_data = hash_sampled_queries(filtered_data, integer_root)
-
-    categorical = [
-        "indexer",
-        "deployment_hash",
-        "indexer_network",
-        "sampled_query_id_hashed_mod_integer_root",
-    ]
-
-    # Perform latency linear regression
-    latency_rankings, latency_results = perform_latency_linear_regression(
-        filtered_data, predictor, categorical, numeric
-    )
-
-    # Calculate per-indexer query count (queries used in regression for each indexer)
-    indexer_query_count = filtered_data.groupby("indexer").size().reset_index(name="query_count")
-
-    # Calculate other metrics
+    # GeoIP-independent metrics: always computed from real Redpanda data
     indexer_success_rate = calculate_indexer_success_rate(combined_queries)
     indexer_uptime = calculate_indexer_uptime(data_for_uptime)
 
-    # Fetch and calculate stake-to-fees
     stake_to_fees_raw = provider.fetch_stake_to_fees(start_ts)
     stake_to_fees = calculate_indexer_stake_to_fees(stake_to_fees_raw)
 
-    # Aggregate indexer info (org, location)
     agg_df = aggregate_indexer_info(combined_queries)
 
     # Merge all data together
@@ -419,6 +432,7 @@ def compute_all_scores(
         indexer_success_rate,
         stake_to_fees,
         indexer_query_count,
+        drop_missing_latency=geoip_available,
     )
 
     # Fetch DIP pricing info from indexers.
@@ -438,8 +452,9 @@ def compute_all_scores(
 
     # Transform to indexer_scores schema with pre-normalized values
     scores_df = transform_to_scores_schema(merged)
+    scores_df["scoring_mode"] = "full" if geoip_available else "partial_no_geoip"
 
-    logger.info(f"Score computation complete: {len(scores_df)} indexers, columns: {list(scores_df.columns)}")
+    logger.info(f"Score computation complete: {len(scores_df)} indexers, mode={'full' if geoip_available else 'partial'}, columns: {list(scores_df.columns)}")
     return scores_df
 
 
@@ -1037,17 +1052,24 @@ def merge_and_prepare_dataframes(
     indexer_success_rate: pd.DataFrame,
     stake_to_fees: pd.DataFrame,
     indexer_query_count: pd.DataFrame,
+    drop_missing_latency: bool = True,
 ) -> pd.DataFrame:
-    """Merge all indexer data into a single DataFrame."""
+    """Merge all indexer data into a single DataFrame.
+
+    When drop_missing_latency=True (full GeoIP mode), drops rows where latency
+    columns are NaN. When False (partial mode with synthetic latency), skips
+    the dropna since synthetic values have no NaN by construction.
+    """
     merged = pd.merge(indexer_uptime, indexer_rankings, on="indexer", how="left")
 
     columns_to_drop = ["observed_duration_full", "uptime_duration_full", "% up_y"]
     merged = merged.drop(columns=[c for c in columns_to_drop if c in merged.columns])
 
-    columns_to_check = ["Latency Coefficient", "Standard Error", "p-value"]
-    existing = [c for c in columns_to_check if c in merged.columns]
-    if existing:
-        merged = merged.dropna(subset=existing)
+    if drop_missing_latency:
+        columns_to_check = ["Latency Coefficient", "Standard Error", "p-value"]
+        existing = [c for c in columns_to_check if c in merged.columns]
+        if existing:
+            merged = merged.dropna(subset=existing)
 
     merged = pd.merge(merged, agg_df, on="indexer", how="left")
     merged = pd.merge(merged, indexer_success_rate, on="indexer", how="left")
