@@ -21,6 +21,7 @@ import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.request import Request, urlopen
 
 from processing import compute_all_scores, compute_degraded_scores, validate_geoip_databases
 from redpanda import RedpandaProvider
@@ -38,6 +39,7 @@ SCORING_INTERVAL = int(os.environ.get("SCORING_INTERVAL", "86400"))
 HTTP_PORT = int(os.environ.get("SCORING_HTTP_PORT", "9090"))
 SCORES_FILE_PATH = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_scores.json")
 GRAPH_NETWORK_SUBGRAPH_URL = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
+IISA_API_URL = os.environ.get("IISA_API_URL", "")
 
 
 class ConfigurationError(Exception):
@@ -108,6 +110,24 @@ def get_peak_memory_mb() -> float:
     return usage / 1024
 
 
+def _notify_iisa_refresh() -> None:
+    """POST to the IISA API /refresh endpoint so it reloads scores from disk.
+
+    Best-effort: logs a warning on failure but never raises.  Skipped entirely
+    when IISA_API_URL is not configured.
+    """
+    if not IISA_API_URL:
+        return
+    url = f"{IISA_API_URL.rstrip('/')}/refresh"
+    try:
+        req = Request(url, data=b"", method="POST")
+        with urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read())
+            logger.info(f"IISA refresh succeeded: {body}")
+    except Exception as e:
+        logger.warning(f"Failed to notify IISA at {url}: {e}")
+
+
 def run_scoring() -> bool:
     """Run one scoring cycle. Returns True on success."""
     global _consecutive_partial, _consecutive_degraded, _consecutive_failed
@@ -165,6 +185,7 @@ def run_scoring() -> bool:
 
     if success:
         provider.write_scores(scores_df)
+        _notify_iisa_refresh()
 
     # Track consecutive non-full runs (under lock — health endpoint reads these)
     with _status_lock:
@@ -285,6 +306,14 @@ def main() -> int:
         f"Score computation service starting "
         f"(interval={SCORING_INTERVAL}s, http_port={HTTP_PORT})"
     )
+
+    if IISA_API_URL:
+        logger.info(f"IISA API refresh enabled: {IISA_API_URL}")
+    else:
+        logger.warning(
+            "IISA_API_URL not set -- the IISA API will not be notified after "
+            "scores are written. Set IISA_API_URL to enable immediate score refresh."
+        )
 
     try:
         validate_configuration()
