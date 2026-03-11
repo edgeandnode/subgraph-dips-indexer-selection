@@ -110,11 +110,11 @@ def get_peak_memory_mb() -> float:
     return usage / 1024
 
 
-def _notify_iisa_refresh() -> None:
-    """POST to the IISA API /refresh endpoint so it reloads scores from disk.
+def _refresh_iisa_scores() -> None:
+    """Trigger the IISA API to reload scores from disk.
 
-    Best-effort: logs a warning on failure but never raises.  Skipped entirely
-    when IISA_API_URL is not configured.
+    Best-effort: logs a warning on failure but never raises.  Skipped when
+    IISA_API_URL is not configured.
     """
     if not IISA_API_URL:
         return
@@ -185,7 +185,7 @@ def run_scoring() -> bool:
 
     if success:
         provider.write_scores(scores_df)
-        _notify_iisa_refresh()
+        _refresh_iisa_scores()
 
     # Track consecutive non-full runs (under lock — health endpoint reads these)
     with _status_lock:
