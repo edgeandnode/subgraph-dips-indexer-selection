@@ -10,8 +10,10 @@ Endpoints:
 - POST /select-indexers - Select optimal indexers for a deployment
 """
 
+import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Optional
@@ -51,6 +53,7 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8080
     log_level: str = "INFO"
+    scores_reload_interval: int = 300  # seconds between file-mtime checks (fallback)
 
 
 @lru_cache
@@ -271,9 +274,37 @@ async def lifespan(app: FastAPI):
 
     logger.info("IISA service ready")
 
+    # Background task: periodically check if the scores file has been updated
+    # and reload when it changes.  This is a fallback mechanism -- the cronjob
+    # should also POST /refresh after writing scores for immediate freshness.
+    scores_path = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_scores.json")
+    reload_interval = settings.scores_reload_interval
+    logger.info(f"Scores auto-reload enabled: checking {scores_path} every {reload_interval}s")
+
+    async def _periodic_reload():
+        last_mtime: float = 0.0
+        try:
+            last_mtime = os.path.getmtime(scores_path)
+        except OSError:
+            pass
+
+        while True:
+            await asyncio.sleep(reload_interval)
+            try:
+                mtime = os.path.getmtime(scores_path)
+            except OSError:
+                continue
+            if mtime != last_mtime:
+                last_mtime = mtime
+                logger.info("Scores file changed on disk, reloading")
+                _state.refresh_data()
+
+    reload_task = asyncio.create_task(_periodic_reload())
+
     yield
 
     # Cleanup
+    reload_task.cancel()
     logger.info("Shutting down IISA service...")
 
 
