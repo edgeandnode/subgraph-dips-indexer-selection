@@ -497,6 +497,8 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     # Economic security metrics
     scores["stake_to_fees"] = merged.get("stake_to_fees")
     scores["stake_to_fees_iqr_deviation"] = merged.get("stake_to_fees_iqr_deviation")
+    scores["total_query_fees"] = merged.get("total_query_fees", 0.0)
+    scores["recent_slashable_stake"] = merged.get("recent_slashable_stake", 0.0)
 
     # Pre-normalized scores
     scores["norm_uptime_score"] = normalize_to_0_1(scores["uptime_score"])
@@ -510,8 +512,6 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     scores["dst_lat"] = merged.get("dst_lat")
     scores["dst_lon"] = merged.get("dst_lon")
 
-    # DIP agreement metrics (placeholders until data sources available - see #15)
-    scores["existing_dips_agreements"] = merged.get("existing_dips_agreements", 0)
     scores["avg_sync_duration"] = merged.get("avg_sync_duration")
 
     # DIP pricing info (fetched from indexer /dips/info endpoints)
@@ -1076,9 +1076,6 @@ def merge_and_prepare_dataframes(
     merged = pd.merge(merged, stake_to_fees, on="indexer", how="left")
     merged = pd.merge(merged, indexer_query_count, on="indexer", how="left")
 
-    # Add placeholder columns for metrics not yet populated from data sources
-    # These are required by DataProcessor for scoring
-    merged["existing_dips_agreements"] = 0
     merged["avg_sync_duration"] = np.nan
 
     return merged
@@ -1121,7 +1118,8 @@ def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
     scores["org"] = None
     scores["dst_lat"] = None
     scores["dst_lon"] = None
-    scores["existing_dips_agreements"] = 0
+    scores["total_query_fees"] = 0.0
+    scores["recent_slashable_stake"] = 0.0
     scores["avg_sync_duration"] = None
     scores["computed_at"] = now
     scores["query_count"] = 0

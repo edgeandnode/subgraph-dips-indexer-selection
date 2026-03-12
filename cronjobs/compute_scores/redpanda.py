@@ -239,7 +239,7 @@ class RedpandaProvider:
             df["recent_slashable_stake"] / df["total_query_fees"].replace(0.0, float("nan"))
         )
 
-        df = df[["indexer", "stake_to_fees"]]
+        df = df[["indexer", "stake_to_fees", "total_query_fees", "recent_slashable_stake"]]
         df.set_index("indexer", inplace=True)
 
         matched = df["stake_to_fees"].notna().sum()
