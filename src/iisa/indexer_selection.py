@@ -202,9 +202,9 @@ class DataProcessor:
             dips_adjustment = self.data["indexer"].map(self.optimistic_dips_fees).fillna(0.0)
             effective_fees = self.data["total_query_fees"].fillna(0.0) + dips_adjustment
 
-            if "recent_slashable_stake" in self.data.columns:
+            if "last_known_slashable_stake" in self.data.columns:
                 self.data["stake_to_fees"] = (
-                    self.data["recent_slashable_stake"]
+                    self.data["last_known_slashable_stake"]
                     / effective_fees.replace(0.0, float("nan"))
                 )
                 self.data["stake_to_fees_iqr_deviation"] = _calculate_iqr_deviation(
