@@ -226,7 +226,7 @@ class RedpandaProvider:
 
         df = pd.DataFrame(indexers)
         df = df.rename(columns={"id": "indexer"})
-        df["recent_slashable_stake"] = (
+        df["last_known_slashable_stake"] = (
             df["stakedTokens"].astype(float) - df["lockedTokens"].astype(float)
         )
 
@@ -236,10 +236,10 @@ class RedpandaProvider:
         # stake_to_fees = slashable_stake / total_fees. Indexers with zero fees
         # get NaN (division by zero produces NULL / NaN).
         df["stake_to_fees"] = (
-            df["recent_slashable_stake"] / df["total_query_fees"].replace(0.0, float("nan"))
+            df["last_known_slashable_stake"] / df["total_query_fees"].replace(0.0, float("nan"))
         )
 
-        df = df[["indexer", "stake_to_fees"]]
+        df = df[["indexer", "stake_to_fees", "total_query_fees", "last_known_slashable_stake"]]
         df.set_index("indexer", inplace=True)
 
         matched = df["stake_to_fees"].notna().sum()
