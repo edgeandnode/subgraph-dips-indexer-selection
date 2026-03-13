@@ -47,7 +47,7 @@ class WeightsDict(TypedDict, total=False):
     A dictionary containing weights for each metric used in the weighted score calculation.
     """
 
-    stake_to_fees_iqr_deviation: float
+    stake_to_fees: float
     base_price_per_epoch: float
     lat_lin_reg_coefficient: float
     uptime_score: float
@@ -59,7 +59,7 @@ DEFAULT_WEIGHTS = cast(
     WeightsDict,
     MappingProxyType(
         {
-            "stake_to_fees_iqr_deviation": 0.30,
+            "stake_to_fees": 0.30,
             "base_price_per_epoch": 0.25,
             "lat_lin_reg_coefficient": 0.20,
             "uptime_score": 0.15,
@@ -207,12 +207,9 @@ class DataProcessor:
                     self.data["last_known_slashable_stake"]
                     / effective_fees.replace(0.0, float("nan"))
                 )
-                self.data["stake_to_fees_iqr_deviation"] = _calculate_iqr_deviation(
-                    self.data["stake_to_fees"]
-                )
                 # Drop pre-normalised column so _normalize_metrics recomputes it
                 self.data.drop(
-                    columns=["norm_stake_to_fees_iqr_deviation"],
+                    columns=["norm_stake_to_fees"],
                     errors="ignore",
                     inplace=True,
                 )
@@ -630,23 +627,6 @@ class DataProcessor:
         )
         return None  # Only when truly zero candidates available
 
-def _calculate_iqr_deviation(series: pd.Series) -> pd.Series:
-    """
-    Calculate IQR-based deviation from median.
-
-    Returns (value - median) / IQR for each value in the series.
-    If IQR is zero, returns 0 for all values since there's no meaningful
-    deviation to measure.
-    """
-    median_val = series.median()
-    q1 = series.quantile(0.25)
-    q3 = series.quantile(0.75)
-    iqr = q3 - q1
-    if iqr == 0:
-        return pd.Series([0.0] * len(series), index=series.index)
-    return (series - median_val) / iqr
-
-
 def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize various metrics in the merged DataFrame to create comparable scores across different dimensions.
@@ -670,7 +650,7 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
         new_columns = [
             "norm_lat_lin_reg_coefficient",
             "norm_uptime_score",
-            "norm_stake_to_fees_iqr_deviation",
+            "norm_stake_to_fees",
             "norm_success_rate",
             "norm_base_price_per_epoch",
             "norm_price_per_entity",
@@ -697,14 +677,18 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
         else:
             merged["norm_uptime_score"] = np.nan
 
-    # Normalise stake to fees ratio
-    if "norm_stake_to_fees_iqr_deviation" not in merged.columns:
-        if "stake_to_fees_iqr_deviation" in merged.columns:
-            merged["norm_stake_to_fees_iqr_deviation"] = _normalize_generic(
-                merged["stake_to_fees_iqr_deviation"]
-            )  # higher is better
+    # Normalise stake to fees ratio (higher = more capacity = better).
+    # Indexers with zero fees get NaN (infinite ratio = maximum capacity).
+    # Fill NaN above the max finite value so they normalise to 1.0.
+    if "norm_stake_to_fees" not in merged.columns:
+        if "stake_to_fees" in merged.columns:
+            stf = merged["stake_to_fees"].copy()
+            finite_max = stf.max()
+            fill_value = (finite_max + 1.0) if pd.notna(finite_max) else 1.0
+            stf = stf.fillna(fill_value)
+            merged["norm_stake_to_fees"] = _normalize_generic(stf)
         else:
-            merged["norm_stake_to_fees_iqr_deviation"] = np.nan
+            merged["norm_stake_to_fees"] = np.nan
 
     # Normalise success rate score
     if "norm_success_rate" not in merged.columns:

@@ -122,7 +122,7 @@ class DataManager:
         - uptime_score (0-1) -> "% up_x" (0-100)
         - success_rate -> "average_status"
         - dst_lat, dst_lon -> "destination_loc"
-        - norm_stake_to_fees -> "norm_stake_to_fees_iqr_deviation"
+        - norm_stake_to_fees -> "norm_stake_to_fees"
         """
         df = scores_df.copy()
 
@@ -130,7 +130,6 @@ class DataManager:
         df = df.rename(columns={
             "lat_coefficient_upper_bound": "Latency Coefficient + Error Confidence Interval",
             "success_rate": "average_status",
-            "norm_stake_to_fees": "norm_stake_to_fees_iqr_deviation",
             "lat_normalized_score": "norm_lat_lin_reg_coefficient",
         })
 
