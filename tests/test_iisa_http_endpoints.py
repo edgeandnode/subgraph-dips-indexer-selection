@@ -357,7 +357,7 @@ def mock_history_df():
         "norm_lat_lin_reg_coefficient": [0.8, 0.9, 0.6],
         "norm_uptime_score": [0.9, 0.7, 0.95],
         "norm_success_rate": [0.85, 0.6, 0.9],
-        "norm_stake_to_fees_iqr_deviation": [0.5, 0.8, 0.65],
+        "norm_stake_to_fees": [0.5, 0.8, 0.65],
         "norm_base_price_per_epoch": [0.7, 0.8, 0.9],
         "norm_price_per_entity": [0.6, 0.7, 0.8],
         "existing_dips_agreements": [2, 1, 0],

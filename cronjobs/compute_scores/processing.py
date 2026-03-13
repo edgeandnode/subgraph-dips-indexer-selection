@@ -419,8 +419,7 @@ def compute_all_scores(
     indexer_success_rate = calculate_indexer_success_rate(combined_queries)
     indexer_uptime = calculate_indexer_uptime(data_for_uptime)
 
-    stake_to_fees_raw = provider.fetch_stake_to_fees(start_ts)
-    stake_to_fees = calculate_indexer_stake_to_fees(stake_to_fees_raw)
+    stake_to_fees = provider.fetch_stake_to_fees(start_ts)
 
     agg_df = aggregate_indexer_info(combined_queries)
 
@@ -496,16 +495,12 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
 
     # Economic security metrics
     scores["stake_to_fees"] = merged.get("stake_to_fees")
-    scores["stake_to_fees_iqr_deviation"] = merged.get("stake_to_fees_iqr_deviation")
     scores["total_query_fees"] = merged.get("total_query_fees", 0.0)
     scores["last_known_slashable_stake"] = merged.get("last_known_slashable_stake", 0.0)
 
     # Pre-normalized scores
     scores["norm_uptime_score"] = normalize_to_0_1(scores["uptime_score"])
     scores["norm_success_rate"] = normalize_to_0_1(scores["success_rate"])
-    scores["norm_stake_to_fees"] = normalize_iqr_to_0_1(
-        merged.get("stake_to_fees_iqr_deviation")
-    )
 
     # Organization/location
     scores["org"] = merged.get("org")
@@ -547,18 +542,6 @@ def normalize_to_0_1_inverted(series: pd.Series) -> pd.Series:
     normalized = normalize_to_0_1(series)
     return 1 - normalized
 
-
-def normalize_iqr_to_0_1(series: pd.Series) -> pd.Series:
-    """
-    Normalize IQR deviation to 0-1 range.
-
-    IQR deviations can be negative or positive. We map them so that
-    higher stake-to-fees (more economic security) gets a higher score.
-    """
-    if series is None or series.empty:
-        return series
-    # Higher deviation = more stake relative to fees = better
-    return normalize_to_0_1(series)
 
 
 def calculate_iqr_deviation(series: pd.Series) -> pd.Series:
@@ -1010,13 +993,6 @@ def calculate_indexer_uptime(df: pd.DataFrame, threshold_seconds: int = 120) -> 
     return pd.merge(merged_restricted, merged_full, on="indexer", how="left")
 
 
-def calculate_indexer_stake_to_fees(stake_query_pandas: pd.DataFrame) -> pd.DataFrame:
-    """Calculate stake-to-fees ratio and IQR deviation."""
-    stake_to_fees = stake_query_pandas[["stake_to_fees"]].copy()
-    stake_to_fees["stake_to_fees_iqr_deviation"] = calculate_iqr_deviation(stake_to_fees["stake_to_fees"])
-    stake_to_fees.index.name = "indexer"
-    return stake_to_fees.reset_index()
-
 
 def aggregate_indexer_info(df: pd.DataFrame) -> pd.DataFrame:
     """Aggregate organizational and location info per indexer."""
@@ -1111,7 +1087,6 @@ def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
     scores["uptime_duration_seconds"] = None
     scores["success_rate"] = 0.5
     scores["stake_to_fees"] = None
-    scores["stake_to_fees_iqr_deviation"] = None
     scores["norm_uptime_score"] = 0.5
     scores["norm_success_rate"] = 0.5
     scores["norm_stake_to_fees"] = 0.5

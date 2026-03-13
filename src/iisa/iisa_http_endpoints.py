@@ -386,7 +386,7 @@ async def get_score(request: ScoreRequest) -> ScoreResponse:
         ("norm_lat_lin_reg_coefficient", "latency"),
         ("norm_uptime_score", "uptime"),
         ("norm_success_rate", "success_rate"),
-        ("norm_stake_to_fees_iqr_deviation", "stake_to_fees"),
+        ("norm_stake_to_fees", "stake_to_fees"),
         ("norm_base_price_per_epoch", "base_price"),
         ("norm_price_per_entity", "price_per_entity"),
     ]

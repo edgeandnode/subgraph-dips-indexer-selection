@@ -25,13 +25,11 @@ from processing import (
     is_private_ip,
     normalize_to_0_1,
     normalize_to_0_1_inverted,
-    normalize_iqr_to_0_1,
     transform_to_scores_schema,
     haversine_vectorized,
     filter_successful_queries,
     iterative_filter,
     calculate_indexer_success_rate,
-    calculate_indexer_stake_to_fees,
     adjust_rows,
     strategic_sample,
     hash_sampled_queries,
@@ -148,31 +146,6 @@ class TestNormalizeToZeroOneInverted:
         assert result.empty
 
 
-class TestNormalizeIqrToZeroOne:
-    """Tests for the normalize_iqr_to_0_1 function."""
-
-    def test_normalize_iqr_basic(self):
-        # Arrange - IQR deviations can be negative
-        series = pd.Series([-2, -1, 0, 1, 2])
-
-        # Act
-        result = normalize_iqr_to_0_1(series)
-
-        # Assert
-        assert result.min() == 0.0
-        assert result.max() == 1.0
-
-    def test_normalize_iqr_empty(self):
-        # Arrange
-        series = pd.Series([], dtype=float)
-
-        # Act
-        result = normalize_iqr_to_0_1(series)
-
-        # Assert
-        assert result.empty
-
-
 class TestTransformToScoresSchema:
     """Tests for the transform_to_scores_schema function."""
 
@@ -190,7 +163,6 @@ class TestTransformToScoresSchema:
             "uptime_duration_restricted": [995, 1900, 2700],
             "average_status": [0.98, 0.95, 0.90],
             "stake_to_fees": [100.0, 200.0, 300.0],
-            "stake_to_fees_iqr_deviation": [-1.0, 0.0, 1.0],
             "org": ["AWS", "GCP", "Hetzner"],
             "dst_lat": [40.0, 35.0, 50.0],
             "dst_lon": [-74.0, -120.0, 8.0],
@@ -208,8 +180,8 @@ class TestTransformToScoresSchema:
             "lat_normalized_score",
             "uptime_score", "observed_duration_seconds", "uptime_duration_seconds",
             "success_rate",
-            "stake_to_fees", "stake_to_fees_iqr_deviation",
-            "norm_uptime_score", "norm_success_rate", "norm_stake_to_fees",
+            "stake_to_fees",
+            "norm_uptime_score", "norm_success_rate",
             "org", "dst_lat", "dst_lon",
             "computed_at", "query_count",
         ]
@@ -385,41 +357,6 @@ class TestCalculateIndexerSuccessRate:
 
         # Assert
         assert result["average_status"].iloc[0] == 1.0
-
-
-class TestCalculateIndexerStakeToFees:
-    """Tests for calculate_indexer_stake_to_fees function."""
-
-    def test_stake_to_fees_basic(self):
-        # Arrange
-        df = pd.DataFrame({
-            "indexer": ["A", "B", "C", "D", "E"],
-            "stake_to_fees": [1.0, 2.0, 3.0, 4.0, 5.0],
-        })
-        df = df.set_index("indexer")
-
-        # Act
-        result = calculate_indexer_stake_to_fees(df)
-
-        # Assert
-        assert "stake_to_fees_iqr_deviation" in result.columns
-        assert len(result) == 5
-
-    def test_stake_to_fees_iqr_calculation(self):
-        # Arrange
-        df = pd.DataFrame({
-            "indexer": ["A", "B", "C", "D", "E"],
-            "stake_to_fees": [1.0, 2.0, 3.0, 4.0, 5.0],
-        })
-        df = df.set_index("indexer")
-
-        # Act
-        result = calculate_indexer_stake_to_fees(df)
-
-        # Assert - median is 3.0, Q1=2.0, Q3=4.0, IQR=2.0
-        # Deviation for C (value=3.0) should be (3.0 - 3.0) / 2.0 = 0.0
-        c_deviation = result[result["indexer"] == "C"]["stake_to_fees_iqr_deviation"].iloc[0]
-        assert c_deviation == pytest.approx(0.0)
 
 
 class TestIterativeFilter:
@@ -1055,7 +992,6 @@ class TestMergeAndPrepareDataframes:
         return pd.DataFrame({
             "indexer": ["0xABC", "0xXYZ", "0xGHI"],
             "stake_to_fees": [100, 200, 300],
-            "stake_to_fees_iqr_deviation": [-0.5, 0, 0.5],
         })
 
     @pytest.fixture

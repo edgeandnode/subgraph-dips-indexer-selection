@@ -26,7 +26,7 @@ class TestDataManager:
             "uptime_score": [0.98, 0.95, 0.99],
             "success_rate": [0.95, 0.90, 0.97],
             "stake_to_fees": [1000, 2000, 1500],
-            "stake_to_fees_iqr_deviation": [0.5, 1.0, 0.75],
+            "stake_to_fees": [0.5, 1.0, 0.75],
             "norm_uptime_score": [0.9, 0.7, 0.95],
             "norm_success_rate": [0.85, 0.6, 0.9],
             "norm_stake_to_fees": [0.5, 0.8, 0.65],
@@ -80,7 +80,7 @@ class TestDataManager:
         assert "% up_x" in data.columns
         assert "destination_loc" in data.columns
         assert "norm_lat_lin_reg_coefficient" in data.columns
-        assert "norm_stake_to_fees_iqr_deviation" in data.columns
+        assert "norm_stake_to_fees" in data.columns
 
     def test_load_scores_uptime_conversion(self, mock_provider_with_scores):
         """Test that uptime is converted from 0-1 to percentage."""

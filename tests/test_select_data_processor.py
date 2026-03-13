@@ -174,7 +174,7 @@ class TestDataProcessor:
                 "weighted_score": [0.9, 0.7, 0.8],
                 "lat_lin_reg_coefficient": [0.1, 0.2, 0.3],
                 "uptime_score": [0.9, 0.8, 0.7],
-                "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3],
+                "stake_to_fees": [0.1, 0.2, 0.3],
                 "success_rate": [0.95, 0.90, 0.85],
                 "base_price_per_epoch": [100, 200, 300],
                 "price_per_entity": [0.1, 0.2, 0.3],
@@ -533,7 +533,7 @@ class TestDataProcessor:
         # Set up mock return values
         normalized_data = sample_data.copy()
         for metric in [
-            "stake_to_fees_iqr_deviation",
+            "stake_to_fees",
             "base_price_per_epoch",
             "lat_lin_reg_coefficient",
             "uptime_score",
@@ -561,7 +561,7 @@ class TestDataProcessor:
             assert isinstance(args[1], dict)
             weights = args[1]
             expected_metrics = [
-                "stake_to_fees_iqr_deviation",
+                "stake_to_fees",
                 "base_price_per_epoch",
                 "lat_lin_reg_coefficient",
                 "uptime_score",
@@ -1012,7 +1012,7 @@ class TestDataProcessor:
                 "existing_dips_agreements": [1, 2, 3, 4],
                 "lat_lin_reg_coefficient": [0.1, 0.2, 0.3, 0.4],
                 "uptime_score": [0.9, 0.8, 0.7, 0.6],
-                "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3, 0.4],
+                "stake_to_fees": [0.1, 0.2, 0.3, 0.4],
                 "success_rate": [0.95, 0.90, 0.85, 0.80],
                 "base_price_per_epoch": [100, 200, 300, 400],
                 "price_per_entity": [0.1, 0.2, 0.3, 0.4],
@@ -1025,7 +1025,7 @@ class TestDataProcessor:
         )
 
         processor.weights = {
-            "stake_to_fees_iqr_deviation": 0.30,
+            "stake_to_fees": 0.30,
             "base_price_per_epoch": 0.25,
             "lat_lin_reg_coefficient": 0.20,
             "uptime_score": 0.15,
@@ -1134,7 +1134,7 @@ class TestNormalizeMetrics:
                     12.121212,
                 ],
                 "% up_x": [0, 10, 50, 75.7575, 99.9],
-                "stake_to_fees_iqr_deviation": [-5.15, 0, 1.125, 3, 120],
+                "stake_to_fees": [-5.15, 0, 1.125, 3, 120],
                 "average_status": [0, 1, 50, 75.7575, 99.9],
                 "base_price_per_epoch": [10, 200, 300, 400.457, 1000],
                 "price_per_entity": [0.1, 0.2, 0.3, 0.4, 0.5],
@@ -1151,7 +1151,7 @@ class TestNormalizeMetrics:
             # Original columns
             "Latency Coefficient + Error Confidence Interval",
             "% up_x",
-            "stake_to_fees_iqr_deviation",
+            "stake_to_fees",
             "average_status",
             "base_price_per_epoch",
             "price_per_entity",
@@ -1159,7 +1159,7 @@ class TestNormalizeMetrics:
             # New columns
             "norm_lat_lin_reg_coefficient",
             "norm_uptime_score",
-            "norm_stake_to_fees_iqr_deviation",
+            "norm_stake_to_fees",
             "norm_success_rate",
             "norm_base_price_per_epoch",
             "norm_price_per_entity",
@@ -1171,7 +1171,7 @@ class TestNormalizeMetrics:
         normalized_columns = [
             "norm_lat_lin_reg_coefficient",
             "norm_uptime_score",
-            "norm_stake_to_fees_iqr_deviation",
+            "norm_stake_to_fees",
             "norm_success_rate",
             "norm_base_price_per_epoch",
             "norm_price_per_entity",
@@ -1203,7 +1203,7 @@ class TestNormalizeMetrics:
         expected_columns = list(empty_df.columns) + [
             "norm_lat_lin_reg_coefficient",
             "norm_uptime_score",
-            "norm_stake_to_fees_iqr_deviation",
+            "norm_stake_to_fees",
             "norm_success_rate",
             "norm_base_price_per_epoch",
             "norm_price_per_entity",
@@ -1220,7 +1220,7 @@ class TestNormalizeMetrics:
         norm_columns = [
             "norm_lat_lin_reg_coefficient",
             "norm_uptime_score",
-            "norm_stake_to_fees_iqr_deviation",
+            "norm_stake_to_fees",
             "norm_success_rate",
             "norm_base_price_per_epoch",
             "norm_price_per_entity",
@@ -1229,7 +1229,7 @@ class TestNormalizeMetrics:
         # Check for normalization results where input values are the same
         for column in norm_columns:
             if column in [
-                "norm_stake_to_fees_iqr_deviation",
+                "norm_stake_to_fees",
             ]:
                 assert (result[column] == 0).all(), (
                     f"Column {column} is not 0 for identical input values"
@@ -1301,7 +1301,7 @@ class TestNormalizeMetrics:
             {
                 "Latency Coefficient + Error Confidence Interval": [1, 2, 3],
                 "% up_x": [99, 100, 98],
-                "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3],
+                "stake_to_fees": [0.1, 0.2, 0.3],
                 "average_status": [99, 100, 98],
                 "base_price_per_epoch": [100, 500, 1000],
                 "price_per_entity": [0.1, 0.5, 1.0],
@@ -1333,7 +1333,7 @@ class TestTargetSize:
                 "weighted_score": [0.9, 0.8, 0.7, 0.6, 0.5],
                 "lat_lin_reg_coefficient": [0.1, 0.2, 0.3, 0.4, 0.5],
                 "uptime_score": [0.9, 0.8, 0.7, 0.6, 0.5],
-                "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3, 0.4, 0.5],
+                "stake_to_fees": [0.1, 0.2, 0.3, 0.4, 0.5],
                 "success_rate": [0.95, 0.90, 0.85, 0.80, 0.75],
                 "base_price_per_epoch": [100, 200, 300, 400, 500],
                 "price_per_entity": [0.1, 0.2, 0.3, 0.4, 0.5],
@@ -1453,7 +1453,7 @@ class TestDecentralizationBestEffort:
                 "weighted_score": [0.9, 0.8, 0.7],
                 "lat_lin_reg_coefficient": [0.1, 0.2, 0.3],
                 "uptime_score": [0.9, 0.8, 0.7],
-                "stake_to_fees_iqr_deviation": [0.1, 0.2, 0.3],
+                "stake_to_fees": [0.1, 0.2, 0.3],
                 "success_rate": [0.95, 0.90, 0.85],
                 "base_price_per_epoch": [100, 200, 300],
                 "price_per_entity": [0.1, 0.2, 0.3],
