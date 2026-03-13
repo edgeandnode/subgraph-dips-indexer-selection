@@ -143,9 +143,6 @@ class DataManager:
                 df["dst_lon"].fillna(0).astype(str)
             )
 
-        if "existing_dips_agreements" not in df.columns:
-            df["existing_dips_agreements"] = 0
-
         return df
 
     def _check_scores_staleness(self, computed_at: Optional[datetime]) -> None:

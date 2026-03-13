@@ -97,6 +97,7 @@ class DataProcessor:
         indexer_denylist: Optional[list[IndexerId]] = None,
         weights: Optional[WeightsDict] = None,
         target_size: int = 3,
+        optimistic_dips_fees: Optional[dict[str, float]] = None,
     ):
         """
         Initialize the DataProcessor class with data, deployment ID, existing agreements,
@@ -104,6 +105,9 @@ class DataProcessor:
 
         Args:
             target_size: The target number of indexers to assign to this deployment.
+            optimistic_dips_fees: Per-indexer expected DIPs fees in GRT per 30 days,
+                keyed by checksummed hex address. Used to adjust stake_to_fees at
+                request time so indexers with accepted agreements get deprioritised.
         """
         # Initialize class variables with provided parameters
         self.data = pd.DataFrame(history)
@@ -114,6 +118,7 @@ class DataProcessor:
         self.indexer_denylist = indexer_denylist or []
         self.weights = {**DEFAULT_WEIGHTS, **(weights or {})}
         self.target_size = target_size
+        self.optimistic_dips_fees = optimistic_dips_fees or {}
 
         # Process the data, we can then call update_indexer_denylist_cancel_indexing_agreements,
         # or get_indexer_selections later after this constructor has finished running.
@@ -189,8 +194,34 @@ class DataProcessor:
         """
         Process data by normalizing metrics and calculating weighted scores.
         """
-        # Update the number of existing agreements for each indexer
-        self.data = self._fetch_number_of_indexer_agreements()
+        # Apply optimistic DIPs fees to adjust stake_to_fees before normalisation.
+        # When dipper reports expected fees from accepted agreements, we add them
+        # to the Redpanda-derived query fees so stake_to_fees can differentiate
+        # indexers even before on-chain payment claims appear.
+        if self.optimistic_dips_fees and "total_query_fees" in self.data.columns:
+            dips_adjustment = self.data["indexer"].map(self.optimistic_dips_fees).fillna(0.0)
+            effective_fees = self.data["total_query_fees"].fillna(0.0) + dips_adjustment
+
+            if "last_known_slashable_stake" in self.data.columns:
+                self.data["stake_to_fees"] = (
+                    self.data["last_known_slashable_stake"]
+                    / effective_fees.replace(0.0, float("nan"))
+                )
+                self.data["stake_to_fees_iqr_deviation"] = _calculate_iqr_deviation(
+                    self.data["stake_to_fees"]
+                )
+                # Drop pre-normalised column so _normalize_metrics recomputes it
+                self.data.drop(
+                    columns=["norm_stake_to_fees_iqr_deviation"],
+                    errors="ignore",
+                    inplace=True,
+                )
+
+            adjusted_count = (dips_adjustment > 0).sum()
+            logger.info(
+                "deployment=%s applied optimistic DIPs fees to %d/%d indexers",
+                self.deployment_id, adjusted_count, len(self.data),
+            )
 
         # Get the current group of indexers for the subgraph using '_get_current_group'
         self.current_group = self._get_current_group()
@@ -216,34 +247,6 @@ class DataProcessor:
 
         # Call _assign_indexers_to_subgraph to assign/replace/remove an indexer on the subgraph.
         self._assign_indexers_to_subgraph()
-
-    def _fetch_number_of_indexer_agreements(self):
-        """
-        Fetch and update the number of existing agreements for each indexer based on current assignments.
-
-        This method updates the 'existing_dips_agreements' field in the df to reflect the number of
-        current agreements each indexer has, as specified in the existing_agreements attribute passed by the rust server.
-        """
-        agreement_counts = {}
-        # Count the occurrences of each indexer in existing agreements
-        for subgraph_indexers in self.existing_agreements.values():
-            for indexer in subgraph_indexers:
-                if indexer in agreement_counts:
-                    agreement_counts[indexer] += 1
-                else:
-                    agreement_counts[indexer] = 1
-
-        # Update 'existing_dips_agreements' for all indexers at once
-        self.data["existing_dips_agreements"] = (
-            self.data["indexer"].map(agreement_counts).fillna(0).astype(int)
-        )
-        logger.debug(
-            "deployment=%s agreement_counts: %d indexers have existing agreements",
-            self.deployment_id,
-            sum(1 for v in agreement_counts.values() if v > 0),
-        )
-
-        return self.data
 
     def _get_current_group(self):
         """
@@ -432,11 +435,6 @@ class DataProcessor:
 
         # Create a copy of the data for this indexer
         indexer_data = indexer_data.copy()
-
-        # Reduce the indexer's agreement count by 1
-        indexer_data["existing_dips_agreements"] = (
-            indexer_data["existing_dips_agreements"] - 1
-        ).clip(lower=0)
 
         # Normalize only the necessary metrics for this indexer
         normalized_data = _normalize_metrics(indexer_data)
@@ -632,46 +630,21 @@ class DataProcessor:
         )
         return None  # Only when truly zero candidates available
 
-    def _calculate_group_score(
-        self, group, indexer_to_exclude=None, indexer_to_include=None
-    ):
-        """
-        Temporarily adjust the number of indexing agreements for specified indexers and calculate
-        the average weighted score of the new indexer group.
+def _calculate_iqr_deviation(series: pd.Series) -> pd.Series:
+    """
+    Calculate IQR-based deviation from median.
 
-        This method is intended to have only one of [indexer_to_exclude, indexer_to_include] passed
-        into it at a time, at most.
-        """
-        original_data = self.data.copy()
-        try:
-            if indexer_to_exclude:
-                self.data.loc[
-                    self.data["indexer"] == indexer_to_exclude,
-                    "existing_dips_agreements",
-                ] -= 1
-                self._recalculate_metrics_and_scores()
-
-            if indexer_to_include:
-                self.data.loc[
-                    self.data["indexer"] == indexer_to_include,
-                    "existing_dips_agreements",
-                ] += 1
-                self._recalculate_metrics_and_scores()
-
-            score = self.data[self.data["indexer"].isin(group)]["weighted_score"].mean()
-        finally:
-            self.data = original_data
-
-        return score
-
-    def _recalculate_metrics_and_scores(self):
-        """
-        Helper method to recalculate metrics and scores.
-        """
-        self.data = _normalize_metrics(self.data)
-        self.data["weighted_score"] = self.data.apply(
-            _calculate_weighted_score, axis=1, weights=self.weights
-        )
+    Returns (value - median) / IQR for each value in the series.
+    If IQR is zero, returns 0 for all values since there's no meaningful
+    deviation to measure.
+    """
+    median_val = series.median()
+    q1 = series.quantile(0.25)
+    q3 = series.quantile(0.75)
+    iqr = q3 - q1
+    if iqr == 0:
+        return pd.Series([0.0] * len(series), index=series.index)
+    return (series - median_val) / iqr
 
 
 def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:

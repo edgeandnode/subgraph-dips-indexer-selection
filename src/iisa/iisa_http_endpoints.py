@@ -86,6 +86,7 @@ class SelectionRequest(BaseModel):
     declined_indexers: Optional[dict[str, list[str]]] = None
     chain_id: Optional[str] = None  # e.g., "arbitrum-one"
     max_grt_per_30_days: Optional[float] = None  # e.g., 4500.0
+    optimistic_dips_fees: Optional[dict[str, float]] = None  # indexer address -> GRT per 30 days
 
 
 class SelectedIndexer(BaseModel):
@@ -683,6 +684,7 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
         declined_indexers=request.declined_indexers or {},
         indexer_denylist=request.blocklist or [],
         target_size=request.num_candidates,
+        optimistic_dips_fees=request.optimistic_dips_fees,
     )
 
     # Build response with pricing info
