@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
@@ -170,7 +170,6 @@ class TestDataProcessor:
                 "score": [0.8, 0.6, 0.7],
                 "destination_loc": ["loc1", "loc2", "loc3"],
                 "org": ["org1", "org2", "org3"],
-                "existing_dips_agreements": [1, 2, 3],
                 "weighted_score": [0.9, 0.7, 0.8],
                 "lat_lin_reg_coefficient": [0.1, 0.2, 0.3],
                 "uptime_score": [0.9, 0.8, 0.7],
@@ -328,124 +327,6 @@ class TestDataProcessor:
         # Verify that no indexers were added or cancelled.
         assert added == {}
         assert cancelled == {}
-
-    @patch("iisa.indexer_selection.DataProcessor._fetch_number_of_indexer_agreements")
-    @patch("iisa.indexer_selection.DataProcessor._get_current_group")
-    @patch("iisa.indexer_selection.DataProcessor._normalize_and_score")
-    @patch("iisa.indexer_selection.DataProcessor._assign_indexers_to_subgraph")
-    def test_process_data(
-        self,
-        mock_assign,
-        mock_normalize,
-        mock_get_group,
-        mock__fetch,
-        sample_data,
-        mock__provider,
-    ):
-        """
-        Test the _process_data method of the DataProcessor class.
-
-        This test verifies that:
-        1. The _process_data method calls the methods in the correct order.
-        2. Each method is called exactly once during processing.
-        3. The _process_data method handles the data correctly, passing results between methods.
-        4. The current_group and initial_group are properly set and updated.
-        5. The data is correctly sorted by weighted_score.
-        """
-        # Create a DataProcessor instance
-        processor = DataProcessor(
-            history=sample_data,
-            deployment_id=DeploymentId("test_subgraph"),
-        )
-
-        # Reset all mock call counts after initialization
-        mock__fetch.reset_mock()
-        mock_get_group.reset_mock()
-        mock_normalize.reset_mock()
-        mock_assign.reset_mock()
-
-        # Set up mock return values
-        mock__fetch.return_value = pd.DataFrame(
-            {"indexer": ["A", "B", "C"], "existing_dips_agreements": [1, 2, 3]}
-        )
-        mock_get_group.return_value = ["A", "B"]
-        mock_normalize.return_value = pd.DataFrame(
-            {"indexer": ["A", "B", "C"], "weighted_score": [0.8, 0.7, 0.9]}
-        )
-
-        # Call the method under test
-        processor._process_data()
-
-        # Verify that all expected methods were called only once
-        assert mock__fetch.call_count == 1
-        assert mock_get_group.call_count == 1
-        assert mock_normalize.call_count == 1
-        assert mock_assign.call_count == 1
-
-        # Verify the order of method calls
-        expected_call_order = [
-            call._fetch_number_of_indexer_agreements(),
-            call._get_current_group(),
-            call._normalize_and_score(),
-            call._assign_indexers_to_subgraph(),
-        ]
-        actual_calls = (
-            mock__fetch.mock_calls
-            + [mock_get_group.mock_calls[0]]
-            + mock_normalize.mock_calls
-            + mock_assign.mock_calls
-        )
-        assert actual_calls == expected_call_order
-
-        # Verify that the current_group and initial_group are set correctly
-        assert processor.current_group == ["A", "B"]
-        assert processor.initial_group == ["A", "B"]
-
-    def test_fetch_number_of_indexer_agreements(
-        self, sample_data, mock__provider
-    ):
-        """
-        This test verifies the _fetch_number_of_indexer_agreements method updates the
-        'existing_dips_agreements' column based on the existing_agreements.
-        """
-        # Create a DataProcessor instance with specific existing agreements
-        with patch("iisa.indexer_selection.DataProcessor._process_data"):
-            processor = DataProcessor(
-                history=sample_data,
-                deployment_id=DeploymentId("test_subgraph"),
-                existing_agreements={
-                    DeploymentId("subgraph1"): [
-                        IndexerId("A"),
-                        IndexerId("B"),
-                        IndexerId("A"),
-                    ],
-                    DeploymentId("subgraph2"): [IndexerId("A"), IndexerId("B")],
-                    DeploymentId("subgraph3"): [IndexerId("A")],
-                },
-            )
-
-        # Call the method under test
-        updated_data = processor._fetch_number_of_indexer_agreements()
-
-        # Verify that 'existing_dips_agreements' are updated correctly
-        assert (
-            updated_data.loc[
-                updated_data["indexer"] == "A", "existing_dips_agreements"
-            ].iloc[0]
-            == 4
-        ), "A issue"
-        assert (
-            updated_data.loc[
-                updated_data["indexer"] == "B", "existing_dips_agreements"
-            ].iloc[0]
-            == 2
-        ), "B issue"
-        assert (
-            updated_data.loc[
-                updated_data["indexer"] == "C", "existing_dips_agreements"
-            ].iloc[0]
-            == 0
-        ), "C issue"
 
     @pytest.fixture
     def processor(self, sample_data, mock__provider):
@@ -991,66 +872,6 @@ class TestDataProcessor:
             # Verify the number of decentralization requirement checks
             assert mock_decentralization.call_count == 1
 
-    def test_calculate_group_score(self, mock__provider):
-        """
-        Test the _calculate_group_score method of the DataProcessor class.
-
-        This test verifies that:
-        1. The method correctly calculates group scores for different scenarios:
-        2. The method produces consistent results for each scenario.
-
-        The test uses raw, non-normalized sample data to create a DataProcessor instance,
-        sets predefined weights, and then calls _calculate_group_score with different
-        parameters to test various scenarios.
-        """
-        # raw non-normalized sample data
-        raw_data = pd.DataFrame(
-            {
-                "indexer": ["A", "B", "C", "D"],
-                "destination_loc": ["0,0", "0,0", "0,0", "0,0"],
-                "org": ["org1", "org7", "org3", "org2"],
-                "existing_dips_agreements": [1, 2, 3, 4],
-                "lat_lin_reg_coefficient": [0.1, 0.2, 0.3, 0.4],
-                "uptime_score": [0.9, 0.8, 0.7, 0.6],
-                "stake_to_fees": [0.1, 0.2, 0.3, 0.4],
-                "success_rate": [0.95, 0.90, 0.85, 0.80],
-                "base_price_per_epoch": [100, 200, 300, 400],
-                "price_per_entity": [0.1, 0.2, 0.3, 0.4],
-            }
-        )
-
-        processor = DataProcessor(
-            history=raw_data,
-            deployment_id=DeploymentId("test_subgraph"),
-        )
-
-        processor.weights = {
-            "stake_to_fees": 0.30,
-            "base_price_per_epoch": 0.25,
-            "lat_lin_reg_coefficient": 0.20,
-            "uptime_score": 0.15,
-            "success_rate": 0.05,
-            "price_per_entity": 0.05,
-        }
-
-        original_data = processor.data.copy()
-
-        normal_score = processor._calculate_group_score(["A", "B", "C"])
-        exclude_score = processor._calculate_group_score(
-            ["A", "C"], indexer_to_exclude="B"
-        )
-        include_score = processor._calculate_group_score(
-            ["A", "B"], indexer_to_include="D"
-        )
-
-        # Verify scores are calculated (values will differ from old test due to new weights)
-        assert 0 <= normal_score <= 1
-        assert 0 <= exclude_score <= 1
-        assert 0 <= include_score <= 1
-
-        # Verify that the original data was not modified
-        pd.testing.assert_frame_equal(processor.data, original_data)
-
     def test_update_indexer_denylist_cancel_indexing_agreements(
         self, sample_data, mock__provider
     ):
@@ -1329,7 +1150,6 @@ class TestTargetSize:
                 "deployment_hash": ["hash1"] * 5,
                 "destination_loc": ["loc1", "loc2", "loc3", "loc4", "loc5"],
                 "org": ["org1", "org2", "org3", "org4", "org5"],
-                "existing_dips_agreements": [0, 0, 0, 0, 0],
                 "weighted_score": [0.9, 0.8, 0.7, 0.6, 0.5],
                 "lat_lin_reg_coefficient": [0.1, 0.2, 0.3, 0.4, 0.5],
                 "uptime_score": [0.9, 0.8, 0.7, 0.6, 0.5],
@@ -1449,7 +1269,6 @@ class TestDecentralizationBestEffort:
                 "deployment_hash": ["hash1"] * 3,
                 "destination_loc": ["loc1", "loc1", "loc1"],  # Same location
                 "org": ["org1", "org1", "org1"],  # Same org
-                "existing_dips_agreements": [0, 0, 0],
                 "weighted_score": [0.9, 0.8, 0.7],
                 "lat_lin_reg_coefficient": [0.1, 0.2, 0.3],
                 "uptime_score": [0.9, 0.8, 0.7],

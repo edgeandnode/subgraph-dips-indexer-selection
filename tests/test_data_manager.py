@@ -33,7 +33,6 @@ class TestDataManager:
             "org": ["hetzner", "amazon", "google"],
             "dst_lat": [50.0, 40.0, 35.0],
             "dst_lon": [10.0, -74.0, 139.0],
-            "existing_dips_agreements": [2, 1, 0],
             "avg_sync_duration": [np.nan, np.nan, np.nan],
             "computed_at": [datetime(2024, 1, 15, 12, 0)] * 3,
             "query_count": [10000, 8000, 12000],
