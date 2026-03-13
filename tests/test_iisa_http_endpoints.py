@@ -360,7 +360,6 @@ def mock_history_df():
         "norm_stake_to_fees": [0.5, 0.8, 0.65],
         "norm_base_price_per_epoch": [0.7, 0.8, 0.9],
         "norm_price_per_entity": [0.6, 0.7, 0.8],
-        "existing_dips_agreements": [2, 1, 0],
         "dips_info_available": [True, True, False],
         "dips_min_grt_per_30_days": ['{"arbitrum-one": "450"}', '{"arbitrum-one": "500"}', "{}"],
         "dips_min_grt_per_billion_entities_per_30_days": ["200", "300", None],

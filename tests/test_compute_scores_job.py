@@ -1018,8 +1018,6 @@ class TestMergeAndPrepareDataframes:
         assert "query_count" in result.columns
 
         # Placeholder columns for DIP metrics
-        assert "existing_dips_agreements" in result.columns
-        assert all(result["existing_dips_agreements"] == 0)
         assert "avg_sync_duration" in result.columns
         assert all(pd.isna(result["avg_sync_duration"]))
 
