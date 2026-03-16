@@ -360,13 +360,13 @@ class RedpandaProvider:
         batch polling, and parallel partition consumption.
         """
         start_dt = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-        end_dt = start_dt + timedelta(days=num_days)
+        end_dt = datetime.now(timezone.utc)
         start_ts_ms = int(start_dt.timestamp() * 1000)
         end_ts_ms = int(end_dt.timestamp() * 1000)
 
         logger.info(
             f"Starting count pass: topic={self._topic}, "
-            f"window={start_date} to {end_dt.date()}"
+            f"window={start_date} to {end_dt.isoformat()}"
         )
 
         partitions = self._resolve_partitions(start_ts_ms)
@@ -494,13 +494,13 @@ class RedpandaProvider:
         parallel partition consumption, and thread-local PRNG.
         """
         start_dt = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-        end_dt = start_dt + timedelta(days=num_days)
+        end_dt = datetime.now(timezone.utc)
         start_ts_ms = int(start_dt.timestamp() * 1000)
         end_ts_ms = int(end_dt.timestamp() * 1000)
 
         logger.info(
             f"Starting sample pass: topic={self._topic}, "
-            f"window={start_date} to {end_dt.date()}, "
+            f"window={start_date} to {end_dt.isoformat()}, "
             f"rows_to_use={rows_to_use}"
         )
 
