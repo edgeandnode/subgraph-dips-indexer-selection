@@ -70,6 +70,10 @@ spec:
                   key: REDPANDA_SASL_PASSWORD
             - name: SCORES_FILE_PATH
               value: "/app/scores/indexer_scores.json"
+            - name: IISA_API_URL
+              value: "http://iisa:8080"
+            - name: REDPANDA_GATEWAY_IDS
+              value: ""
             securityContext:
               allowPrivilegeEscalation: false
               capabilities:
