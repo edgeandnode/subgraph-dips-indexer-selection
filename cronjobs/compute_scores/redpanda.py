@@ -113,7 +113,7 @@ class RedpandaProvider:
         if self._gateway_id_filter:
             logger.info(f"Gateway ID filter active: {self._gateway_id_filter}")
         else:
-            logger.warning("No REDPANDA_GATEWAY_IDS set — processing all gateways")
+            logger.info("No REDPANDA_GATEWAY_IDS set — processing all gateways")
 
         # Count cache — populated by _count_pass
         self._count_cache: Dict[Tuple[str, str], int] = {}
@@ -406,12 +406,14 @@ class RedpandaProvider:
         merged_counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
         merged_fees: Dict[bytes, float] = defaultdict(float)
         total_messages = 0
-        for counts, fees, msg_count in results:
+        total_filtered = 0
+        for counts, fees, msg_count, filtered in results:
             for key, val in counts.items():
                 merged_counts[key] += val
             for idx_bytes, fee in fees.items():
                 merged_fees[idx_bytes] += fee
             total_messages += msg_count
+            total_filtered += filtered
 
         # Convert byte keys to string keys — only ~N_pairs conversions
         self._count_cache = {}
@@ -431,22 +433,24 @@ class RedpandaProvider:
         self._count_cache_num_days = num_days
 
         logger.info(
-            f"Count pass complete: {total_messages:,} messages, "
+            f"Count pass complete: {total_messages:,} messages "
+            f"({total_filtered:,} filtered by gateway ID), "
             f"{sum(self._count_cache.values()):,} attempts across "
             f"{len(self._count_cache)} (deployment, indexer) pairs"
         )
 
     def _count_partition_loop(
         self, consumer, end_ts_ms: int
-    ) -> Tuple[Dict[Tuple[bytes, bytes], int], Dict[bytes, float], int]:
+    ) -> Tuple[Dict[Tuple[bytes, bytes], int], Dict[bytes, float], int, int]:
         """
         Consume one partition for the count pass.
 
-        Returns (counts_by_pair, fees_by_indexer, message_count).
+        Returns (counts_by_pair, fees_by_indexer, message_count, filtered_count).
         """
         counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
         fees: Dict[bytes, float] = defaultdict(float)
         total_messages = 0
+        filtered_count = 0
         consecutive_empty = 0
 
         while True:
@@ -469,7 +473,7 @@ class RedpandaProvider:
                     ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
                 if ts_ms > end_ts_ms:
-                    return (counts, fees, total_messages)
+                    return (counts, fees, total_messages, filtered_count)
 
                 total_messages += 1
 
@@ -482,6 +486,7 @@ class RedpandaProvider:
                 # Skip messages from non-matching gateways (defense in depth
                 # for mixed mainnet/testnet topics).
                 if self._gateway_id_filter and query.gateway_id not in self._gateway_id_filter:
+                    filtered_count += 1
                     continue
 
                 for attempt in query.indexer_queries:
@@ -491,7 +496,7 @@ class RedpandaProvider:
                         counts[(dep_bytes, idx_bytes)] += 1
                         fees[idx_bytes] += attempt.fee_grt
 
-        return (counts, fees, total_messages)
+        return (counts, fees, total_messages, filtered_count)
 
     # -----------------------------------------------------------------------
     # Internal: Pass 2 — sample
@@ -548,11 +553,13 @@ class RedpandaProvider:
         # Merge per-partition reservoirs
         merged_reservoirs: Dict[Tuple[bytes, bytes], List[dict]] = defaultdict(list)
         merged_counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
-        for reservoirs, counts in results:
+        total_filtered = 0
+        for reservoirs, counts, filtered in results:
             for key, rows in reservoirs.items():
                 merged_reservoirs[key].extend(rows)
             for key, count in counts.items():
                 merged_counts[key] += count
+            total_filtered += filtered
 
         # Truncate pairs that exceed rows_to_use after cross-partition merge
         all_rows: List[dict] = []
@@ -573,7 +580,8 @@ class RedpandaProvider:
 
         logger.info(
             f"Sample pass complete: {len(all_rows):,} rows buffered across "
-            f"{len(merged_reservoirs)} pairs"
+            f"{len(merged_reservoirs)} pairs "
+            f"({total_filtered:,} messages filtered by gateway ID)"
         )
 
     def _sample_partition_loop(
@@ -582,15 +590,17 @@ class RedpandaProvider:
         end_ts_ms: int,
         rows_to_use: int,
         rng: random.Random,
-    ) -> Tuple[Dict[Tuple[bytes, bytes], List[dict]], Dict[Tuple[bytes, bytes], int]]:
+    ) -> Tuple[Dict[Tuple[bytes, bytes], List[dict]], Dict[Tuple[bytes, bytes], int], int]:
         """
         Consume one partition for the sample pass.
 
-        Returns (reservoirs, counts) where reservoirs maps (dep_bytes, idx_bytes)
-        to a list of row dicts with raw bytes and ts_ms (deferred conversion).
+        Returns (reservoirs, counts, filtered_count) where reservoirs maps
+        (dep_bytes, idx_bytes) to a list of row dicts with raw bytes and
+        ts_ms (deferred conversion).
         """
         reservoirs: Dict[Tuple[bytes, bytes], List[dict]] = defaultdict(list)
         counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
+        filtered_count = 0
         consecutive_empty = 0
 
         while True:
@@ -613,7 +623,7 @@ class RedpandaProvider:
                     ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
                 if ts_ms > end_ts_ms:
-                    return (reservoirs, counts)
+                    return (reservoirs, counts, filtered_count)
 
                 try:
                     query = ClientQueryProtobuf()
@@ -622,6 +632,7 @@ class RedpandaProvider:
                     continue
 
                 if self._gateway_id_filter and query.gateway_id not in self._gateway_id_filter:
+                    filtered_count += 1
                     continue
 
                 for attempt in query.indexer_queries:
@@ -657,7 +668,7 @@ class RedpandaProvider:
 
                     counts[key] += 1
 
-        return (reservoirs, counts)
+        return (reservoirs, counts, filtered_count)
 
     # -----------------------------------------------------------------------
     # Internal: GraphQL pagination

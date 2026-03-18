@@ -1,7 +1,13 @@
 """Tests for the REDPANDA_GATEWAY_IDS filter on RedpandaProvider."""
 
 import os
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+# Make the cronjob package importable.
+jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
+sys.path.insert(0, str(jobs_path))
 
 from redpanda import RedpandaProvider
 
@@ -69,12 +75,13 @@ class TestGatewayIdFilter:
                 MagicMock(indexer=b"\x01" * 20, deployment=b"\x02" * 32, fee_grt=0.1)
             ]
 
-            counts, fees, total = provider._count_partition_loop(
+            counts, fees, total, filtered = provider._count_partition_loop(
                 mock_consumer, end_ts_ms=999999999999
             )
 
         # Message was consumed (total_messages incremented) but indexer data was skipped
         assert total == 1
+        assert filtered == 1
         assert len(counts) == 0
         assert len(fees) == 0
 
@@ -99,11 +106,12 @@ class TestGatewayIdFilter:
                 MagicMock(indexer=b"\x01" * 20, deployment=b"\x02" * 32, fee_grt=0.1)
             ]
 
-            counts, fees, total = provider._count_partition_loop(
+            counts, fees, total, filtered = provider._count_partition_loop(
                 mock_consumer, end_ts_ms=999999999999
             )
 
         assert total == 1
+        assert filtered == 0
         assert len(counts) == 1
         assert len(fees) == 1
 
@@ -130,9 +138,10 @@ class TestGatewayIdFilter:
                 MagicMock(indexer=b"\x01" * 20, deployment=b"\x02" * 32, fee_grt=0.1)
             ]
 
-            counts, fees, total = provider._count_partition_loop(
+            counts, fees, total, filtered = provider._count_partition_loop(
                 mock_consumer, end_ts_ms=999999999999
             )
 
         assert total == 1
+        assert filtered == 0
         assert len(counts) == 1
