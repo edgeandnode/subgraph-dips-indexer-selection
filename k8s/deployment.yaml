@@ -36,6 +36,8 @@ spec:
               value: "INFO"
             - name: SCORES_FILE_PATH
               value: "/app/scores/indexer_scores.json"
+            - name: IISA_SCORES_RELOAD_INTERVAL
+              value: "120"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
