@@ -32,7 +32,7 @@ spec:
           - name: dockerhub-pull-secret
           containers:
           - name: compute-scores
-            image: dockermoonboi9001/iisa-score-computation:sha-d09d11c
+            image: dockermoonboi9001/iisa-score-computation:sha-cbfc1c9
             imagePullPolicy: Always
             resources:
               requests:
