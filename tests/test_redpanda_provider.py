@@ -8,29 +8,27 @@ so that imports resolve correctly without installing the cronjob package.
 import json
 import os
 import sys
-import tempfile
-from collections import namedtuple
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, List
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
-import pytest
 
 # Make the cronjob package importable.
 jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
-from gateway_queries_pb2 import ClientQueryProtobuf, IndexerQueryProtobuf
-
-from redpanda import (
+from gateway_queries_pb2 import (  # noqa: E402
+    ClientQueryProtobuf,
+    IndexerQueryProtobuf,
+)
+from redpanda import (  # noqa: E402
     RedpandaProvider,
     _bytes_to_cid,
     _bytes_to_hex,
     _map_result_to_status,
 )
-
 
 # ---------------------------------------------------------------------------
 # Proto helpers — build test messages using generated protobuf classes
@@ -240,7 +238,9 @@ class TestProtobufRoundTrip:
 class TestScoresFileIO:
     def _make_scores_df(self, today: bool = True) -> pd.DataFrame:
         """Build a minimal scores DataFrame."""
-        computed_at = datetime.now(timezone.utc) if today else datetime(2000, 1, 1, tzinfo=timezone.utc)
+        computed_at = (
+            datetime.now(timezone.utc) if today else datetime(2000, 1, 1, tzinfo=timezone.utc)
+        )
         return pd.DataFrame(
             [
                 {
@@ -374,7 +374,7 @@ def _make_partition_consumer(message_batches: List[List]):
 
 
 class TestRedpandaProviderCaching:
-    """Tests for _count_pass, _sample_pass, fetch_initial_query_results, fetch_combined_query_results."""
+    """Tests for the two-pass caching architecture."""
 
     def _build_provider(self) -> RedpandaProvider:
         """Build a RedpandaProvider with mocked environment."""
@@ -430,19 +430,21 @@ class TestRedpandaProviderCaching:
         indexer1 = INDEXER_BYTES
         indexer2 = bytes(20)
 
-        msg_value = self._two_attempt_message(
-            "qid-001-JFK", deployment, indexer1, indexer2, ts_ms
-        )
+        msg_value = self._two_attempt_message("qid-001-JFK", deployment, indexer1, indexer2, ts_ms)
         fake_msg = _fake_kafka_message(ts_ms, msg_value)
 
         # Resolution consumer (for _resolve_partitions)
         resolution_consumer = _make_resolution_consumer("gateway_queries", [0])
 
         # Count pass partition consumer — one batch of messages then 3 empty batches
-        count_consumer = _make_partition_consumer([
-            [fake_msg],  # batch 1: one message
-            [], [], [],  # 3 empty = end of data
-        ])
+        count_consumer = _make_partition_consumer(
+            [
+                [fake_msg],  # batch 1: one message
+                [],
+                [],
+                [],  # 3 empty = end of data
+            ]
+        )
 
         with patch("confluent_kafka.Consumer", side_effect=[resolution_consumer, count_consumer]):
             result = provider.fetch_initial_query_results(start_date, num_days)
@@ -482,16 +484,24 @@ class TestRedpandaProviderCaching:
         resolution_consumer = _make_resolution_consumer("gateway_queries", [0])
 
         # Count pass consumer
-        count_consumer = _make_partition_consumer([
-            messages,   # all 5 messages in one batch
-            [], [], [],
-        ])
+        count_consumer = _make_partition_consumer(
+            [
+                messages,  # all 5 messages in one batch
+                [],
+                [],
+                [],
+            ]
+        )
 
         # Sample pass consumer (same messages replayed)
-        sample_consumer = _make_partition_consumer([
-            messages,
-            [], [], [],
-        ])
+        sample_consumer = _make_partition_consumer(
+            [
+                messages,
+                [],
+                [],
+                [],
+            ]
+        )
 
         with patch(
             "confluent_kafka.Consumer",
@@ -537,16 +547,27 @@ class TestRedpandaProviderCaching:
         provider._row_cache_num_days = num_days
         provider._row_cache_rows_to_use = rows_to_use
         provider._row_cache_df = pd.DataFrame(
-            [{"query_id": "x", "deployment_hash": _bytes_to_cid(bytes(32)),
-              "fee": 0.001, "timestamp": pd.Timestamp("2024-01-01", tz="UTC"),
-              "blocks_behind": 0, "response_time_ms": 100,
-              "indexer": _bytes_to_hex(INDEXER_BYTES), "status": "200 OK",
-              "day_partition": date(2024, 1, 1), "subgraph_network": "mainnet",
-              "url": "https://indexer.example.com/"}]
+            [
+                {
+                    "query_id": "x",
+                    "deployment_hash": _bytes_to_cid(bytes(32)),
+                    "fee": 0.001,
+                    "timestamp": pd.Timestamp("2024-01-01", tz="UTC"),
+                    "blocks_behind": 0,
+                    "response_time_ms": 100,
+                    "indexer": _bytes_to_hex(INDEXER_BYTES),
+                    "status": "200 OK",
+                    "day_partition": date(2024, 1, 1),
+                    "subgraph_network": "mainnet",
+                    "url": "https://indexer.example.com/",
+                }
+            ]
         )
 
-        with patch.object(provider, "_count_pass") as mock_count, \
-             patch.object(provider, "_sample_pass") as mock_sample:
+        with (
+            patch.object(provider, "_count_pass") as mock_count,
+            patch.object(provider, "_sample_pass") as mock_sample,
+        ):
             result = provider.fetch_combined_query_results(start_date, num_days, rows_to_use)
 
         mock_count.assert_not_called()
@@ -615,10 +636,14 @@ class TestParallelMerge:
             msgs = []
             for i in range(4):
                 a = _build_indexer_attempt(
-                    indexer=indexer1, deployment=deployment,
-                    indexed_chain="mainnet", url="https://indexer1.example.com/",
-                    fee_grt=0.001, response_time_ms=50 + i,
-                    result="success", blocks_behind=0,
+                    indexer=indexer1,
+                    deployment=deployment,
+                    indexed_chain="mainnet",
+                    url="https://indexer1.example.com/",
+                    fee_grt=0.001,
+                    response_time_ms=50 + i,
+                    result="success",
+                    blocks_behind=0,
                 )
                 raw = _build_client_query(f"qid-{offset_start + i:03d}-JFK", [a])
                 msgs.append(_fake_kafka_message(base_ts_ms + i * 1000, raw))
@@ -641,9 +666,11 @@ class TestParallelMerge:
         with patch(
             "confluent_kafka.Consumer",
             side_effect=[
-                resolution_consumer,   # partition resolution
-                count_p0, count_p1,    # count pass (2 partitions)
-                sample_p0, sample_p1,  # sample pass (2 partitions)
+                resolution_consumer,  # partition resolution
+                count_p0,
+                count_p1,  # count pass (2 partitions)
+                sample_p0,
+                sample_p1,  # sample pass (2 partitions)
             ],
         ):
             # Count pass
@@ -738,10 +765,12 @@ class TestFetchStakeToFees:
     def test_computes_ratio_from_stake_and_fees(self):
         """stake_to_fees = (stakedTokens - lockedTokens) / total_fees."""
         # Arrange
-        provider = self._build_provider_with_fees({
-            EXPECTED_INDEXER: 100.0,   # earned 100 GRT in fees
-            EXPECTED_INDEXER2: 50.0,   # earned 50 GRT in fees
-        })
+        provider = self._build_provider_with_fees(
+            {
+                EXPECTED_INDEXER: 100.0,  # earned 100 GRT in fees
+                EXPECTED_INDEXER2: 50.0,  # earned 50 GRT in fees
+            }
+        )
 
         subgraph_indexers = [
             {"id": EXPECTED_INDEXER, "stakedTokens": "1000000", "lockedTokens": "0"},
@@ -749,7 +778,9 @@ class TestFetchStakeToFees:
         ]
 
         # Act
-        with patch("redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)):
+        with patch(
+            "redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
+        ):
             result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
 
         # Assert
@@ -768,7 +799,9 @@ class TestFetchStakeToFees:
         ]
 
         # Act
-        with patch("redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)):
+        with patch(
+            "redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
+        ):
             result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
 
         # Assert
@@ -791,9 +824,11 @@ class TestFetchStakeToFees:
     def test_subgraph_indexer_not_in_replay_gets_nan(self):
         """Indexers in the subgraph but absent from the replay get NaN."""
         # Arrange — fee cache has no data for this indexer
-        provider = self._build_provider_with_fees({
-            EXPECTED_INDEXER: 100.0,
-        })
+        provider = self._build_provider_with_fees(
+            {
+                EXPECTED_INDEXER: 100.0,
+            }
+        )
         unknown_indexer = "0x" + "ff" * 20
 
         subgraph_indexers = [
@@ -802,7 +837,9 @@ class TestFetchStakeToFees:
         ]
 
         # Act
-        with patch("redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)):
+        with patch(
+            "redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
+        ):
             result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
 
         # Assert
@@ -819,12 +856,19 @@ class TestFetchStakeToFees:
         ]
 
         # Act
-        with patch("redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)):
+        with patch(
+            "redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
+        ):
             result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
 
         # Assert
         assert result.index.name == "indexer"
-        assert list(result.columns) == ["stake_to_fees"]
+        expected_cols = [
+            "stake_to_fees",
+            "total_query_fees",
+            "last_known_slashable_stake",
+        ]
+        assert list(result.columns) == expected_cols
 
 
 class TestFeesAccumulatedDuringCountPass:
@@ -852,19 +896,34 @@ class TestFeesAccumulatedDuringCountPass:
 
         # Three messages: indexer1 earns 0.001 + 0.003 = 0.004, indexer2 earns 0.002
         a1 = _build_indexer_attempt(
-            indexer=INDEXER_BYTES, deployment=deployment,
-            indexed_chain="mainnet", url="https://i1.example.com/",
-            fee_grt=0.001, response_time_ms=50, result="success", blocks_behind=0,
+            indexer=INDEXER_BYTES,
+            deployment=deployment,
+            indexed_chain="mainnet",
+            url="https://i1.example.com/",
+            fee_grt=0.001,
+            response_time_ms=50,
+            result="success",
+            blocks_behind=0,
         )
         a2 = _build_indexer_attempt(
-            indexer=INDEXER2_BYTES, deployment=deployment,
-            indexed_chain="mainnet", url="https://i2.example.com/",
-            fee_grt=0.002, response_time_ms=80, result="success", blocks_behind=0,
+            indexer=INDEXER2_BYTES,
+            deployment=deployment,
+            indexed_chain="mainnet",
+            url="https://i2.example.com/",
+            fee_grt=0.002,
+            response_time_ms=80,
+            result="success",
+            blocks_behind=0,
         )
         a3 = _build_indexer_attempt(
-            indexer=INDEXER_BYTES, deployment=deployment,
-            indexed_chain="mainnet", url="https://i1.example.com/",
-            fee_grt=0.003, response_time_ms=60, result="success", blocks_behind=0,
+            indexer=INDEXER_BYTES,
+            deployment=deployment,
+            indexed_chain="mainnet",
+            url="https://i1.example.com/",
+            fee_grt=0.003,
+            response_time_ms=60,
+            result="success",
+            blocks_behind=0,
         )
 
         msg1 = _fake_kafka_message(base_ts_ms, _build_client_query("q1-JFK", [a1, a2]))
@@ -874,10 +933,14 @@ class TestFeesAccumulatedDuringCountPass:
         resolution_consumer = _make_resolution_consumer("gateway_queries", [0])
 
         # Count pass consumer
-        count_consumer = _make_partition_consumer([
-            [msg1, msg2],
-            [], [], [],
-        ])
+        count_consumer = _make_partition_consumer(
+            [
+                [msg1, msg2],
+                [],
+                [],
+                [],
+            ]
+        )
 
         # Act
         with patch("confluent_kafka.Consumer", side_effect=[resolution_consumer, count_consumer]):
