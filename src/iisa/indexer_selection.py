@@ -412,12 +412,16 @@ class IndexerSelector:
         while len(self.current_group) > self.target_size:
             indexer_scores = []
             for indexer in self.current_group:
-                # Calculate each indexers score as if the indexer had 1 less indexing agreement
-                score = self._calculate_indexer_score(indexer)
+                row = self.data[self.data["indexer"] == indexer]
+                score = (
+                    row["weighted_score"].iloc[0]
+                    if not row.empty and "weighted_score" in row.columns
+                    else 0.0
+                )
                 indexer_scores.append((indexer, score))
 
-            # Sort indexers by score, worst (lowest score) first
-            indexer_scores.sort(key=lambda x: x[1], reverse=False)
+            # Sort by score, worst (lowest) first
+            indexer_scores.sort(key=lambda x: x[1])
 
             for indexer, score in indexer_scores:
                 temp_group = self.current_group.copy()
@@ -436,30 +440,6 @@ class IndexerSelector:
                     break
             else:
                 break
-
-    def _calculate_indexer_score(self, indexer):
-        """
-        Calculate the score for an individual indexer as if they had one less indexing agreement.
-        """
-        # Check if the indexer exists in self.data
-        indexer_data = self.data[self.data["indexer"] == indexer]
-
-        if indexer_data.empty:
-            logger.warning(
-                f"Indexer {indexer} not found in self.data. Returning lowest possible score."
-            )
-            return 0
-
-        # Create a copy of the data for this indexer
-        indexer_data = indexer_data.copy()
-
-        # Normalize only the necessary metrics for this indexer
-        normalized_data = _normalize_metrics(indexer_data, price_ceiling=self.price_ceiling)
-
-        # Calculate the weighted score for this indexer
-        score = _calculate_weighted_score(normalized_data.iloc[0], self.weights)
-
-        return score
 
     def _meets_decentralization_requirements_indexer_removal(self, group):
         """
