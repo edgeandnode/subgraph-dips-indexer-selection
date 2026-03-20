@@ -82,9 +82,10 @@ class DataProcessor:
     task of adding or replacing an indexer from being assigned to a subgraph_id, then it dies.
     After death the class can be re-instantiated again immediately to add or replace another
     indexer from being assigned to another subgraph_id. This class will figure out weather to
-    add or replace an indexer depending on the number of existing indexers serving data on the
-    subgraph in question and the quality of the existing indexers serving data on a subgraph compared
-    to the best alternative.
+    add or replace an indexer depending on the number of existing
+    indexers serving data on the subgraph in question and the quality
+    of the existing indexers serving data on a subgraph compared to
+    the best alternative.
     """
 
     def __init__(
@@ -98,6 +99,7 @@ class DataProcessor:
         weights: Optional[WeightsDict] = None,
         target_size: int = 3,
         optimistic_dips_fees: Optional[dict[str, float]] = None,
+        price_ceiling: Optional[float] = None,
     ):
         """
         Initialize the DataProcessor class with data, deployment ID, existing agreements,
@@ -108,6 +110,9 @@ class DataProcessor:
             optimistic_dips_fees: Per-indexer expected DIPs fees in GRT per 30 days,
                 keyed by checksummed hex address. Used to adjust stake_to_fees at
                 request time so indexers with accepted agreements get deprioritised.
+            price_ceiling: Maximum GRT per 30 days that the payer will accept.
+                Used as the normalisation ceiling for pricing scores so that
+                outlier prices cannot compress legitimate price differentiation.
         """
         # Initialize class variables with provided parameters
         self.data = pd.DataFrame(history)
@@ -119,15 +124,18 @@ class DataProcessor:
         self.weights = {**DEFAULT_WEIGHTS, **(weights or {})}
         self.target_size = target_size
         self.optimistic_dips_fees = optimistic_dips_fees or {}
+        self.price_ceiling = price_ceiling
+        self.current_group: list[IndexerId] = []
+        self.initial_group: list[IndexerId] = []
 
-        # Process the data, we can then call update_indexer_denylist_cancel_indexing_agreements,
-        # or get_indexer_selections later after this constructor has finished running.
         self._process_data()
 
         logger.info(
             "DataProcessor completed: deployment=%s target=%d initial=%d final=%d",
-            self.deployment_id, self.target_size,
-            len(self.initial_group), len(self.current_group),
+            self.deployment_id,
+            self.target_size,
+            len(self.initial_group),
+            len(self.current_group),
         )
 
     def update_indexer_denylist_cancel_indexing_agreements(self, indexer_denylist):
@@ -135,16 +143,13 @@ class DataProcessor:
         Cancels all outstanding indexing agreements for indexers on the denylist.
 
         Note:
-        - This method does not currently attempt to reassign indexers to the subgraph after
-          cancellation of the indexing agreement from the denied indexers. Instead we can loop through
-          all of the subgraphs while calling the process_subgraph function. Which will detect when a subgraph
-          has less than the threshold number of indexers assigned to it and reassign an appropriate indexer.
-          We would do this loop at frequent intervals anyway, because it will be important to reassign indexing
-          agreements to high quality indexers after an indexers quality has slipped based on their updated
-          weighted_score. # TODO we could address the above note, as if all indexers on a subgraph got
-          denied simultaneously, there could be a longer than necessary latency while we reassign new indexers.
-        - Although it would likely take some time for new indexers to accept the agreements and finish syncing, so this
-          additional latency while we wait for the for loop to get to the subgraph, might not be a huge issue.
+        - Does not reassign indexers after cancellation. The
+          periodic process_subgraph loop detects under-staffed
+          subgraphs and reassigns.
+          TODO: if all indexers on a subgraph get denied at once
+          there may be extra latency before reassignment.
+        - New indexers still need time to accept and sync, so
+          the loop latency may not matter much in practice.
 
         :param indexer_denylist: A list of indexers that have been denied.
         :return: A dictionary where keys are denied indexers and values are lists of subgraphs
@@ -161,7 +166,7 @@ class DataProcessor:
                     # If indexer not already in cancelled_agreements, create new key-value
                     if indexer not in cancelled_agreements:
                         cancelled_agreements[indexer] = []
-                    # Add subgraphs that the blocked indexer will be cancelled from receiving DIPS for.
+                    # Add subgraphs the blocked indexer loses.
                     cancelled_agreements[indexer].append(subgraph)
 
         return cancelled_agreements
@@ -176,8 +181,8 @@ class DataProcessor:
             If no indexers were added or removed, the respective dictionary will be empty.
 
         :return: A tuple of two dictionaries:
-                - added_dict: A dictionary where the key is the subgraph_id and the value is a list of newly added indexers
-                - cancelled_dict: A dictionary where the key is the subgraph_id and the value is a list of removed indexers
+                - added_dict: subgraph_id -> list of added indexers
+                - cancelled_dict: subgraph_id -> list of removed indexers
         """
         # Compare initial and current groups to determine changes
         added = set(self.current_group) - set(self.initial_group)
@@ -203,10 +208,9 @@ class DataProcessor:
             effective_fees = self.data["total_query_fees"].fillna(0.0) + dips_adjustment
 
             if "last_known_slashable_stake" in self.data.columns:
-                self.data["stake_to_fees"] = (
-                    self.data["last_known_slashable_stake"]
-                    / effective_fees.replace(0.0, float("nan"))
-                )
+                self.data["stake_to_fees"] = self.data[
+                    "last_known_slashable_stake"
+                ] / effective_fees.replace(0.0, float("nan"))
                 # Drop pre-normalised column so _normalize_metrics recomputes it
                 self.data.drop(
                     columns=["norm_stake_to_fees"],
@@ -217,7 +221,9 @@ class DataProcessor:
             adjusted_count = (dips_adjustment > 0).sum()
             logger.info(
                 "deployment=%s applied optimistic DIPs fees to %d/%d indexers",
-                self.deployment_id, adjusted_count, len(self.data),
+                self.deployment_id,
+                adjusted_count,
+                len(self.data),
             )
 
         # Get the current group of indexers for the subgraph using '_get_current_group'
@@ -238,8 +244,10 @@ class DataProcessor:
             logger.debug(
                 "deployment=%s top_5_scores: %s",
                 self.deployment_id,
-                [(row["indexer"][:10], round(row["weighted_score"], 4))
-                 for _, row in top.iterrows()],
+                [
+                    (row["indexer"][:10], round(row["weighted_score"], 4))
+                    for _, row in top.iterrows()
+                ],
             )
 
         # Call _assign_indexers_to_subgraph to assign/replace/remove an indexer on the subgraph.
@@ -247,9 +255,9 @@ class DataProcessor:
 
     def _get_current_group(self):
         """
-        Get the current group of indexers assigned to a subgraph (data from self.existing_agreements).
+        Get the current group of indexers assigned to a subgraph.
 
-        :return: A list containing the indexer assigned to 'self.subgraph_id', or an empty list if no indexer is assigned.
+        :return: Indexers assigned to self.deployment_id, or [].
         """
         # Check if the subgraph_id exists in the agreements and return the corresponding indexers
         return self.existing_agreements.get(self.deployment_id, [])
@@ -263,14 +271,16 @@ class DataProcessor:
         :return: The processed DataFrame.
         """
         try:
-            normalized_data = _normalize_metrics(self.data)
+            normalized_data = _normalize_metrics(self.data, price_ceiling=self.price_ceiling)
             logger.debug(
                 "deployment=%s normalized %d indexers",
-                self.deployment_id, len(normalized_data),
+                self.deployment_id,
+                len(normalized_data),
             )
         except Exception as e:
             logger.error(
-                f"Unexpected error when trying normalize_metrics(self.data): {e}"
+                "Unexpected error when trying normalize_metrics(self.data): %s",
+                e,
             )
             normalized_data = self.data
 
@@ -292,23 +302,28 @@ class DataProcessor:
         assign indexers to the subgraph in question.
         """
         action = (
-            "add" if len(self.current_group) < self.target_size
-            else "remove" if len(self.current_group) > self.target_size
+            "add"
+            if len(self.current_group) < self.target_size
+            else "remove"
+            if len(self.current_group) > self.target_size
             else "replace_check"
         )
         logger.info(
             "deployment=%s assigning: current_size=%d target_size=%d action=%s",
-            self.deployment_id, len(self.current_group), self.target_size, action,
+            self.deployment_id,
+            len(self.current_group),
+            self.target_size,
+            action,
         )
-        # If the current indexer group has less than target_size indexers, call '_add_indexers_to_group'
+        # Under-staffed: add indexers
         if len(self.current_group) < self.target_size:
             self._add_indexers_to_group()
 
-        # If the current indexer group has more than target_size indexers, call '_remove_indexers_from_group'
+        # Over-staffed: remove worst indexers
         if len(self.current_group) > self.target_size:
             self._remove_indexers_from_group()
 
-        # Otherwise, call '_replace_underperforming_indexers' which will search for a suitable replacement
+        # At target: check for underperforming replacements
         if len(self.current_group) == self.target_size:
             self._replace_underperforming_indexers()
 
@@ -325,15 +340,19 @@ class DataProcessor:
                 self.current_group.append(next_indexer)
                 logger.info(
                     "deployment=%s added indexer %s to group (%d/%d)",
-                    self.deployment_id, next_indexer[:10],
-                    len(self.current_group), self.target_size,
+                    self.deployment_id,
+                    next_indexer[:10],
+                    len(self.current_group),
+                    self.target_size,
                 )
 
             # If there are no indexers available, do nothing.
             else:
                 logger.info(
                     "deployment=%s no more candidates available, group is %d/%d",
-                    self.deployment_id, len(self.current_group), self.target_size,
+                    self.deployment_id,
+                    len(self.current_group),
+                    self.target_size,
                 )
                 break
 
@@ -344,7 +363,8 @@ class DataProcessor:
         Check if adding/replacing an indexer meets decentralisation requirements.
 
         When adding: checks if current_group + [new_indexer] meets requirements.
-        When replacing: checks if (current_group - replacing_indexer) + [new_indexer] meets requirements.
+        When replacing: checks if (current_group - replacing_indexer)
+        + [new_indexer] meets requirements.
 
         The resulting group must have at least 2 unique organizations and 2 unique locations.
         This check applies when the resulting group would have 2+ indexers.
@@ -359,9 +379,7 @@ class DataProcessor:
         # Build the resulting group
         if replacing_indexer:
             # Replacement scenario: remove old, add new
-            new_group = [i for i in self.current_group if i != replacing_indexer] + [
-                new_indexer
-            ]
+            new_group = [i for i in self.current_group if i != replacing_indexer] + [new_indexer]
         else:
             # Addition scenario: just add new
             new_group = self.current_group + [new_indexer]
@@ -371,9 +389,7 @@ class DataProcessor:
             return True
 
         # Get unique locations and organizations for the resulting group
-        locations = self.data[self.data["indexer"].isin(new_group)][
-            "destination_loc"
-        ].unique()
+        locations = self.data[self.data["indexer"].isin(new_group)]["destination_loc"].unique()
         orgs = self.data[self.data["indexer"].isin(new_group)]["org"].unique()
 
         # Return True if decentralisation requirements are met
@@ -382,13 +398,16 @@ class DataProcessor:
             logger.debug(
                 "deployment=%s decentralization check failed for %s: "
                 "locations=%d orgs=%d (need 2 each)",
-                self.deployment_id, new_indexer[:10], len(locations), len(orgs),
+                self.deployment_id,
+                new_indexer[:10],
+                len(locations),
+                len(orgs),
             )
         return meets
 
     def _remove_indexers_from_group(self):
         """
-        Remove the worst indexers from the current group until the current group only has target_size indexers.
+        Remove worst indexers until group has target_size indexers.
         """
         while len(self.current_group) > self.target_size:
             indexer_scores = []
@@ -404,14 +423,15 @@ class DataProcessor:
                 temp_group = self.current_group.copy()
                 temp_group.remove(indexer)
 
-                if self._meets_decentralization_requirements_indexer_removal(
-                    temp_group
-                ):
+                if self._meets_decentralization_requirements_indexer_removal(temp_group):
                     self.current_group.remove(indexer)
                     logger.info(
                         "deployment=%s removed worst indexer %s (score=%.4f, group now %d/%d)",
-                        self.deployment_id, indexer[:10], score,
-                        len(self.current_group), self.target_size,
+                        self.deployment_id,
+                        indexer[:10],
+                        score,
+                        len(self.current_group),
+                        self.target_size,
                     )
                     break
             else:
@@ -434,7 +454,7 @@ class DataProcessor:
         indexer_data = indexer_data.copy()
 
         # Normalize only the necessary metrics for this indexer
-        normalized_data = _normalize_metrics(indexer_data)
+        normalized_data = _normalize_metrics(indexer_data, price_ceiling=self.price_ceiling)
 
         # Calculate the weighted score for this indexer
         score = _calculate_weighted_score(normalized_data.iloc[0], self.weights)
@@ -450,9 +470,7 @@ class DataProcessor:
         if len(group) < 2:
             return False
 
-        locations = self.data[self.data["indexer"].isin(group)][
-            "destination_loc"
-        ].unique()
+        locations = self.data[self.data["indexer"].isin(group)]["destination_loc"].unique()
         orgs = self.data[self.data["indexer"].isin(group)]["org"].unique()
 
         # Return 'True' if decentralisation requirements are hit
@@ -500,9 +518,12 @@ class DataProcessor:
                 # Only consider replacing indexers below the minimum threshold
                 if current_score >= MIN_INDEXER_SCORE:
                     logger.debug(
-                        "deployment=%s indexer %s score=%.4f >= threshold=%.2f, no replacement needed",
-                        self.deployment_id, existing_indexer[:10],
-                        current_score, MIN_INDEXER_SCORE,
+                        "deployment=%s indexer %s score=%.4f "
+                        ">= threshold=%.2f, no replacement needed",
+                        self.deployment_id,
+                        existing_indexer[:10],
+                        current_score,
+                        MIN_INDEXER_SCORE,
                     )
                     continue
 
@@ -534,7 +555,10 @@ class DataProcessor:
                 added_this_call.add(new_indexer)
                 logger.info(
                     "deployment=%s replaced indexer %s with %s (improvement=%.4f)",
-                    self.deployment_id, old_indexer[:10], new_indexer[:10], improvement,
+                    self.deployment_id,
+                    old_indexer[:10],
+                    new_indexer[:10],
+                    improvement,
                 )
             else:
                 logger.debug(
@@ -582,7 +606,9 @@ class DataProcessor:
         )
         logger.debug(
             "deployment=%s unpickable: %d in_group, %d denylisted, %d pending, %d declined",
-            self.deployment_id, len(self.current_group), len(self.indexer_denylist),
+            self.deployment_id,
+            len(self.current_group),
+            len(self.indexer_denylist),
             sum(len(v) for v in self.pending_agreements.values()),
             len(self.declined_indexers.get(self.deployment_id, [])),
         )
@@ -594,7 +620,10 @@ class DataProcessor:
         candidates.sort_values(by="weighted_score", ascending=False, inplace=True)
         logger.debug(
             "deployment=%s candidates: %d eligible out of %d total (excluded %d unpickable)",
-            self.deployment_id, len(candidates), len(self.data), len(unpickable_indexers),
+            self.deployment_id,
+            len(candidates),
+            len(self.data),
+            len(unpickable_indexers),
         )
 
         # Iterate through candidates, prefer one that meets decentralization requirements
@@ -605,7 +634,9 @@ class DataProcessor:
                 score = candidates[candidates["indexer"] == indexer]["weighted_score"].iloc[0]
                 logger.debug(
                     "deployment=%s selected %s (score=%.4f, meets decentralization)",
-                    self.deployment_id, indexer[:10], score,
+                    self.deployment_id,
+                    indexer[:10],
+                    score,
                 )
                 return indexer
 
@@ -617,34 +648,37 @@ class DataProcessor:
             logger.debug(
                 "deployment=%s no candidate meets decentralization, "
                 "falling back to best scorer %s (score=%.4f)",
-                self.deployment_id, fallback[:10], fallback_score,
+                self.deployment_id,
+                fallback[:10],
+                fallback_score,
             )
             return fallback
 
         logger.info(
             "deployment=%s zero candidates remain after filtering %d total indexers",
-            self.deployment_id, len(self.data),
+            self.deployment_id,
+            len(self.data),
         )
         return None  # Only when truly zero candidates available
 
-def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
+
+def _normalize_metrics(
+    merged: pd.DataFrame,
+    price_ceiling: Optional[float] = None,
+) -> pd.DataFrame:
     """
-    Normalize various metrics in the merged DataFrame to create comparable scores across different dimensions.
+    Normalize metrics to create comparable scores across dimensions.
 
-    This function takes the merged DataFrame containing various indexer metrics and normalizes them,
-    to create standardized scores. It handles different types of metrics, applying appropriate
-    normalization techniques for each.
+    Each metric is normalized to [0, 1] where 1 = better performance.
+    Metrics where lower is better (latency, price) are inverted.
 
-    Note:
-    - Each metric is normalized to a scale of 0 to 1, where 1 represents better performance.
-    - Some metrics are inverted (1 - normalized value) if lower values are better (e.g., latency, price).
-    - Different normalization techniques are used based on the nature of each metric:
-        - Generic min-max normalization for most metrics
-        - Special normalization for uptime and success rate to emphasize high performance
-        - Price normalization: 1 - (price / ceiling) so cheaper = higher score
-
-    :param merged: The input DataFrame containing various indexer metrics.
-    :return: The input DataFrame with additional columns for normalized metrics.
+    Args:
+        merged: DataFrame containing indexer metrics.
+        price_ceiling: Maximum GRT/30d the payer will accept. When
+            provided, used as the normalisation ceiling for pricing
+            scores instead of the observed max price. This prevents
+            a single outlier price from compressing legitimate price
+            differentiation among other indexers.
     """
     if merged.empty:
         new_columns = [
@@ -699,32 +733,38 @@ def _normalize_metrics(merged: pd.DataFrame) -> pd.DataFrame:
         else:
             merged["norm_success_rate"] = np.nan
 
-    # Normalize base price per epoch (lower is better)
+    # Normalize base price per epoch (lower is better).
+    # When price_ceiling is provided, use it instead of the observed max
+    # so outlier prices cannot compress differentiation among others.
     if "norm_base_price_per_epoch" not in merged.columns:
         if "base_price_per_epoch" in merged.columns:
-            prices = pd.to_numeric(merged["base_price_per_epoch"], errors="coerce").fillna(0.0).clip(lower=0)
-            floor = prices.min()
-            ceiling = prices.max()
-            if ceiling > 0 and ceiling > floor:
-                # Normal case: spread of prices, cheaper = higher score
-                merged["norm_base_price_per_epoch"] = 1 - (prices / ceiling)
+            prices = (
+                pd.to_numeric(merged["base_price_per_epoch"], errors="coerce")
+                .fillna(0.0)
+                .clip(lower=0)
+            )
+            ceiling = (
+                price_ceiling if price_ceiling is not None and price_ceiling > 0 else prices.max()
+            )
+            if ceiling > 0 and ceiling > prices.min():
+                merged["norm_base_price_per_epoch"] = (1 - (prices / ceiling)).clip(lower=0)
             else:
-                # Uniform prices or all zero: use neutral score (price not a differentiator)
                 merged["norm_base_price_per_epoch"] = 0.5
         else:
             merged["norm_base_price_per_epoch"] = np.nan
 
-    # Normalize price per entity (lower is better)
+    # Normalize price per entity (lower is better).
+    # price_ceiling applies to base epoch price; entity pricing uses
+    # observed max since there is no separate budget field for it.
     if "norm_price_per_entity" not in merged.columns:
         if "price_per_entity" in merged.columns:
-            prices = pd.to_numeric(merged["price_per_entity"], errors="coerce").fillna(0.0).clip(lower=0)
-            floor = prices.min()
+            prices = (
+                pd.to_numeric(merged["price_per_entity"], errors="coerce").fillna(0.0).clip(lower=0)
+            )
             ceiling = prices.max()
-            if ceiling > 0 and ceiling > floor:
-                # Normal case: spread of prices, cheaper = higher score
+            if ceiling > 0 and ceiling > prices.min():
                 merged["norm_price_per_entity"] = 1 - (prices / ceiling)
             else:
-                # Uniform prices or all zero: use neutral score (price not a differentiator)
                 merged["norm_price_per_entity"] = 0.5
         else:
             merged["norm_price_per_entity"] = np.nan
@@ -832,9 +872,7 @@ def _calculate_weighted_score(row: pd.Series, weights: dict) -> float:
         logger.warning(f"Missing columns in input data: {', '.join(missing_columns)}")
 
     if weight_total == 0:
-        logger.error(
-            "Total sum of weights is 0. Sum of weights should be non-zero, ideally 1."
-        )
+        logger.error("Total sum of weights is 0. Sum of weights should be non-zero, ideally 1.")
         raise ValueError("Total weight cannot be 0.")
 
     return weighted_sum / weight_total
