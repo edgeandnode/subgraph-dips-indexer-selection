@@ -1098,6 +1098,49 @@ class TestNormalizeMetrics:
         )
         assert result["norm_price_per_entity"].iloc[0] == result["norm_price_per_entity"].max()
 
+    def test_price_ceiling_clamps_outliers(self):
+        """When price_ceiling is provided, prices above it score 0."""
+        df = pd.DataFrame(
+            {
+                "base_price_per_epoch": [10, 50, 200],
+                "Latency Coefficient + Error Confidence Interval": [1, 1, 1],
+                "% up_x": [99, 99, 99],
+                "stake_to_fees": [1.0, 1.0, 1.0],
+                "average_status": [0.99, 0.99, 0.99],
+                "price_per_entity": [0.1, 0.1, 0.1],
+            }
+        )
+        result = _normalize_metrics(df, price_ceiling=100)
+
+        scores = result["norm_base_price_per_epoch"]
+        # 10 GRT: 1 - (10/100) = 0.9
+        assert scores.iloc[0] == pytest.approx(0.9)
+        # 50 GRT: 1 - (50/100) = 0.5
+        assert scores.iloc[1] == pytest.approx(0.5)
+        # 200 GRT: 1 - (200/100) = -1.0, clipped to 0.0
+        assert scores.iloc[2] == pytest.approx(0.0)
+
+    def test_price_ceiling_none_falls_back_to_observed_max(self):
+        """Without price_ceiling, observed max is the ceiling."""
+        df = pd.DataFrame(
+            {
+                "base_price_per_epoch": [10, 50, 200],
+                "Latency Coefficient + Error Confidence Interval": [1, 1, 1],
+                "% up_x": [99, 99, 99],
+                "stake_to_fees": [1.0, 1.0, 1.0],
+                "average_status": [0.99, 0.99, 0.99],
+                "price_per_entity": [0.1, 0.1, 0.1],
+            }
+        )
+        result = _normalize_metrics(df, price_ceiling=None)
+
+        scores = result["norm_base_price_per_epoch"]
+        # ceiling = 200 (observed max)
+        # 10 GRT: 1 - (10/200) = 0.95
+        assert scores.iloc[0] == pytest.approx(0.95)
+        # 200 GRT: 1 - (200/200) = 0.0
+        assert scores.iloc[2] == pytest.approx(0.0)
+
 
 class TestTargetSize:
     """Tests for variable target_size parameter in IndexerSelector."""
