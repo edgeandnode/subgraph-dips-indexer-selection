@@ -7,10 +7,10 @@ This module provides:
 - iisa_http_endpoints: FastAPI HTTP endpoints for the service
 """
 
-from .indexer_selection import DataProcessor
+from .indexer_selection import IndexerSelector
 from .score_loader import DataManager
 
 __all__ = [
     "DataManager",
-    "DataProcessor",
+    "IndexerSelector",
 ]

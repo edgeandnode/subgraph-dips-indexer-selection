@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 __all__ = [
-    "DataProcessor",
+    "IndexerSelector",
     "DeploymentId",
     "IndexerId",
     "IpfsHashStr",
@@ -70,9 +70,9 @@ DEFAULT_WEIGHTS = cast(
 )
 
 
-class DataProcessor:
+class IndexerSelector:
     """
-    DataProcessor is responsible for processing the data from the DataManager class,
+    IndexerSelector is responsible for processing the data from the DataManager class,
     including score calculations, normalization of scores, using custom weightings
     to get an overall weighted score, and selecting the best indexers for subgraphs.
     It also handles indexers that are blocked, replacing under-performing indexers,
@@ -102,7 +102,7 @@ class DataProcessor:
         price_ceiling: Optional[float] = None,
     ):
         """
-        Initialize the DataProcessor class with data, deployment ID, existing agreements,
+        Initialize the IndexerSelector class with data, deployment ID, existing agreements,
         and an indexer denylist.
 
         Args:
@@ -131,7 +131,7 @@ class DataProcessor:
         self._process_data()
 
         logger.info(
-            "DataProcessor completed: deployment=%s target=%d initial=%d final=%d",
+            "IndexerSelector completed: deployment=%s target=%d initial=%d final=%d",
             self.deployment_id,
             self.target_size,
             len(self.initial_group),

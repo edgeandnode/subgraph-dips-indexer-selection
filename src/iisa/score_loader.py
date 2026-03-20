@@ -9,8 +9,7 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import pandas as pd
 
@@ -111,11 +110,9 @@ class DataManager:
         logger.info(f"Loaded scores for {len(self._data)} indexers")
         return True
 
-    def _transform_scores_to_perf_history(
-        self, scores_df: pd.DataFrame
-    ) -> pd.DataFrame:
+    def _transform_scores_to_perf_history(self, scores_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Transform indexer_scores table format to DataProcessor-compatible format.
+        Transform indexer_scores table format to IndexerSelector-compatible format.
 
         Column mapping:
         - lat_coefficient_upper_bound -> "Latency Coefficient + Error Confidence Interval"
@@ -126,20 +123,21 @@ class DataManager:
         """
         df = scores_df.copy()
 
-        # TODO: Refactor DataProcessor to use CronJob column names directly
-        df = df.rename(columns={
-            "lat_coefficient_upper_bound": "Latency Coefficient + Error Confidence Interval",
-            "success_rate": "average_status",
-            "lat_normalized_score": "norm_lat_lin_reg_coefficient",
-        })
+        # TODO: Refactor IndexerSelector to use CronJob column names directly
+        df = df.rename(
+            columns={
+                "lat_coefficient_upper_bound": "Latency Coefficient + Error Confidence Interval",
+                "success_rate": "average_status",
+                "lat_normalized_score": "norm_lat_lin_reg_coefficient",
+            }
+        )
 
         if "uptime_score" in df.columns:
             df["% up_x"] = df["uptime_score"] * 100
 
         if "dst_lat" in df.columns and "dst_lon" in df.columns:
             df["destination_loc"] = (
-                df["dst_lat"].fillna(0).astype(str) + "," +
-                df["dst_lon"].fillna(0).astype(str)
+                df["dst_lat"].fillna(0).astype(str) + "," + df["dst_lon"].fillna(0).astype(str)
             )
 
         return df

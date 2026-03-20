@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .indexer_selection import DataProcessor
+from .indexer_selection import IndexerSelector
 from .score_loader import DataManager, FileScoreLoader
 
 __all__ = ["app", "Settings", "get_settings"]
@@ -395,7 +395,7 @@ async def get_score(request: ScoreRequest) -> ScoreResponse:
         if col in row.index and pd.notna(row[col]):
             components[name] = float(row[col])
 
-    # Calculate weighted score using DataProcessor logic
+    # Calculate weighted score using IndexerSelector logic
     from .indexer_selection import DEFAULT_WEIGHTS, _calculate_weighted_score, _normalize_metrics
 
     # Normalize and calculate score for this single indexer
@@ -427,7 +427,7 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
     weighted aggregate score, preferring groups with >1 unique org and >1 unique
     location when N > 1. These decentralization constraints are best-effort.
 
-    Note on existing_indexers: This tells DataProcessor which indexers are currently
+    Note on existing_indexers: This tells IndexerSelector which indexers are currently
     assigned, allowing it to decide whether to add, remove, or replace indexers.
     To get a fresh selection ignoring current assignments, pass existing_indexers: [].
     """
@@ -648,9 +648,9 @@ def _build_selected_indexers(
 
 def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     """
-    Use DataProcessor for intelligent indexer selection.
+    Use IndexerSelector for intelligent indexer selection.
 
-    The DataProcessor uses weighted scoring based on:
+    The IndexerSelector uses weighted scoring based on:
     - Stake to fees ratio (economic security)
     - Base price per epoch (cheaper is better)
     - Latency linear regression coefficient
@@ -699,8 +699,8 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     # Build pending_agreements dict - convert to expected format
     pending_agreements: dict[str, list[str]] = request.pending_agreements or {}
 
-    # Create DataProcessor instance with target_size from num_candidates
-    processor = DataProcessor(
+    # Create IndexerSelector instance with target_size from num_candidates
+    processor = IndexerSelector(
         history=enriched_history,
         deployment_id=request.deployment_id,
         existing_agreements=existing_agreements,
