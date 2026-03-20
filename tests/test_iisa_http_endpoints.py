@@ -1,13 +1,11 @@
 """Tests for the IISA HTTP API endpoints."""
 
 import os
-from functools import lru_cache
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
 
 
 class TestSettings:
@@ -163,7 +161,7 @@ class TestIISAState:
     """Tests for IISAState lifecycle management."""
 
     def test_init_default_state(self):
-        """Verify initial state: settings=None, data_manager=None, _history=None, _initialized=False."""
+        """Verify initial state has all fields set to None/False."""
         # Arrange & Act
         from iisa.iisa_http_endpoints import IISAState
 
@@ -351,20 +349,26 @@ def reset_state():
 @pytest.fixture
 def mock_history_df():
     """Create a mock DataFrame simulating loaded history data."""
-    return pd.DataFrame({
-        "indexer": ["0xabc", "0xxyz", "0x123"],  # lowercase for case-insensitive matching
-        "url": ["https://a.com/", "https://b.com/", "https://c.com/"],
-        "norm_lat_lin_reg_coefficient": [0.8, 0.9, 0.6],
-        "norm_uptime_score": [0.9, 0.7, 0.95],
-        "norm_success_rate": [0.85, 0.6, 0.9],
-        "norm_stake_to_fees": [0.5, 0.8, 0.65],
-        "norm_base_price_per_epoch": [0.7, 0.8, 0.9],
-        "norm_price_per_entity": [0.6, 0.7, 0.8],
-        "dips_info_available": [True, True, False],
-        "dips_min_grt_per_30_days": ['{"arbitrum-one": "450"}', '{"arbitrum-one": "500"}', "{}"],
-        "dips_min_grt_per_billion_entities_per_30_days": ["200", "300", None],
-        "dips_supported_networks": ['["arbitrum-one"]', '["arbitrum-one"]', "[]"],
-    })
+    return pd.DataFrame(
+        {
+            "indexer": ["0xabc", "0xxyz", "0x123"],  # lowercase for case-insensitive matching
+            "url": ["https://a.com/", "https://b.com/", "https://c.com/"],
+            "norm_lat_lin_reg_coefficient": [0.8, 0.9, 0.6],
+            "norm_uptime_score": [0.9, 0.7, 0.95],
+            "norm_success_rate": [0.85, 0.6, 0.9],
+            "norm_stake_to_fees": [0.5, 0.8, 0.65],
+            "norm_base_price_per_epoch": [0.7, 0.8, 0.9],
+            "norm_price_per_entity": [0.6, 0.7, 0.8],
+            "dips_info_available": [True, True, False],
+            "dips_min_grt_per_30_days": [
+                '{"arbitrum-one": "450"}',
+                '{"arbitrum-one": "500"}',
+                "{}",
+            ],
+            "dips_min_grt_per_billion_entities_per_30_days": ["200", "300", None],
+            "dips_supported_networks": ['["arbitrum-one"]', '["arbitrum-one"]', "[]"],
+        }
+    )
 
 
 class TestHealthEndpoint:
@@ -557,11 +561,11 @@ class TestGetScoreEndpoint:
 class TestSelectIndexersEndpoint:
     """Tests for POST /select-indexers endpoint."""
 
-    @patch("iisa.iisa_http_endpoints.DataProcessor")
+    @patch("iisa.iisa_http_endpoints.IndexerSelector")
     def test_select_indexers_returns_deployment_id_and_indexers(
         self, mock_processor_class, mock_history_df
     ):
-        """With data loaded, mock DataProcessor, verify response structure."""
+        """With data loaded, mock IndexerSelector, verify response structure."""
         # Arrange
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import app
@@ -616,11 +620,11 @@ class TestSelectIndexersEndpoint:
         assert response.status_code == 503
         assert "IISA data not loaded" in response.json()["detail"]
 
-    @patch("iisa.iisa_http_endpoints.DataProcessor")
+    @patch("iisa.iisa_http_endpoints.IndexerSelector")
     def test_select_indexers_processor_exception_returns_500(
         self, mock_processor_class, mock_history_df
     ):
-        """DataProcessor raises, verify 500 returned."""
+        """IndexerSelector raises, verify 500 returned."""
         # Arrange
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import app
@@ -645,7 +649,7 @@ class TestSelectIndexersEndpoint:
         assert response.status_code == 500
         assert "Selection failed: Processing failed" in response.json()["detail"]
 
-    @patch("iisa.iisa_http_endpoints.DataProcessor")
+    @patch("iisa.iisa_http_endpoints.IndexerSelector")
     def test_select_indexers_zero_num_candidates(self, mock_processor_class, mock_history_df):
         """Verify empty list returned when num_candidates is 0."""
         # Arrange
@@ -673,9 +677,9 @@ class TestSelectIndexersEndpoint:
         assert len(data["indexers"]) == 0
         mock_processor_class.assert_not_called()
 
-    @patch("iisa.iisa_http_endpoints.DataProcessor")
+    @patch("iisa.iisa_http_endpoints.IndexerSelector")
     def test_select_indexers_empty_result(self, mock_processor_class, mock_history_df):
-        """DataProcessor returns no selection, verify empty indexers list."""
+        """IndexerSelector returns no selection, verify empty indexers list."""
         # Arrange
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import app
@@ -704,9 +708,9 @@ class TestSelectIndexersEndpoint:
         assert data["deployment_id"] == "Qm123"
         assert len(data["indexers"]) == 0
 
-    @patch("iisa.iisa_http_endpoints.DataProcessor")
+    @patch("iisa.iisa_http_endpoints.IndexerSelector")
     def test_select_indexers_passes_target_size(self, mock_processor_class, mock_history_df):
-        """Verify num_candidates passed as target_size to DataProcessor."""
+        """Verify num_candidates passed as target_size to IndexerSelector."""
         # Arrange
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import app
@@ -737,11 +741,11 @@ class TestSelectIndexersEndpoint:
 class TestSelectWithProcessor:
     """Tests for _select_with_processor helper."""
 
-    @patch("iisa.iisa_http_endpoints.DataProcessor")
+    @patch("iisa.iisa_http_endpoints.IndexerSelector")
     def test_select_with_processor_returns_selection_response(
         self, mock_processor_class, mock_history_df
     ):
-        """Mock DataProcessor.current_group, verify SelectionResponse returned."""
+        """Mock IndexerSelector.current_group, verify SelectionResponse returned."""
         # Arrange
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import (
@@ -789,10 +793,8 @@ class TestSelectWithProcessor:
         assert result.deployment_id == "Qm123"
         assert result.indexers == []
 
-    @patch("iisa.iisa_http_endpoints.DataProcessor")
-    def test_select_with_processor_maps_blocklist(
-        self, mock_processor_class, mock_history_df
-    ):
+    @patch("iisa.iisa_http_endpoints.IndexerSelector")
+    def test_select_with_processor_maps_blocklist(self, mock_processor_class, mock_history_df):
         """Verify blocklist mapped to indexer_denylist param."""
         # Arrange
         from iisa import iisa_http_endpoints
@@ -817,7 +819,7 @@ class TestSelectWithProcessor:
         call_kwargs = mock_processor_class.call_args[1]
         assert call_kwargs["indexer_denylist"] == ["0xBAD1", "0xBAD2"]
 
-    @patch("iisa.iisa_http_endpoints.DataProcessor")
+    @patch("iisa.iisa_http_endpoints.IndexerSelector")
     def test_select_with_processor_builds_existing_agreements(
         self, mock_processor_class, mock_history_df
     ):
@@ -845,7 +847,7 @@ class TestSelectWithProcessor:
         call_kwargs = mock_processor_class.call_args[1]
         assert call_kwargs["existing_agreements"] == {"Qm123": ["0xEXIST1", "0xEXIST2"]}
 
-    @patch("iisa.iisa_http_endpoints.DataProcessor")
+    @patch("iisa.iisa_http_endpoints.IndexerSelector")
     def test_select_with_processor_passes_pending_agreements(
         self, mock_processor_class, mock_history_df
     ):
@@ -874,7 +876,7 @@ class TestSelectWithProcessor:
         call_kwargs = mock_processor_class.call_args[1]
         assert call_kwargs["pending_agreements"] == pending
 
-    @patch("iisa.iisa_http_endpoints.DataProcessor")
+    @patch("iisa.iisa_http_endpoints.IndexerSelector")
     def test_select_with_processor_passes_declined_indexers(
         self, mock_processor_class, mock_history_df
     ):
@@ -903,11 +905,9 @@ class TestSelectWithProcessor:
         call_kwargs = mock_processor_class.call_args[1]
         assert call_kwargs["declined_indexers"] == declined
 
-    @patch("iisa.iisa_http_endpoints.DataProcessor")
-    def test_select_with_processor_passes_target_size(
-        self, mock_processor_class, mock_history_df
-    ):
-        """Verify num_candidates passed as target_size to DataProcessor."""
+    @patch("iisa.iisa_http_endpoints.IndexerSelector")
+    def test_select_with_processor_passes_target_size(self, mock_processor_class, mock_history_df):
+        """Verify num_candidates passed as target_size to IndexerSelector."""
         # Arrange
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import SelectionRequest, _select_with_processor

@@ -17,12 +17,10 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import airportsdata
-from subgraph import paginate_subgraph_query
 import geoip2.database
 import geoip2.errors
 import numpy as np
 import pandas as pd
-import requests
 from numpy.linalg import pinv
 from scipy.stats import t
 from sklearn.compose import ColumnTransformer
@@ -30,6 +28,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from subgraph import paginate_subgraph_query
 
 if TYPE_CHECKING:
     import aiohttp
@@ -117,15 +116,22 @@ def get_geoip_asn_reader() -> geoip2.database.Reader:
         logger.info(f"Loaded GeoIP ASN database from {GEOIP_ASN_DATABASE_PATH}")
     return _geoip_asn_reader
 
+
 # Iterative filter constants
 ITERATIVE_FILTER_MIN_DEPLOYMENT_INDEXERS = 2
 ITERATIVE_FILTER_MIN_DEPLOYMENTS_PER_INDEXER = 1
 ITERATIVE_FILTER_MIN_QUERIES_PER_INDEXER = 250
 ITERATIVE_FILTER_MIN_QUERIES_PER_DEPLOYMENT = 250
 
+
 # Column rename mappings for geolocation data
 def _geoip_column_mapping(prefix: str) -> dict:
-    return {"country": f"{prefix}_country", "latitude": f"{prefix}_lat", "longitude": f"{prefix}_lon"}
+    return {
+        "country": f"{prefix}_country",
+        "latitude": f"{prefix}_lat",
+        "longitude": f"{prefix}_lon",
+    }
+
 
 GEOIP_DST_COLUMN_MAPPING = _geoip_column_mapping("dst")
 GEOIP_SRC_COLUMN_MAPPING = _geoip_column_mapping("src")
@@ -215,7 +221,9 @@ async def _fetch_single_dips_info_async(
         try:
             data = await do_fetch()
             min_prices = data.get("pricing", {}).get("min_grt_per_30_days", {})
-            min_entity_price = data.get("pricing", {}).get("min_grt_per_billion_entities_per_30_days")
+            min_entity_price = data.get("pricing", {}).get(
+                "min_grt_per_billion_entities_per_30_days"
+            )
             supported_networks = data.get("supported_networks", [])
             # If supported_networks not explicitly provided, infer from price keys
             if not supported_networks and isinstance(min_prices, dict):
@@ -223,8 +231,12 @@ async def _fetch_single_dips_info_async(
             return {
                 "indexer": indexer,
                 "dips_info_available": True,
-                "dips_min_grt_per_30_days": json.dumps(min_prices) if isinstance(min_prices, dict) else "{}",
-                "dips_min_grt_per_billion_entities_per_30_days": str(min_entity_price) if min_entity_price is not None else None,
+                "dips_min_grt_per_30_days": json.dumps(min_prices)
+                if isinstance(min_prices, dict)
+                else "{}",
+                "dips_min_grt_per_billion_entities_per_30_days": str(min_entity_price)
+                if min_entity_price is not None
+                else None,
                 "dips_supported_networks": json.dumps(supported_networks),
             }
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -232,7 +244,7 @@ async def _fetch_single_dips_info_async(
             if attempt < DIPS_INFO_MAX_RETRIES - 1:
                 delay = min(
                     DIPS_INFO_RETRY_BACKOFF_MAX,
-                    DIPS_INFO_RETRY_BACKOFF_MULTIPLIER * (2 ** attempt),
+                    DIPS_INFO_RETRY_BACKOFF_MULTIPLIER * (2**attempt),
                 )
                 await asyncio.sleep(delay)
 
@@ -274,8 +286,13 @@ def fetch_dips_info(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     """
     if not indexer_urls:
         return pd.DataFrame(
-            columns=["indexer", "dips_info_available", "dips_min_grt_per_30_days",
-                     "dips_min_grt_per_billion_entities_per_30_days", "dips_supported_networks"]
+            columns=[
+                "indexer",
+                "dips_info_available",
+                "dips_min_grt_per_30_days",
+                "dips_min_grt_per_billion_entities_per_30_days",
+                "dips_supported_networks",
+            ]
         )
 
     results = asyncio.run(_fetch_all_dips_info_async(indexer_urls))
@@ -324,7 +341,9 @@ def compute_all_scores(
         combined_queries = merge_in_query_geolocation_info(combined_queries)
     else:
         # No GeoIP: add expected columns as NaN so downstream functions don't crash
-        logger.warning("GeoIP unavailable, skipping geo resolution. Latency scores will be neutral.")
+        logger.warning(
+            "GeoIP unavailable, skipping geo resolution. Latency scores will be neutral."
+        )
         for col in ["dst_lat", "dst_lon", "dst_country", "org", "ip_addr"]:
             combined_queries[col] = np.nan
         combined_queries["indexer_network"] = "arbitrum"
@@ -342,7 +361,8 @@ def compute_all_scores(
 
         logger.info(f"Before filter_successful_queries: {len(combined_queries)} rows")
         dst_lat_nan_count = combined_queries["dst_lat"].isna().sum()
-        logger.info(f"  src_lat NaN: {combined_queries['src_lat'].isna().sum()}, dst_lat NaN: {dst_lat_nan_count}")
+        src_lat_nan_count = combined_queries["src_lat"].isna().sum()
+        logger.info(f"  src_lat NaN: {src_lat_nan_count}, dst_lat NaN: {dst_lat_nan_count}")
 
         if dst_lat_nan_count == len(combined_queries):
             raise RuntimeError(
@@ -360,14 +380,17 @@ def compute_all_scores(
 
         filtered_data = combined_queries_filtered[predictor + categorical + numeric]
         logger.info(f"After column selection: {len(filtered_data)} rows")
-        logger.info(f"  NaN counts - distance_miles: {filtered_data['distance_miles'].isna().sum()}, fee: {filtered_data['fee'].isna().sum()}")
+        dist_nan = filtered_data["distance_miles"].isna().sum()
+        fee_nan = filtered_data["fee"].isna().sum()
+        logger.info(f"  NaN counts - distance_miles: {dist_nan}, fee: {fee_nan}")
         filtered_data = filtered_data.dropna(subset=numeric)
         logger.info(f"After dropna(numeric): {len(filtered_data)} rows")
 
         if len(filtered_data) == 0:
             raise RuntimeError(
-                "No rows remain after dropping NaN values in numeric columns (distance_miles, fee). "
-                "This typically means GeoIP resolution failed (all distances are NaN) or "
+                "No rows remain after dropping NaN values in numeric "
+                "columns (distance_miles, fee). This typically means "
+                "GeoIP resolution failed (all distances are NaN) or "
                 "there's a data quality issue with the source tables."
             )
 
@@ -398,22 +421,27 @@ def compute_all_scores(
         latency_rankings, latency_results = perform_latency_linear_regression(
             filtered_data, predictor, categorical, numeric
         )
-        indexer_query_count = filtered_data.groupby("indexer").size().reset_index(name="query_count")
+        indexer_query_count = (
+            filtered_data.groupby("indexer").size().reset_index(name="query_count")
+        )
     else:
         # No GeoIP: synthetic neutral latency rankings for all indexers
         unique_indexers = combined_queries["indexer"].unique()
-        latency_rankings = pd.DataFrame({
-            "indexer": unique_indexers,
-            "Latency Coefficient": 0.0,
-            "Standard Error": 0.0,
-            "p-value": 1.0,
-            "Latency Coefficient + Error Confidence Interval": 0.0,
-            "Robust Normalized Latency Coefficient + Error Confidence Interval": 0.0,
-        })
-        indexer_query_count = pd.DataFrame({
-            "indexer": unique_indexers,
-            "query_count": 0,
-        })
+        latency_rankings = pd.DataFrame(
+            {
+                "indexer": unique_indexers,
+                "Latency Coefficient": 0.0,
+                "Standard Error": 0.0,
+                "p-value": 1.0,
+                "Latency Coefficient + Error Confidence Interval": 0.0,
+            }
+        )
+        indexer_query_count = pd.DataFrame(
+            {
+                "indexer": unique_indexers,
+                "query_count": 0,
+            }
+        )
 
     # GeoIP-independent metrics: always computed from real Redpanda data
     indexer_success_rate = calculate_indexer_success_rate(combined_queries)
@@ -453,7 +481,11 @@ def compute_all_scores(
     scores_df = transform_to_scores_schema(merged)
     scores_df["scoring_mode"] = "full" if geoip_available else "partial_no_geoip"
 
-    logger.info(f"Score computation complete: {len(scores_df)} indexers, mode={'full' if geoip_available else 'partial'}, columns: {list(scores_df.columns)}")
+    mode = "full" if geoip_available else "partial"
+    logger.info(
+        f"Score computation complete: {len(scores_df)} indexers, "
+        f"mode={mode}, columns: {list(scores_df.columns)}"
+    )
     return scores_df
 
 
@@ -477,11 +509,10 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
         "Latency Coefficient + Error Confidence Interval"
     )
 
-    # Compute normalized latency score
-    lat_normalized = merged.get("Robust Normalized Latency Coefficient + Error Confidence Interval")
-    if lat_normalized is not None:
-        # Invert and rescale to 0-1 (lower latency = higher score)
-        scores["lat_normalized_score"] = normalize_to_0_1_inverted(lat_normalized)
+    # Compute normalized latency score (lower latency = higher score)
+    lat_raw = merged.get("Latency Coefficient + Error Confidence Interval")
+    if lat_raw is not None:
+        scores["lat_normalized_score"] = normalize_to_0_1_inverted(lat_raw)
     else:
         scores["lat_normalized_score"] = None
 
@@ -541,26 +572,6 @@ def normalize_to_0_1_inverted(series: pd.Series) -> pd.Series:
         return series
     normalized = normalize_to_0_1(series)
     return 1 - normalized
-
-
-
-def calculate_iqr_deviation(series: pd.Series) -> pd.Series:
-    """
-    Calculate IQR-based deviation from median.
-
-    Returns (value - median) / IQR for each value in the series.
-    Used for robust normalization that's less sensitive to outliers.
-
-    If IQR is zero (all values in Q1-Q3 range are identical), returns 0 for all values
-    since there's no meaningful deviation to measure.
-    """
-    median_val = series.median()
-    q1 = series.quantile(0.25)
-    q3 = series.quantile(0.75)
-    iqr = q3 - q1
-    if iqr == 0:
-        return pd.Series([0.0] * len(series), index=series.index)
-    return (series - median_val) / iqr
 
 
 def resolve_indexer_geoip(combined_queries: pd.DataFrame) -> pd.DataFrame:
@@ -758,7 +769,9 @@ def calculate_distances(data: pd.DataFrame) -> pd.DataFrame:
 
 def haversine_vectorized(lon1, lat1, lon2, lat2):
     """Vectorized haversine distance calculation."""
-    lon1, lat1, lon2, lat2 = [np.radians(np.asarray(x, dtype=float)) for x in [lon1, lat1, lon2, lat2]]
+    lon1, lat1, lon2, lat2 = [
+        np.radians(np.asarray(x, dtype=float)) for x in [lon1, lat1, lon2, lat2]
+    ]
     dlon = lon2 - lon1
     dlat = lat2 - lat1
     a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
@@ -788,22 +801,34 @@ def iterative_filter(
         # Ensure deployments have minimum indexers
         indexer_per_deployment = df.groupby("deployment_hash")["indexer"].nunique()
         df = df[df["deployment_hash"].map(indexer_per_deployment) >= min_deployment_indexers]
-        logger.info(f"  iter {iteration} after min_deployment_indexers ({min_deployment_indexers}): {len(df)} rows")
+        logger.info(
+            f"  iter {iteration} after min_deployment_indexers "
+            f"({min_deployment_indexers}): {len(df)} rows"
+        )
 
         # Ensure indexers serve minimum deployments
         deployment_per_indexer = df.groupby("indexer")["deployment_hash"].nunique()
         df = df[df["indexer"].map(deployment_per_indexer) >= min_deployments_per_indexer]
-        logger.info(f"  iter {iteration} after min_deployments_per_indexer ({min_deployments_per_indexer}): {len(df)} rows")
+        logger.info(
+            f"  iter {iteration} after min_deployments_per_indexer "
+            f"({min_deployments_per_indexer}): {len(df)} rows"
+        )
 
         # Ensure indexers serve minimum queries
         queries_per_indexer = df.groupby("indexer")["query_id"].nunique()
         df = df[df["indexer"].map(queries_per_indexer) >= min_queries_per_indexer]
-        logger.info(f"  iter {iteration} after min_queries_per_indexer ({min_queries_per_indexer}): {len(df)} rows")
+        logger.info(
+            f"  iter {iteration} after min_queries_per_indexer "
+            f"({min_queries_per_indexer}): {len(df)} rows"
+        )
 
         # Ensure deployments have minimum queries
         query_counts = df.groupby("deployment_hash").size()
         df = df[df["deployment_hash"].map(query_counts) >= min_queries_per_deployment]
-        logger.info(f"  iter {iteration} after min_queries_per_deployment ({min_queries_per_deployment}): {len(df)} rows")
+        logger.info(
+            f"  iter {iteration} after min_queries_per_deployment "
+            f"({min_queries_per_deployment}): {len(df)} rows"
+        )
 
         if len(df) == initial_len:
             break
@@ -831,9 +856,7 @@ def strategic_sample(df: pd.DataFrame, target_rows_per_subgraph: int) -> Tuple[p
     query_counts["cap"] = query_counts["deployment_hash"].map(cap_per_indexer)
 
     def sample_queries(query_ids, cap):
-        query_ids = (
-            list(np.concatenate(query_ids)) if isinstance(query_ids[0], list) else query_ids
-        )
+        query_ids = list(np.concatenate(query_ids)) if isinstance(query_ids[0], list) else query_ids
         return np.random.choice(query_ids, size=min(len(query_ids), cap), replace=False)
 
     query_counts["sampled_query_id_list"] = query_counts.apply(
@@ -875,7 +898,11 @@ def perform_latency_linear_regression(
 
     pipeline = Pipeline([("preprocessor", preprocessor), ("regressor", LinearRegression())])
     try:
-        logger.info(f"Fitting linear regression model with {len(x)} samples, {len(categorical)} categorical and {len(numeric)} numeric features")
+        logger.info(
+            f"Fitting linear regression model with {len(x)} samples, "
+            f"{len(categorical)} categorical and {len(numeric)} numeric "
+            f"features"
+        )
         pipeline.fit(x, y)
     except Exception:
         logger.exception("Linear regression fitting failed")
@@ -899,12 +926,14 @@ def perform_latency_linear_regression(
     t_scores = coefficients / std_errors
     p_values = [2 * (1 - t.cdf(abs(ts), deg_freedom)) for ts in t_scores]
 
-    results_df = pd.DataFrame({
-        "Variable": feature_names,
-        "Latency Coefficient": coefficients,
-        "Standard Error": std_errors,
-        "p-value": p_values,
-    })
+    results_df = pd.DataFrame(
+        {
+            "Variable": feature_names,
+            "Latency Coefficient": coefficients,
+            "Standard Error": std_errors,
+            "p-value": p_values,
+        }
+    )
 
     # Calculate robust normalized coefficients
     indexer_rankings = results_df[
@@ -915,15 +944,13 @@ def perform_latency_linear_regression(
     indexer_rankings = indexer_rankings.reset_index(drop=True)
     indexer_rankings["Variable"] = indexer_rankings["Variable"].str.replace("one_hot__indexer_", "")
     indexer_rankings.rename(columns={"Variable": "indexer"}, inplace=True)
-    indexer_rankings.dropna(subset=["Latency Coefficient", "Standard Error", "p-value"], inplace=True)
+    indexer_rankings.dropna(
+        subset=["Latency Coefficient", "Standard Error", "p-value"], inplace=True
+    )
 
     indexer_rankings["Latency Coefficient + Error Confidence Interval"] = (
         indexer_rankings["Latency Coefficient"]
         + LATENCY_COEFFICIENT_STANDARD_ERROR_MULTIPLIER * indexer_rankings["Standard Error"]
-    )
-
-    indexer_rankings["Robust Normalized Latency Coefficient + Error Confidence Interval"] = (
-        calculate_iqr_deviation(indexer_rankings["Latency Coefficient + Error Confidence Interval"])
     )
 
     return indexer_rankings, results_df
@@ -936,9 +963,7 @@ def calculate_indexer_success_rate(df: pd.DataFrame) -> pd.DataFrame:
         lambda x: 1 if x in [REQUEST_STATUS_OK, REQUEST_STATUS_UNAVAILABLE_MISSING_BLOCK] else 0
     )
     return (
-        df_filtered.groupby("indexer")
-        .agg(average_status=("status_numeric", "mean"))
-        .reset_index()
+        df_filtered.groupby("indexer").agg(average_status=("status_numeric", "mean")).reset_index()
     )
 
 
@@ -951,26 +976,42 @@ def calculate_indexer_uptime(df: pd.DataFrame, threshold_seconds: int = 120) -> 
     df_copy["next_timestamp"] = df_copy.groupby("indexer")["timestamp"].shift(-1)
     df_copy["previous_timestamp"] = df_copy.groupby("indexer")["timestamp"].shift(1)
 
-    df_copy["gap_to_next_query"] = (df_copy["next_timestamp"] - df_copy["timestamp"]).dt.total_seconds()
-    df_copy["gap_to_previous_query"] = (df_copy["timestamp"] - df_copy["previous_timestamp"]).dt.total_seconds()
+    df_copy["gap_to_next_query"] = (
+        df_copy["next_timestamp"] - df_copy["timestamp"]
+    ).dt.total_seconds()
+    df_copy["gap_to_previous_query"] = (
+        df_copy["timestamp"] - df_copy["previous_timestamp"]
+    ).dt.total_seconds()
 
-    df_copy["next_midpoint"] = df_copy["timestamp"] + pd.to_timedelta(df_copy["gap_to_next_query"] / 2, unit="s")
+    df_copy["next_midpoint"] = df_copy["timestamp"] + pd.to_timedelta(
+        df_copy["gap_to_next_query"] / 2, unit="s"
+    )
     df_copy["next_midpoint"] = df_copy["next_midpoint"].fillna(df_copy["timestamp"])
 
-    df_copy["previous_midpoint"] = df_copy["timestamp"] - pd.to_timedelta(df_copy["gap_to_previous_query"] / 2, unit="s")
+    df_copy["previous_midpoint"] = df_copy["timestamp"] - pd.to_timedelta(
+        df_copy["gap_to_previous_query"] / 2, unit="s"
+    )
     df_copy["previous_midpoint"] = df_copy["previous_midpoint"].fillna(df_copy["timestamp"])
 
-    df_copy["is_up"] = df_copy["status"].isin([REQUEST_STATUS_OK, REQUEST_STATUS_UNAVAILABLE_MISSING_BLOCK])
+    df_copy["is_up"] = df_copy["status"].isin(
+        [REQUEST_STATUS_OK, REQUEST_STATUS_UNAVAILABLE_MISSING_BLOCK]
+    )
 
     df_copy["uptime_duration_full"] = (
-        (df_copy["next_midpoint"] - df_copy["previous_midpoint"]).dt.total_seconds().where(df_copy["is_up"], 0)
+        (df_copy["next_midpoint"] - df_copy["previous_midpoint"])
+        .dt.total_seconds()
+        .where(df_copy["is_up"], 0)
     )
     df_copy["uptime_duration_restricted"] = np.minimum(
-        (df_copy["next_midpoint"] - df_copy["previous_midpoint"]).dt.total_seconds().where(df_copy["is_up"], 0),
+        (df_copy["next_midpoint"] - df_copy["previous_midpoint"])
+        .dt.total_seconds()
+        .where(df_copy["is_up"], 0),
         threshold_seconds,
     )
 
-    df_copy["observed_duration_full"] = (df_copy["next_midpoint"] - df_copy["previous_midpoint"]).dt.total_seconds()
+    df_copy["observed_duration_full"] = (
+        df_copy["next_midpoint"] - df_copy["previous_midpoint"]
+    ).dt.total_seconds()
     df_copy["observed_duration_restricted"] = np.minimum(
         (df_copy["next_midpoint"] - df_copy["previous_midpoint"]).dt.total_seconds(),
         threshold_seconds,
@@ -982,20 +1023,29 @@ def calculate_indexer_uptime(df: pd.DataFrame, threshold_seconds: int = 120) -> 
     observed_full = df_copy.groupby("indexer")["observed_duration_full"].sum()
     observed_restricted = df_copy.groupby("indexer")["observed_duration_restricted"].sum()
 
-    merged_restricted = pd.merge(observed_restricted, uptime_restricted, on="indexer", how="left").reset_index()
-    merged_restricted["% up"] = round(merged_restricted["uptime_duration_restricted"] / merged_restricted["observed_duration_restricted"] * 100, 3)
+    merged_restricted = pd.merge(
+        observed_restricted, uptime_restricted, on="indexer", how="left"
+    ).reset_index()
+    merged_restricted["% up"] = round(
+        merged_restricted["uptime_duration_restricted"]
+        / merged_restricted["observed_duration_restricted"]
+        * 100,
+        3,
+    )
     merged_restricted = merged_restricted.sort_values(by="% up", ascending=False)
 
     merged_full = pd.merge(observed_full, uptime_full, on="indexer", how="left").reset_index()
-    merged_full["% up"] = round(merged_full["uptime_duration_full"] / merged_full["observed_duration_full"] * 100, 3)
+    merged_full["% up"] = round(
+        merged_full["uptime_duration_full"] / merged_full["observed_duration_full"] * 100, 3
+    )
     merged_full = merged_full.sort_values(by="% up", ascending=False)
 
     return pd.merge(merged_restricted, merged_full, on="indexer", how="left")
 
 
-
 def aggregate_indexer_info(df: pd.DataFrame) -> pd.DataFrame:
     """Aggregate organizational and location info per indexer."""
+
     def round_to_20(x):
         return x if pd.isna(x) else round(x / 20) * 20
 
@@ -1006,12 +1056,14 @@ def aggregate_indexer_info(df: pd.DataFrame) -> pd.DataFrame:
 
     agg_df = (
         df.groupby("indexer")
-        .agg({
-            "url": first_non_null,  # Take first non-null URL for this indexer
-            "org": lambda x: x.mode()[0] if not x.mode().empty else np.nan,
-            "dst_lat": lambda x: x.mode()[0] if not x.mode().empty else np.nan,
-            "dst_lon": lambda x: x.mode()[0] if not x.mode().empty else np.nan,
-        })
+        .agg(
+            {
+                "url": first_non_null,  # Take first non-null URL for this indexer
+                "org": lambda x: x.mode()[0] if not x.mode().empty else np.nan,
+                "dst_lat": lambda x: x.mode()[0] if not x.mode().empty else np.nan,
+                "dst_lon": lambda x: x.mode()[0] if not x.mode().empty else np.nan,
+            }
+        )
         .reset_index()
     )
 
@@ -1072,10 +1124,12 @@ def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
     dips_info_df = fetch_dips_info(indexer_urls)
     now = datetime.now(timezone.utc)
 
-    scores = pd.DataFrame({
-        "indexer": list(indexer_urls.keys()),
-        "url": list(indexer_urls.values()),
-    })
+    scores = pd.DataFrame(
+        {
+            "indexer": list(indexer_urls.keys()),
+            "url": list(indexer_urls.values()),
+        }
+    )
 
     # Equal quality metrics — all indexers treated identically
     scores["lat_lin_reg_coefficient"] = 0.0
@@ -1109,9 +1163,8 @@ def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
         scores["dips_min_grt_per_billion_entities_per_30_days"] = None
         scores["dips_supported_networks"] = "[]"
 
-    available = scores["dips_info_available"].sum() if "dips_info_available" in scores.columns else 0
-    logger.info(
-        f"Degraded scoring complete: {len(scores)} indexers, "
-        f"{available} with pricing data"
+    available = (
+        scores["dips_info_available"].sum() if "dips_info_available" in scores.columns else 0
     )
+    logger.info(f"Degraded scoring complete: {len(scores)} indexers, {available} with pricing data")
     return scores

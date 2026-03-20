@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
-from redpanda import RedpandaProvider
+from redpanda import RedpandaProvider  # noqa: E402
 
 
 class TestGatewayIdFilter:

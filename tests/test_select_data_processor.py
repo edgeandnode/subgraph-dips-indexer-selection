@@ -5,9 +5,9 @@ import pandas as pd
 import pytest
 
 from iisa.indexer_selection import (
-    DataProcessor,
     DeploymentId,
     IndexerId,
+    IndexerSelector,
     _calculate_weighted_score,
     _normalize_generic,
     _normalize_metrics,
@@ -21,7 +21,7 @@ def process_subgraph(
     existing_agreements,
     indexer_denylist=None,
 ):
-    processor = DataProcessor(
+    processor = IndexerSelector(
         history,
         deployment_id,
         existing_agreements=existing_agreements,
@@ -70,48 +70,40 @@ def mock__combined_query_results(faker):
 @pytest.fixture
 def mock__provider(faker, mock__combined_query_results):
     provider = MagicMock()
-    provider.return_value.fetch_initial_query_results.return_value = (
-        pd.DataFrame(
-            {
-                "deployment_hash": [faker.deployment_id() for _ in range(3)],
-                "indexer": [faker.indexer_id() for _ in range(3)],
-                "num_rows": [1000, 2000, 3000],
-            }
-        )
+    provider.return_value.fetch_initial_query_results.return_value = pd.DataFrame(
+        {
+            "deployment_hash": [faker.deployment_id() for _ in range(3)],
+            "indexer": [faker.indexer_id() for _ in range(3)],
+            "num_rows": [1000, 2000, 3000],
+        }
     )
-    provider.return_value.fetch_combined_query_results.return_value = (
-        mock__combined_query_results
-    )
-    provider.return_value.fetch_initial_stake_to_fees.return_value = (
-        pd.DataFrame(
-            {
-                "indexer": [faker.indexer_id() for _ in range(3)],
-                "stake_to_fees": [1.0, 2.0, 3.0],
-            }
-        )
+    provider.return_value.fetch_combined_query_results.return_value = mock__combined_query_results
+    provider.return_value.fetch_initial_stake_to_fees.return_value = pd.DataFrame(
+        {
+            "indexer": [faker.indexer_id() for _ in range(3)],
+            "stake_to_fees": [1.0, 2.0, 3.0],
+        }
     )
     return provider
 
 
 class TestProcessSubgraph:
     """
-    This class verifies the process_subgraph function creates a DataProcessor
+    This class verifies the process_subgraph function creates a IndexerSelector
     instance and returns the expected results for added/cancelled indexers.
     """
 
     @pytest.mark.skip(reason="Flaky test: high dependency on internal details")
-    @patch("iisa.indexer_selection.DataProcessor")
-    def test_process_subgraph(
-        self, mock__data_processor, sample_data, mock__provider
-    ):
+    @patch("iisa.indexer_selection.IndexerSelector")
+    def test_process_subgraph(self, mock__data_processor, sample_data, mock__provider):
         """
-        Test the process_subgraph function creates a DataProcessor instance and returns the expected results.
+        Test process_subgraph creates a IndexerSelector and returns expected results.
 
         Expected results:
         1. processor.added_indexers
         2. processor.cancelled_indexers
         """
-        # Set up mock DataProcessor instance
+        # Set up mock IndexerSelector instance
         mock_instance = mock__data_processor.return_value
         mock_instance.added_indexers = [
             ("indexer1", "test_subgraph"),
@@ -135,7 +127,7 @@ class TestProcessSubgraph:
             existing_agreements,
         )
 
-        # Verify an instance of DataProcessor was created with expected parameters
+        # Verify an instance of IndexerSelector was created with expected parameters
         mock__data_processor.assert_called_once_with(
             history=sample_data,
             deployment_id=deployment_id,
@@ -153,9 +145,9 @@ class TestProcessSubgraph:
         assert all(pair[1] == deployment_id for pair in cancelled)
 
 
-class TestDataProcessor:
+class TestIndexerSelector:
     """
-    This class contains a range of unit tests to ensure that the DataProcessor class functions as intended.
+    Unit tests for the IndexerSelector class.
     """
 
     @pytest.fixture
@@ -183,7 +175,7 @@ class TestDataProcessor:
     @pytest.mark.skip(reason="Flaky test: high dependency on internal details")
     def test_data_processor_constructor(self, sample_data):
         """
-        Test the initialization of the DataProcessor class.
+        Test the initialization of the IndexerSelector class.
 
         This test verifies:
         1. The constructor correctly sets all instance variables with provided parameters.
@@ -204,8 +196,8 @@ class TestDataProcessor:
         }
         indexer_denylist = [IndexerId("D")]
 
-        # Create a DataProcessor instance
-        processor = DataProcessor(
+        # Create a IndexerSelector instance
+        processor = IndexerSelector(
             history=sample_data,
             deployment_id=deployment_id,
             existing_agreements=existing_agreements,
@@ -218,7 +210,7 @@ class TestDataProcessor:
         assert processor.indexer_denylist == indexer_denylist
 
         # Verify default values for optional parameters
-        processor_default = DataProcessor(
+        processor_default = IndexerSelector(
             history=sample_data,
             deployment_id=deployment_id,
         )
@@ -273,9 +265,9 @@ class TestDataProcessor:
         This test verifies the get_indexer_selections method correctly identifies the
         recent added and cancelled indexers.
         """
-        with patch("iisa.indexer_selection.DataProcessor._process_data"):
-            # Create a DataProcessor instance
-            processor = DataProcessor(
+        with patch("iisa.indexer_selection.IndexerSelector._process_data"):
+            # Create a IndexerSelector instance
+            processor = IndexerSelector(
                 history=sample_data,
                 deployment_id=DeploymentId("test_subgraph"),
             )
@@ -290,9 +282,7 @@ class TestDataProcessor:
         added_sorted = {k: sorted(v) for k, v in added.items()}
         cancelled_sorted = {k: sorted(v) for k, v in cancelled.items()}
         expected_added_sorted = {k: sorted(v) for k, v in expected_added.items()}
-        expected_cancelled_sorted = {
-            k: sorted(v) for k, v in expected_cancelled.items()
-        }
+        expected_cancelled_sorted = {k: sorted(v) for k, v in expected_cancelled.items()}
 
         # Verify the results by comparing sorted dictionaries
         assert added_sorted == expected_added_sorted, (
@@ -302,9 +292,7 @@ class TestDataProcessor:
             f"Expected cancelled: {expected_cancelled_sorted}, but got: {cancelled_sorted}"
         )
 
-    def test_get_indexer_selections_empty_groups(
-        self, sample_data, mock__provider
-    ):
+    def test_get_indexer_selections_empty_groups(self, sample_data, mock__provider):
         """
         Test get_indexer_selections method when both initial_group and current_group are empty.
 
@@ -313,8 +301,8 @@ class TestDataProcessor:
         It ensures that the method returns empty lists for both added and cancelled indexers
         when there are no indexers in either group.
         """
-        with patch("iisa.indexer_selection.DataProcessor._process_data"):
-            processor = DataProcessor(
+        with patch("iisa.indexer_selection.IndexerSelector._process_data"):
+            processor = IndexerSelector(
                 history=sample_data,
                 deployment_id=DeploymentId("test_subgraph"),
             )
@@ -330,7 +318,7 @@ class TestDataProcessor:
 
     @pytest.fixture
     def processor(self, sample_data, mock__provider):
-        return DataProcessor(
+        return IndexerSelector(
             history=sample_data,
             deployment_id=DeploymentId("test_subgraph"),
         )
@@ -368,9 +356,7 @@ class TestDataProcessor:
         result = processor._get_current_group()
         assert result == []
 
-    def test_get_current_group_subgraph_not_in_agreements(
-        self, processor, mock__provider
-    ):
+    def test_get_current_group_subgraph_not_in_agreements(self, processor, mock__provider):
         """
         Test _get_current_group when the subgraph 'test_subgraph' is not in any agreement.
         """
@@ -404,9 +390,9 @@ class TestDataProcessor:
         Note: This test does not verify specific weight values or exception handling for
         normalization and score calculation, as these are implementation details that may change.
         """
-        # Create a DataProcessor instance
-        with patch("iisa.indexer_selection.DataProcessor._process_data"):
-            processor = DataProcessor(
+        # Create a IndexerSelector instance
+        with patch("iisa.indexer_selection.IndexerSelector._process_data"):
+            processor = IndexerSelector(
                 history=sample_data,
                 deployment_id=DeploymentId("test_subgraph"),
             )
@@ -462,19 +448,17 @@ class TestDataProcessor:
     @pytest.mark.skip(reason="Flaky test: high dependency on internal details")
     def test_assign_indexers_to_subgraph(self, sample_data, mock__provider):
         """
-        Test the _assign_indexers_to_subgraph method of DataProcessor.
+        Test the _assign_indexers_to_subgraph method of IndexerSelector.
 
         This test verifies:
         1. The method calls _add_indexers_to_group when there are fewer than 3 indexers.
         2. The method calls _replace_underperforming_indexers when there are 3 or more indexers.
         """
-        with patch(
-            "iisa.indexer_selection.DataProcessor._add_indexers_to_group"
-        ) as mock_add:
+        with patch("iisa.indexer_selection.IndexerSelector._add_indexers_to_group") as mock_add:
             with patch(
-                "iisa.indexer_selection.DataProcessor._replace_underperforming_indexers)"
+                "iisa.indexer_selection.IndexerSelector._replace_underperforming_indexers)"
             ) as mock_replace:
-                processor = DataProcessor(
+                processor = IndexerSelector(
                     history=sample_data,
                     deployment_id=DeploymentId("test_subgraph"),
                 )
@@ -529,20 +513,20 @@ class TestDataProcessor:
         mock__provider,
     ):
         """
-        Test the _add_indexers_to_group method of DataProcessor.
+        Test the _add_indexers_to_group method of IndexerSelector.
 
         This test verifies:
         1. The method adds indexers to the group until there are 3 indexers in the group.
         2. The method stops adding indexers if no suitable candidates are found.
         3. The method behaves correctly with different initial group sizes.
         """
-        processor = DataProcessor(
+        processor = IndexerSelector(
             history=sample_data,
             deployment_id=DeploymentId("test_subgraph"),
         )
 
         with patch(
-            "iisa.indexer_selection.DataProcessor._find_best_replacement_or_select_best_indexer"
+            "iisa.indexer_selection.IndexerSelector._find_best_replacement_or_select_best_indexer"
         ) as mock_select:
             mock_select.side_effect = ["B", "C", "D", None]
             processor.current_group = initial_group.copy()
@@ -558,7 +542,7 @@ class TestDataProcessor:
 
         # Test when no suitable indexers are found
         with patch(
-            "iisa.indexer_selection.DataProcessor._find_best_replacement_or_select_best_indexer",
+            "iisa.indexer_selection.IndexerSelector._find_best_replacement_or_select_best_indexer",
             return_value=None,
         ):
             processor.current_group = ["A"]
@@ -567,7 +551,7 @@ class TestDataProcessor:
 
     def test_meets_decentralization_requirements(self, mock__provider):
         """
-        Test the _meets_decentralization_requirements method of DataProcessor.
+        Test the _meets_decentralization_requirements method of IndexerSelector.
 
         This test verifies:
         1. Resulting group with < 2 indexers always passes (no check needed).
@@ -577,7 +561,7 @@ class TestDataProcessor:
         Note:
         _meets_decentralization_requirements accepts new_indexer and optional replacing_indexer.
         """
-        processor = DataProcessor(
+        processor = IndexerSelector(
             history=pd.DataFrame(
                 {
                     "indexer": ["A", "B", "C", "D"],
@@ -623,13 +607,11 @@ class TestDataProcessor:
         processor.current_group = ["A", "A"]
         assert not processor._meets_decentralization_requirements("A")
 
-    def test_meets_decentralization_requirements_edge_cases(
-        self, mock__provider
-    ):
+    def test_meets_decentralization_requirements_edge_cases(self, mock__provider):
         """
         Test _meets_decentralization_requirements with various edge cases.
         """
-        processor = DataProcessor(
+        processor = IndexerSelector(
             history=pd.DataFrame(
                 {
                     "indexer": ["A", "B", "C", "D", "E", "F"],
@@ -669,9 +651,7 @@ class TestDataProcessor:
         processor.current_group = ["A", "D"]  # loc1/org1 + loc2/org2 = 2 locs, 2 orgs
         assert processor._meets_decentralization_requirements("E")  # Adds more diversity
 
-    def test_replace_underperforming_indexers_replaces_low_scorer(
-        self, mock__provider
-    ):
+    def test_replace_underperforming_indexers_replaces_low_scorer(self, mock__provider):
         """
         Test replacement when indexer scores below MIN_INDEXER_SCORE and
         candidate exceeds current + REPLACEMENT_MARGIN.
@@ -683,7 +663,7 @@ class TestDataProcessor:
                 "org": ["org1", "org2", "org3", "org4"],
             }
         )
-        processor = DataProcessor(
+        processor = IndexerSelector(
             history=history,
             deployment_id=DeploymentId("test_subgraph"),
         )
@@ -703,9 +683,7 @@ class TestDataProcessor:
         assert "A" not in processor.current_group
         assert len(processor.current_group) == 3
 
-    def test_replace_underperforming_indexers_keeps_adequate_performers(
-        self, mock__provider
-    ):
+    def test_replace_underperforming_indexers_keeps_adequate_performers(self, mock__provider):
         """
         Test that indexers scoring >= MIN_INDEXER_SCORE are not replaced,
         even if better candidates exist.
@@ -717,7 +695,7 @@ class TestDataProcessor:
                 "org": ["org1", "org2", "org3", "org4"],
             }
         )
-        processor = DataProcessor(
+        processor = IndexerSelector(
             history=history,
             deployment_id=DeploymentId("test_subgraph"),
         )
@@ -734,9 +712,7 @@ class TestDataProcessor:
         # No replacement - all indexers are above MIN_INDEXER_SCORE (0.15)
         assert processor.current_group == ["A", "B", "C"]
 
-    def test_replace_underperforming_indexers_margin_not_met(
-        self, mock__provider
-    ):
+    def test_replace_underperforming_indexers_margin_not_met(self, mock__provider):
         """
         Test that no replacement occurs when candidate doesn't exceed
         current + REPLACEMENT_MARGIN.
@@ -748,7 +724,7 @@ class TestDataProcessor:
                 "org": ["org1", "org2", "org3", "org4"],
             }
         )
-        processor = DataProcessor(
+        processor = IndexerSelector(
             history=history,
             deployment_id=DeploymentId("test_subgraph"),
         )
@@ -765,9 +741,7 @@ class TestDataProcessor:
         # No replacement - D (0.55) doesn't exceed A (0.10) + REPLACEMENT_MARGIN (0.50)
         assert processor.current_group == ["A", "B", "C"]
 
-    def test_replace_underperforming_indexers_multiple_swaps(
-        self, mock__provider
-    ):
+    def test_replace_underperforming_indexers_multiple_swaps(self, mock__provider):
         """
         Test iterative replacement when multiple indexers are below threshold.
         """
@@ -779,7 +753,7 @@ class TestDataProcessor:
                 "org": ["org1", "org2", "org3", "org4", "org5"],
             }
         )
-        processor = DataProcessor(
+        processor = IndexerSelector(
             history=history,
             deployment_id=DeploymentId("test_subgraph"),
         )
@@ -801,9 +775,7 @@ class TestDataProcessor:
         assert "C" in processor.current_group
         assert len(processor.current_group) == 3
 
-    def test_replace_underperforming_indexers_skips_newly_added(
-        self, mock__provider
-    ):
+    def test_replace_underperforming_indexers_skips_newly_added(self, mock__provider):
         """
         Test that newly added indexers are not eligible for replacement in the same call.
         """
@@ -814,7 +786,7 @@ class TestDataProcessor:
                 "org": ["org1", "org2", "org3", "org4", "org5"],
             }
         )
-        processor = DataProcessor(
+        processor = IndexerSelector(
             history=history,
             deployment_id=DeploymentId("test_subgraph"),
         )
@@ -833,18 +805,16 @@ class TestDataProcessor:
         assert "A" not in processor.current_group
         assert len(processor.current_group) == 3
 
-    def test_find_best_replacement_or_select_best_indexer(
-        self, mock__provider
-    ):
+    def test_find_best_replacement_or_select_best_indexer(self, mock__provider):
         """
-        Test the _find_best_replacement_or_select_best_indexer method of DataProcessor.
+        Test the _find_best_replacement_or_select_best_indexer method of IndexerSelector.
 
         This test verifies:
         1. The method returns the best replacement that meets decentralization requirements.
         2. The method returns None when no suitable replacement is found.
-        3. The method will not try to replace an indexer with one that is already indexer_denylisted.
+        3. The method skips indexers already on the denylist.
         """
-        processor = DataProcessor(
+        processor = IndexerSelector(
             history=pd.DataFrame(
                 {
                     "indexer": ["A", "B", "C", "D", "E"],
@@ -860,7 +830,7 @@ class TestDataProcessor:
         processor.indexer_denylist = ["E"]
 
         with patch(
-            "iisa.indexer_selection.DataProcessor._meets_decentralization_requirements"
+            "iisa.indexer_selection.IndexerSelector._meets_decentralization_requirements"
         ) as mock_decentralization:
             mock_decentralization.side_effect = [True]
 
@@ -872,19 +842,17 @@ class TestDataProcessor:
             # Verify the number of decentralization requirement checks
             assert mock_decentralization.call_count == 1
 
-    def test_update_indexer_denylist_cancel_indexing_agreements(
-        self, sample_data, mock__provider
-    ):
+    def test_update_indexer_denylist_cancel_indexing_agreements(self, sample_data, mock__provider):
         """
-        Test the update_indexer_denylist_cancel_indexing_agreements method of DataProcessor.
+        Test the update_indexer_denylist_cancel_indexing_agreements method of IndexerSelector.
 
         This test verifies:
-        1. The method correctly identifies agreements to be cancelled based on the new indexer_denylist.
+        1. Correctly identifies agreements to cancel based on the denylist.
         2. The method returns the correct dictionary of cancelled agreements.
-        3. The method updates the internal indexer_denylist of the DataProcessor.
+        3. The method updates the internal indexer_denylist of the IndexerSelector.
         """
-        # Initialize DataProcessor
-        processor = DataProcessor(
+        # Initialize IndexerSelector
+        processor = IndexerSelector(
             history=sample_data,
             deployment_id=DeploymentId("test_subgraph"),
             existing_agreements={
@@ -922,8 +890,8 @@ class TestDataProcessor:
         ]
 
         # Call update_indexer_denylist_cancel_indexing_agreements with new new_indexer_denylist
-        newly_cancelled_agreements = (
-            processor.update_indexer_denylist_cancel_indexing_agreements(new_indexer_denylist)
+        newly_cancelled_agreements = processor.update_indexer_denylist_cancel_indexing_agreements(
+            new_indexer_denylist
         )
         expected_newly_cancelled_agreements = {
             "B": ["subgraph2", "subgraph3", "subgraph5", "subgraph9", "subgraph12"],
@@ -1109,12 +1077,7 @@ class TestNormalizeMetrics:
         result = _normalize_metrics(sample_df)
 
         # Check that NaN values are not present in other rows of normalized columns
-        assert (
-            not result.iloc[1:, result.columns.str.startswith("norm_")]
-            .isnull()
-            .any()
-            .any()
-        )
+        assert not result.iloc[1:, result.columns.str.startswith("norm_")].isnull().any().any()
 
     def test_price_normalization(self):
         """Test that price columns normalize correctly (lower is better)."""
@@ -1130,20 +1093,61 @@ class TestNormalizeMetrics:
         )
         result = _normalize_metrics(df)
         # Cheapest indexer should have highest score
-        assert result["norm_base_price_per_epoch"].iloc[0] == result[
-            "norm_base_price_per_epoch"
-        ].max()
-        assert result["norm_price_per_entity"].iloc[0] == result[
-            "norm_price_per_entity"
-        ].max()
+        assert (
+            result["norm_base_price_per_epoch"].iloc[0] == result["norm_base_price_per_epoch"].max()
+        )
+        assert result["norm_price_per_entity"].iloc[0] == result["norm_price_per_entity"].max()
+
+    def test_price_ceiling_clamps_outliers(self):
+        """When price_ceiling is provided, prices above it score 0."""
+        df = pd.DataFrame(
+            {
+                "base_price_per_epoch": [10, 50, 200],
+                "Latency Coefficient + Error Confidence Interval": [1, 1, 1],
+                "% up_x": [99, 99, 99],
+                "stake_to_fees": [1.0, 1.0, 1.0],
+                "average_status": [0.99, 0.99, 0.99],
+                "price_per_entity": [0.1, 0.1, 0.1],
+            }
+        )
+        result = _normalize_metrics(df, price_ceiling=100)
+
+        scores = result["norm_base_price_per_epoch"]
+        # 10 GRT: 1 - (10/100) = 0.9
+        assert scores.iloc[0] == pytest.approx(0.9)
+        # 50 GRT: 1 - (50/100) = 0.5
+        assert scores.iloc[1] == pytest.approx(0.5)
+        # 200 GRT: 1 - (200/100) = -1.0, clipped to 0.0
+        assert scores.iloc[2] == pytest.approx(0.0)
+
+    def test_price_ceiling_none_falls_back_to_observed_max(self):
+        """Without price_ceiling, observed max is the ceiling."""
+        df = pd.DataFrame(
+            {
+                "base_price_per_epoch": [10, 50, 200],
+                "Latency Coefficient + Error Confidence Interval": [1, 1, 1],
+                "% up_x": [99, 99, 99],
+                "stake_to_fees": [1.0, 1.0, 1.0],
+                "average_status": [0.99, 0.99, 0.99],
+                "price_per_entity": [0.1, 0.1, 0.1],
+            }
+        )
+        result = _normalize_metrics(df, price_ceiling=None)
+
+        scores = result["norm_base_price_per_epoch"]
+        # ceiling = 200 (observed max)
+        # 10 GRT: 1 - (10/200) = 0.95
+        assert scores.iloc[0] == pytest.approx(0.95)
+        # 200 GRT: 1 - (200/200) = 0.0
+        assert scores.iloc[2] == pytest.approx(0.0)
 
 
 class TestTargetSize:
-    """Tests for variable target_size parameter in DataProcessor."""
+    """Tests for variable target_size parameter in IndexerSelector."""
 
     @pytest.fixture
     def sample_data_with_scores(self):
-        """Sample data with all required fields for DataProcessor."""
+        """Sample data with all required fields for IndexerSelector."""
         return pd.DataFrame(
             {
                 "indexer": ["A", "B", "C", "D", "E"],
@@ -1163,8 +1167,8 @@ class TestTargetSize:
     def test_target_size_defaults_to_three(self, sample_data_with_scores):
         """Default target_size is 3."""
         # Arrange & Act
-        with patch("iisa.indexer_selection.DataProcessor._process_data"):
-            processor = DataProcessor(
+        with patch("iisa.indexer_selection.IndexerSelector._process_data"):
+            processor = IndexerSelector(
                 history=sample_data_with_scores,
                 deployment_id=DeploymentId("test_subgraph"),
             )
@@ -1175,8 +1179,8 @@ class TestTargetSize:
     def test_target_size_custom_value(self, sample_data_with_scores):
         """Custom target_size is stored correctly."""
         # Arrange & Act
-        with patch("iisa.indexer_selection.DataProcessor._process_data"):
-            processor = DataProcessor(
+        with patch("iisa.indexer_selection.IndexerSelector._process_data"):
+            processor = IndexerSelector(
                 history=sample_data_with_scores,
                 deployment_id=DeploymentId("test_subgraph"),
                 target_size=5,
@@ -1188,7 +1192,7 @@ class TestTargetSize:
     def test_target_size_one_selects_single_indexer(self, sample_data_with_scores):
         """With target_size=1, only one indexer is selected."""
         # Arrange & Act
-        processor = DataProcessor(
+        processor = IndexerSelector(
             history=sample_data_with_scores,
             deployment_id=DeploymentId("test_subgraph"),
             target_size=1,
@@ -1200,7 +1204,7 @@ class TestTargetSize:
     def test_target_size_five_selects_five_indexers(self, sample_data_with_scores):
         """With target_size=5, five indexers are selected."""
         # Arrange & Act
-        processor = DataProcessor(
+        processor = IndexerSelector(
             history=sample_data_with_scores,
             deployment_id=DeploymentId("test_subgraph"),
             target_size=5,
@@ -1212,7 +1216,7 @@ class TestTargetSize:
     def test_target_size_respects_available_indexers(self, sample_data_with_scores):
         """target_size > available indexers returns all available."""
         # Arrange & Act
-        processor = DataProcessor(
+        processor = IndexerSelector(
             history=sample_data_with_scores,
             deployment_id=DeploymentId("test_subgraph"),
             target_size=10,  # More than available
@@ -1224,7 +1228,7 @@ class TestTargetSize:
     def test_target_size_removes_excess_indexers(self, sample_data_with_scores):
         """Existing group larger than target_size gets trimmed."""
         # Arrange & Act
-        processor = DataProcessor(
+        processor = IndexerSelector(
             history=sample_data_with_scores,
             deployment_id=DeploymentId("test_subgraph"),
             existing_agreements={
@@ -1244,12 +1248,10 @@ class TestTargetSize:
     def test_target_size_adds_to_small_group(self, sample_data_with_scores):
         """Existing group smaller than target_size gets expanded."""
         # Arrange & Act
-        processor = DataProcessor(
+        processor = IndexerSelector(
             history=sample_data_with_scores,
             deployment_id=DeploymentId("test_subgraph"),
-            existing_agreements={
-                DeploymentId("test_subgraph"): [IndexerId("A")]
-            },
+            existing_agreements={DeploymentId("test_subgraph"): [IndexerId("A")]},
             target_size=4,
         )
 
@@ -1280,7 +1282,7 @@ class TestDecentralizationBestEffort:
         )
 
         # Arrange & Act
-        processor = DataProcessor(
+        processor = IndexerSelector(
             history=data,
             deployment_id=DeploymentId("test_subgraph"),
             target_size=3,
@@ -1304,18 +1306,14 @@ class TestCalculateWeightedScore:
 
     def test_missing_metric(self, sample_weights):
         # Test the function when one metric is missing (NaN)
-        row = pd.Series(
-            {"norm_metric1": 0.8, "norm_metric2": np.nan, "norm_metric3": 0.4}
-        )
+        row = pd.Series({"norm_metric1": 0.8, "norm_metric2": np.nan, "norm_metric3": 0.4})
         result = _calculate_weighted_score(row, sample_weights)
         expected = ((0.8 * 0.5) + (0 * 0.3) + (0.4 * 0.2)) / (0.5 + 0.2)
         assert np.isclose(result, expected)
 
     def test_all_metrics_missing(self, sample_weights):
         # Test the function when all metrics are missing (NaN)
-        row = pd.Series(
-            {"norm_metric1": np.nan, "norm_metric2": np.nan, "norm_metric3": np.nan}
-        )
+        row = pd.Series({"norm_metric1": np.nan, "norm_metric2": np.nan, "norm_metric3": np.nan})
         with pytest.raises(ValueError, match="Total weight cannot be 0."):
             _calculate_weighted_score(row, sample_weights)
 

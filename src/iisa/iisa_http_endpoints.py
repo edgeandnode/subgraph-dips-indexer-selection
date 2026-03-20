@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .indexer_selection import DataProcessor
+from .indexer_selection import IndexerSelector
 from .score_loader import DataManager, FileScoreLoader
 
 __all__ = ["app", "Settings", "get_settings"]
@@ -395,8 +395,8 @@ async def get_score(request: ScoreRequest) -> ScoreResponse:
         if col in row.index and pd.notna(row[col]):
             components[name] = float(row[col])
 
-    # Calculate weighted score using DataProcessor logic
-    from .indexer_selection import _normalize_metrics, _calculate_weighted_score, DEFAULT_WEIGHTS
+    # Calculate weighted score using IndexerSelector logic
+    from .indexer_selection import DEFAULT_WEIGHTS, _calculate_weighted_score, _normalize_metrics
 
     # Normalize and calculate score for this single indexer
     normalized = _normalize_metrics(indexer_data.copy())
@@ -427,7 +427,7 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
     weighted aggregate score, preferring groups with >1 unique org and >1 unique
     location when N > 1. These decentralization constraints are best-effort.
 
-    Note on existing_indexers: This tells DataProcessor which indexers are currently
+    Note on existing_indexers: This tells IndexerSelector which indexers are currently
     assigned, allowing it to decide whether to add, remove, or replace indexers.
     To get a fresh selection ignoring current assignments, pass existing_indexers: [].
     """
@@ -440,8 +440,11 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
     logger.info(
         "select-indexers request: deployment=%s chain=%s num_candidates=%d "
         "existing=%d blocked=%d budget=%s",
-        request.deployment_id, request.chain_id, request.num_candidates,
-        len(request.existing_indexers or []), len(request.blocklist or []),
+        request.deployment_id,
+        request.chain_id,
+        request.num_candidates,
+        len(request.existing_indexers or []),
+        len(request.blocklist or []),
         f"{request.max_grt_per_30_days} GRT/30d" if request.max_grt_per_30_days else "none",
     )
 
@@ -506,6 +509,7 @@ def _filter_by_price(
 
     # Exclude indexers that don't support the chain
     if "dips_supported_networks" in df.columns:
+
         def supports_chain(networks_json):
             try:
                 networks = json.loads(networks_json) if isinstance(networks_json, str) else []
@@ -515,12 +519,15 @@ def _filter_by_price(
 
         pre_filter = len(df)
         df = df[df["dips_supported_networks"].apply(supports_chain)]
-        logger.debug("price filter: %d/%d indexers support chain '%s'", len(df), pre_filter, chain_id)
+        logger.debug(
+            "price filter: %d/%d indexers support chain '%s'", len(df), pre_filter, chain_id
+        )
         if df.empty:
             return df, f"none of {pre_filter} indexers support chain '{chain_id}'"
 
     # Exclude indexers that don't have pricing for this chain
     if "dips_min_grt_per_30_days" in df.columns:
+
         def has_chain_price(prices_json):
             price_str = _extract_chain_price(prices_json, chain_id)
             return price_str is not None
@@ -528,7 +535,10 @@ def _filter_by_price(
         pre_filter = len(df)
         df = df[df["dips_min_grt_per_30_days"].apply(has_chain_price)]
         if df.empty:
-            return df, f"none of {pre_filter} indexers have pricing configured for chain '{chain_id}'"
+            return (
+                df,
+                f"none of {pre_filter} indexers have pricing configured for chain '{chain_id}'",
+            )
 
     if df.empty or max_grt_per_30_days is None:
         return df, ""
@@ -537,6 +547,7 @@ def _filter_by_price(
     max_budget = max_grt_per_30_days
 
     if "dips_min_grt_per_30_days" in df.columns:
+
         def within_budget(prices_json):
             price_str = _extract_chain_price(prices_json, chain_id)
             if price_str is None:
@@ -550,10 +561,18 @@ def _filter_by_price(
         df = df[df["dips_min_grt_per_30_days"].apply(within_budget)]
         logger.debug(
             "price filter: %d/%d indexers within budget of %s GRT/30d for chain '%s'",
-            len(df), pre_filter, max_grt_per_30_days, chain_id,
+            len(df),
+            pre_filter,
+            max_grt_per_30_days,
+            chain_id,
         )
         if df.empty:
-            return df, f"all {pre_filter} indexers exceed payment ceiling of {max_grt_per_30_days} GRT/30d for chain '{chain_id}'"
+            return (
+                df,
+                f"all {pre_filter} indexers exceed payment "
+                f"ceiling of {max_grt_per_30_days} GRT/30d "
+                f"for chain '{chain_id}'",
+            )
 
     return df, ""
 
@@ -607,7 +626,9 @@ def _build_selected_indexers(
 
         if not row.empty and chain_id is not None:
             if "dips_min_grt_per_30_days" in row.columns:
-                min_grt = _extract_chain_price(row.iloc[0].get("dips_min_grt_per_30_days", "{}"), chain_id)
+                min_grt = _extract_chain_price(
+                    row.iloc[0].get("dips_min_grt_per_30_days", "{}"), chain_id
+                )
             if "dips_min_grt_per_billion_entities_per_30_days" in row.columns:
                 val = row.iloc[0].get("dips_min_grt_per_billion_entities_per_30_days")
                 try:
@@ -615,19 +636,21 @@ def _build_selected_indexers(
                 except (TypeError, ValueError):
                     min_entity = None
 
-        results.append(SelectedIndexer(
-            id=idx_id,
-            min_grt_per_30_days=min_grt,
-            min_grt_per_billion_entities_per_30_days=min_entity,
-        ))
+        results.append(
+            SelectedIndexer(
+                id=idx_id,
+                min_grt_per_30_days=min_grt,
+                min_grt_per_billion_entities_per_30_days=min_entity,
+            )
+        )
     return results
 
 
 def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     """
-    Use DataProcessor for intelligent indexer selection.
+    Use IndexerSelector for intelligent indexer selection.
 
-    The DataProcessor uses weighted scoring based on:
+    The IndexerSelector uses weighted scoring based on:
     - Stake to fees ratio (economic security)
     - Base price per epoch (cheaper is better)
     - Latency linear regression coefficient
@@ -660,7 +683,8 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
 
     logger.info(
         "deployment=%s proceeding with %d candidates after price filtering (from %d total)",
-        request.deployment_id, len(filtered_history),
+        request.deployment_id,
+        len(filtered_history),
         len(_state.history) if _state.history is not None else 0,
     )
 
@@ -675,8 +699,8 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     # Build pending_agreements dict - convert to expected format
     pending_agreements: dict[str, list[str]] = request.pending_agreements or {}
 
-    # Create DataProcessor instance with target_size from num_candidates
-    processor = DataProcessor(
+    # Create IndexerSelector instance with target_size from num_candidates
+    processor = IndexerSelector(
         history=enriched_history,
         deployment_id=request.deployment_id,
         existing_agreements=existing_agreements,
@@ -685,6 +709,7 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
         indexer_denylist=request.blocklist or [],
         target_size=request.num_candidates,
         optimistic_dips_fees=request.optimistic_dips_fees,
+        price_ceiling=request.max_grt_per_30_days,
     )
 
     # Build response with pricing info
