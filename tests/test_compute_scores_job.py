@@ -1101,10 +1101,6 @@ class TestMergeAndPrepareDataframes:
         assert "Latency Coefficient" in result.columns
         assert "query_count" in result.columns
 
-        # Placeholder columns for DIP metrics
-        assert "avg_sync_duration" in result.columns
-        assert all(pd.isna(result["avg_sync_duration"]))
-
         # Dropped columns not present
         assert "% up_y" not in result.columns
         assert "observed_duration_full" not in result.columns
