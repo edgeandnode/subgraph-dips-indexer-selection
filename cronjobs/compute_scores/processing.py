@@ -538,8 +538,6 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     scores["dst_lat"] = merged.get("dst_lat")
     scores["dst_lon"] = merged.get("dst_lon")
 
-    scores["avg_sync_duration"] = merged.get("avg_sync_duration")
-
     # DIP pricing info (fetched from indexer /dips/info endpoints)
     scores["dips_info_available"] = merged.get("dips_info_available", False)
     scores["dips_min_grt_per_30_days"] = merged.get("dips_min_grt_per_30_days", "{}")
@@ -1104,8 +1102,6 @@ def merge_and_prepare_dataframes(
     merged = pd.merge(merged, stake_to_fees, on="indexer", how="left")
     merged = pd.merge(merged, indexer_query_count, on="indexer", how="left")
 
-    merged["avg_sync_duration"] = np.nan
-
     return merged
 
 
@@ -1149,7 +1145,6 @@ def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
     scores["dst_lon"] = None
     scores["total_query_fees"] = 0.0
     scores["last_known_slashable_stake"] = 0.0
-    scores["avg_sync_duration"] = None
     scores["computed_at"] = now
     scores["query_count"] = 0
 
