@@ -137,7 +137,7 @@ class IndexerSelector:
         self.target_size = target_size
         self.optimistic_dips_fees = optimistic_dips_fees or {}
         self.price_ceiling = price_ceiling
-        self.synced_indexers = synced_indexers or set()
+        self.synced_indexers = {s.lower() for s in synced_indexers} if synced_indexers else set()
         self.current_group: list[IndexerId] = []
         self.initial_group: list[IndexerId] = []
 
@@ -629,8 +629,11 @@ class IndexerSelector:
         # MIN_SYNCED_THRESHOLD to be preferred — below that, they
         # compete on merit in the unsynced pool.
         if self.synced_indexers:
-            group_has_synced = bool(set(self.current_group) & self.synced_indexers)
-            all_synced_candidates = candidates[candidates["indexer"].isin(self.synced_indexers)]
+            group_lower = {i.lower() for i in self.current_group}
+            group_has_synced = bool(group_lower & self.synced_indexers)
+            all_synced_candidates = candidates[
+                candidates["indexer"].str.lower().isin(self.synced_indexers)
+            ]
 
             if group_has_synced:
                 # Already have a synced indexer — threshold applies
