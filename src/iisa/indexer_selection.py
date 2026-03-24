@@ -621,26 +621,33 @@ class IndexerSelector:
 
         # Two-pool selection: when sync status is available, prefer
         # candidates already synced for this deployment so queries can
-        # be served immediately after on-chain acceptance. Only synced
-        # indexers scoring above MIN_SYNCED_THRESHOLD qualify — below
-        # that, sync status is ignored and they compete on merit.
+        # be served immediately after on-chain acceptance.
+        #
+        # The first synced indexer is always preferred (regardless of
+        # score) to guarantee at least one indexer can serve queries
+        # immediately. Subsequent synced candidates must score above
+        # MIN_SYNCED_THRESHOLD to be preferred — below that, they
+        # compete on merit in the unsynced pool.
         if self.synced_indexers:
-            synced = candidates[
-                candidates["indexer"].isin(self.synced_indexers)
-                & (candidates["weighted_score"] >= MIN_SYNCED_THRESHOLD)
-            ]
-            unsynced = candidates[
-                ~(
-                    candidates["indexer"].isin(self.synced_indexers)
-                    & (candidates["weighted_score"] >= MIN_SYNCED_THRESHOLD)
-                )
-            ]
+            group_has_synced = bool(set(self.current_group) & self.synced_indexers)
+            all_synced_candidates = candidates[candidates["indexer"].isin(self.synced_indexers)]
+
+            if group_has_synced:
+                # Already have a synced indexer — threshold applies
+                synced = all_synced_candidates[
+                    all_synced_candidates["weighted_score"] >= MIN_SYNCED_THRESHOLD
+                ]
+            else:
+                # No synced indexer yet — first one gets in at any score
+                synced = all_synced_candidates
+
+            unsynced = candidates[~candidates["indexer"].isin(synced["indexer"])]
             logger.info(
-                "deployment=%s candidates: %d synced (above %.2f), %d unsynced/below-threshold",
+                "deployment=%s candidates: %d synced eligible, %d unsynced (group_has_synced=%s)",
                 self.deployment_id,
                 len(synced),
-                MIN_SYNCED_THRESHOLD,
                 len(unsynced),
+                group_has_synced,
             )
             pools = [("synced", synced), ("unsynced", unsynced)]
         else:

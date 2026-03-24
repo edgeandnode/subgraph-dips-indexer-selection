@@ -1410,17 +1410,33 @@ class TestSyncedIndexerPreference:
         assert "A" not in processor.current_group
         assert processor.current_group[0] in {"D", "E"}
 
-    def test_synced_below_threshold_not_preferred(self, five_indexers):
-        """Synced indexer below MIN_SYNCED_THRESHOLD competes on merit."""
-        # E scores 0.20 (below 0.6 threshold) — should not be preferred
+    def test_first_synced_preferred_regardless_of_score(self, five_indexers):
+        """First synced pick ignores threshold to guarantee availability."""
+        # E scores 0.20 (below 0.6) but is the only synced option
+        # and no synced indexer is in the group yet — gets preferred
         processor = IndexerSelector(
             history=five_indexers,
             deployment_id="hash1",
             target_size=1,
             synced_indexers={"E"},
         )
-        # A wins on score, E's sync status ignored due to threshold
-        assert "A" in processor.current_group
+        assert "E" in processor.current_group
+
+    def test_second_synced_below_threshold_not_preferred(self, five_indexers):
+        """After first synced pick, threshold applies to subsequent ones."""
+        # Need 3 slots. C (0.72) and E (0.20) are synced.
+        # C gets first synced slot. E is below 0.6, so threshold
+        # kicks in for the second synced slot — E competes on merit
+        # in the unsynced pool and loses to A and B.
+        processor = IndexerSelector(
+            history=five_indexers,
+            deployment_id="hash1",
+            target_size=3,
+            synced_indexers={"C", "E"},
+        )
+        assert len(processor.current_group) == 3
+        assert "C" in processor.current_group
+        assert "E" not in processor.current_group
 
 
 class TestDecentralizationBestEffort:
