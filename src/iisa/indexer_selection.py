@@ -41,6 +41,11 @@ MIN_INDEXER_SCORE = 0.15
 # Candidate must score at least (current_score + REPLACEMENT_MARGIN) to replace.
 REPLACEMENT_MARGIN = 0.50
 
+# Minimum weighted score for a synced indexer to be preferred over unsynced
+# candidates. Below this threshold, sync status is ignored and the indexer
+# competes on merit in the unsynced pool.
+MIN_SYNCED_THRESHOLD = 0.60
+
 
 class WeightsDict(TypedDict, total=False):
     """
@@ -100,21 +105,28 @@ class IndexerSelector:
         target_size: int = 3,
         optimistic_dips_fees: Optional[dict[str, float]] = None,
         price_ceiling: Optional[float] = None,
+        synced_indexers: Optional[set[IndexerId]] = None,
     ):
         """
-        Initialize the IndexerSelector class with data, deployment ID, existing agreements,
-        and an indexer denylist.
+        Initialize the IndexerSelector class with data, deployment ID,
+        existing agreements, and an indexer denylist.
 
         Args:
-            target_size: The target number of indexers to assign to this deployment.
-            optimistic_dips_fees: Per-indexer expected DIPs fees in GRT per 30 days,
-                keyed by checksummed hex address. Used to adjust stake_to_fees at
-                request time so indexers with accepted agreements get deprioritised.
-            price_ceiling: Maximum GRT per 30 days that the payer will accept.
-                Used as the normalisation ceiling for pricing scores so that
-                outlier prices cannot compress legitimate price differentiation.
+            target_size: The target number of indexers to assign.
+            optimistic_dips_fees: Per-indexer expected DIPs fees in
+                GRT per 30 days, keyed by checksummed hex address.
+                Used to adjust stake_to_fees at request time so
+                indexers with accepted agreements get deprioritised.
+            price_ceiling: Maximum GRT per 30 days the payer will
+                accept. Used as the normalisation ceiling for pricing
+                scores so outlier prices cannot compress legitimate
+                price differentiation.
+            synced_indexers: Set of indexer addresses that are already
+                synced and healthy for this deployment. When provided,
+                the add and replace paths prefer these candidates so
+                queries can be served immediately after on-chain
+                acceptance.
         """
-        # Initialize class variables with provided parameters
         self.data = pd.DataFrame(history)
         self.deployment_id = deployment_id
         self.existing_agreements = existing_agreements or {}
@@ -125,6 +137,7 @@ class IndexerSelector:
         self.target_size = target_size
         self.optimistic_dips_fees = optimistic_dips_fees or {}
         self.price_ceiling = price_ceiling
+        self.synced_indexers = synced_indexers or set()
         self.current_group: list[IndexerId] = []
         self.initial_group: list[IndexerId] = []
 
@@ -606,22 +619,58 @@ class IndexerSelector:
             len(unpickable_indexers),
         )
 
-        # Iterate through candidates, prefer one that meets decentralization requirements
-        for indexer in candidates["indexer"]:
-            if self._meets_decentralization_requirements(
-                indexer, replacing_indexer=replacing_indexer
-            ):
-                score = candidates[candidates["indexer"] == indexer]["weighted_score"].iloc[0]
-                logger.debug(
-                    "deployment=%s selected %s (score=%.4f, meets decentralization)",
-                    self.deployment_id,
-                    indexer[:10],
-                    score,
-                )
-                return indexer
+        # Two-pool selection: when sync status is available, prefer
+        # candidates already synced for this deployment so queries can
+        # be served immediately after on-chain acceptance.
+        #
+        # The first synced indexer is always preferred (regardless of
+        # score) to guarantee at least one indexer can serve queries
+        # immediately. Subsequent synced candidates must score above
+        # MIN_SYNCED_THRESHOLD to be preferred — below that, they
+        # compete on merit in the unsynced pool.
+        if self.synced_indexers:
+            group_has_synced = bool(set(self.current_group) & self.synced_indexers)
+            all_synced_candidates = candidates[candidates["indexer"].isin(self.synced_indexers)]
 
-        # Fallback: return best candidate even if it doesn't meet decentralization
-        # Decentralization is best-effort - if constraints cannot be met, still return an indexer
+            if group_has_synced:
+                # Already have a synced indexer — threshold applies
+                synced = all_synced_candidates[
+                    all_synced_candidates["weighted_score"] >= MIN_SYNCED_THRESHOLD
+                ]
+            else:
+                # No synced indexer yet — first one gets in at any score
+                synced = all_synced_candidates
+
+            unsynced = candidates[~candidates["indexer"].isin(synced["indexer"])]
+            logger.info(
+                "deployment=%s candidates: %d synced eligible, %d unsynced (group_has_synced=%s)",
+                self.deployment_id,
+                len(synced),
+                len(unsynced),
+                group_has_synced,
+            )
+            pools = [("synced", synced), ("unsynced", unsynced)]
+        else:
+            pools = [("all", candidates)]
+
+        # Iterate pools in order, checking decentralisation
+        for pool_name, pool_df in pools:
+            for indexer in pool_df["indexer"]:
+                if self._meets_decentralization_requirements(
+                    indexer, replacing_indexer=replacing_indexer
+                ):
+                    score = pool_df[pool_df["indexer"] == indexer]["weighted_score"].iloc[0]
+                    logger.info(
+                        "deployment=%s selected %s indexer %s (score=%.4f, meets decentralization)",
+                        self.deployment_id,
+                        pool_name,
+                        indexer[:10],
+                        score,
+                    )
+                    return indexer
+
+        # Fallback: best scorer regardless of decentralisation or
+        # sync status. Decentralisation is best-effort.
         if not candidates.empty:
             fallback = candidates["indexer"].iloc[0]
             fallback_score = candidates["weighted_score"].iloc[0]
@@ -639,7 +688,7 @@ class IndexerSelector:
             self.deployment_id,
             len(self.data),
         )
-        return None  # Only when truly zero candidates available
+        return None
 
 
 def _normalize_metrics(
