@@ -76,7 +76,7 @@ class SyncStatusData:
 
     def synced_indexers_for(self, deployment_id: str) -> set[str]:
         """Return indexer addresses synced+healthy for this deployment."""
-        return self._deployment_index.get(deployment_id, set())
+        return set(self._deployment_index.get(deployment_id, set()))
 
     @property
     def total_indexers(self) -> int:
