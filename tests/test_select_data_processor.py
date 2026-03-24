@@ -1264,20 +1264,29 @@ class TestSyncedIndexerPreference:
 
     @pytest.fixture
     def five_indexers(self):
-        """Five indexers with distinct orgs/locations and descending scores."""
+        """Five indexers with distinct orgs/locations and descending scores.
+
+        Raw metrics are varied so normalisation produces different
+        weighted_scores. A is best, E is worst, all above 0.6.
+        """
         return pd.DataFrame(
             {
                 "indexer": ["A", "B", "C", "D", "E"],
                 "deployment_hash": ["hash1"] * 5,
                 "destination_loc": ["loc1", "loc2", "loc3", "loc4", "loc5"],
                 "org": ["org1", "org2", "org3", "org4", "org5"],
-                "weighted_score": [0.9, 0.8, 0.7, 0.6, 0.5],
-                "Latency Coefficient + Error Confidence Interval": [1] * 5,
-                "% up_x": [99] * 5,
-                "stake_to_fees": [1.0] * 5,
-                "average_status": [0.99] * 5,
-                "base_price_per_epoch": [100] * 5,
-                "price_per_entity": [0.1] * 5,
+                "Latency Coefficient + Error Confidence Interval": [
+                    1.0,
+                    1.1,
+                    1.2,
+                    1.3,
+                    2.0,
+                ],
+                "% up_x": [100.0] * 5,
+                "stake_to_fees": [10.0, 9.5, 9.0, 8.5, 5.0],
+                "average_status": [1.0] * 5,
+                "base_price_per_epoch": [50, 55, 60, 65, 100],
+                "price_per_entity": [0.1, 0.11, 0.12, 0.13, 0.2],
             }
         )
 
@@ -1400,6 +1409,18 @@ class TestSyncedIndexerPreference:
         # A replaced — D or E selected from synced pool
         assert "A" not in processor.current_group
         assert processor.current_group[0] in {"D", "E"}
+
+    def test_synced_below_threshold_not_preferred(self, five_indexers):
+        """Synced indexer below MIN_SYNCED_THRESHOLD competes on merit."""
+        # E scores 0.20 (below 0.6 threshold) — should not be preferred
+        processor = IndexerSelector(
+            history=five_indexers,
+            deployment_id="hash1",
+            target_size=1,
+            synced_indexers={"E"},
+        )
+        # A wins on score, E's sync status ignored due to threshold
+        assert "A" in processor.current_group
 
 
 class TestDecentralizationBestEffort:

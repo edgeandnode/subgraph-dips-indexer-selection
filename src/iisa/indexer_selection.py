@@ -41,6 +41,11 @@ MIN_INDEXER_SCORE = 0.15
 # Candidate must score at least (current_score + REPLACEMENT_MARGIN) to replace.
 REPLACEMENT_MARGIN = 0.50
 
+# Minimum weighted score for a synced indexer to be preferred over unsynced
+# candidates. Below this threshold, sync status is ignored and the indexer
+# competes on merit in the unsynced pool.
+MIN_SYNCED_THRESHOLD = 0.60
+
 
 class WeightsDict(TypedDict, total=False):
     """
@@ -616,14 +621,25 @@ class IndexerSelector:
 
         # Two-pool selection: when sync status is available, prefer
         # candidates already synced for this deployment so queries can
-        # be served immediately after on-chain acceptance.
+        # be served immediately after on-chain acceptance. Only synced
+        # indexers scoring above MIN_SYNCED_THRESHOLD qualify — below
+        # that, sync status is ignored and they compete on merit.
         if self.synced_indexers:
-            synced = candidates[candidates["indexer"].isin(self.synced_indexers)]
-            unsynced = candidates[~candidates["indexer"].isin(self.synced_indexers)]
+            synced = candidates[
+                candidates["indexer"].isin(self.synced_indexers)
+                & (candidates["weighted_score"] >= MIN_SYNCED_THRESHOLD)
+            ]
+            unsynced = candidates[
+                ~(
+                    candidates["indexer"].isin(self.synced_indexers)
+                    & (candidates["weighted_score"] >= MIN_SYNCED_THRESHOLD)
+                )
+            ]
             logger.info(
-                "deployment=%s candidates: %d synced, %d unsynced",
+                "deployment=%s candidates: %d synced (above %.2f), %d unsynced/below-threshold",
                 self.deployment_id,
                 len(synced),
+                MIN_SYNCED_THRESHOLD,
                 len(unsynced),
             )
             pools = [("synced", synced), ("unsynced", unsynced)]
