@@ -14,7 +14,6 @@ import logging
 import os
 import signal
 import threading
-import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import TYPE_CHECKING, Dict, Optional
@@ -47,7 +46,7 @@ STATUS_QUERY = "{ indexingStatuses { subgraph synced health } }"
 
 # Service state
 _last_write_time: Optional[str] = None
-_shutdown = False
+_stop_event = threading.Event()
 
 
 async def _fetch_single_status(
@@ -139,9 +138,15 @@ async def _fetch_all_statuses(
     return output
 
 
+def _ensure_output_dir() -> None:
+    """Create the output directory if it doesn't exist."""
+    parent = os.path.dirname(SYNC_STATUS_FILE_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def _write_sync_status(data: dict) -> None:
     """Write sync status to file atomically."""
-    os.makedirs(os.path.dirname(SYNC_STATUS_FILE_PATH), exist_ok=True)
     tmp_path = SYNC_STATUS_FILE_PATH + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(data, f)
@@ -231,12 +236,9 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global _shutdown
-
     def handle_signal(signum, frame):
-        global _shutdown
         logger.info("Received signal %d, shutting down", signum)
-        _shutdown = True
+        _stop_event.set()
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
@@ -248,6 +250,8 @@ def main():
         MAX_CONCURRENCY,
         MAX_RETRIES,
     )
+
+    _ensure_output_dir()
 
     # Start HTTP healthcheck server
     server = HTTPServer(("0.0.0.0", HTTP_PORT), HealthHandler)
@@ -262,16 +266,11 @@ def main():
     except Exception:
         logger.exception("First fetch cycle failed")
 
-    # Main loop
-    while not _shutdown:
-        for _ in range(FETCH_INTERVAL):
-            if _shutdown:
-                break
-            time.sleep(1)
-
-        if _shutdown:
+    # Main loop — wait for interval or shutdown signal
+    while not _stop_event.is_set():
+        _stop_event.wait(timeout=FETCH_INTERVAL)
+        if _stop_event.is_set():
             break
-
         try:
             run_fetch_cycle()
         except Exception:
