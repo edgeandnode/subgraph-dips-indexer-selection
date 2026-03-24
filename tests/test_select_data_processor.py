@@ -15,21 +15,6 @@ from iisa.indexer_selection import (
 )
 
 
-def process_subgraph(
-    history,
-    deployment_id,
-    existing_agreements,
-    indexer_denylist=None,
-):
-    processor = IndexerSelector(
-        history,
-        deployment_id,
-        existing_agreements=existing_agreements,
-        indexer_denylist=indexer_denylist,
-    )
-    return processor.get_indexer_selections()
-
-
 @pytest.fixture
 def sample_data():
     return pd.DataFrame(
@@ -87,64 +72,6 @@ def mock__provider(faker, mock__combined_query_results):
     return provider
 
 
-class TestProcessSubgraph:
-    """
-    This class verifies the process_subgraph function creates a IndexerSelector
-    instance and returns the expected results for added/cancelled indexers.
-    """
-
-    @pytest.mark.skip(reason="Flaky test: high dependency on internal details")
-    @patch("iisa.indexer_selection.IndexerSelector")
-    def test_process_subgraph(self, mock__data_processor, sample_data, mock__provider):
-        """
-        Test process_subgraph creates a IndexerSelector and returns expected results.
-
-        Expected results:
-        1. processor.added_indexers
-        2. processor.cancelled_indexers
-        """
-        # Set up mock IndexerSelector instance
-        mock_instance = mock__data_processor.return_value
-        mock_instance.added_indexers = [
-            ("indexer1", "test_subgraph"),
-            ("indexer2", "test_subgraph"),
-        ]
-        mock_instance.cancelled_indexers = [("indexer3", "test_subgraph")]
-
-        # Define test input parameters
-        deployment_id = "test_subgraph"
-        existing_agreements = {
-            "indexer1": ["subgraph1"],
-            "indexer2": ["subgraph2"],
-            "indexer3": ["test_subgraph"],
-        }
-        indexer_denylist = ["indexer_denylisted_indexer"]
-
-        # Process the subgraph
-        added, cancelled = process_subgraph(
-            sample_data,
-            deployment_id,
-            existing_agreements,
-        )
-
-        # Verify an instance of IndexerSelector was created with expected parameters
-        mock__data_processor.assert_called_once_with(
-            history=sample_data,
-            deployment_id=deployment_id,
-            existing_agreements=existing_agreements,
-            indexer_denylist=indexer_denylist,
-            weights=None,
-        )
-
-        # Verify the function returns the expected added and cancelled indexer pairs
-        assert added == [("indexer1", "test_subgraph"), ("indexer2", "test_subgraph")]
-        assert cancelled == [("indexer3", "test_subgraph")]
-
-        # Verify pairs are associated with the expected respective subgraphs
-        assert all(pair[1] == deployment_id for pair in added)
-        assert all(pair[1] == deployment_id for pair in cancelled)
-
-
 class TestIndexerSelector:
     """
     Unit tests for the IndexerSelector class.
@@ -171,51 +98,6 @@ class TestIndexerSelector:
                 "price_per_entity": [0.1, 0.2, 0.3],
             }
         )
-
-    @pytest.mark.skip(reason="Flaky test: high dependency on internal details")
-    def test_data_processor_constructor(self, sample_data):
-        """
-        Test the initialization of the IndexerSelector class.
-
-        This test verifies:
-        1. The constructor correctly sets all instance variables with provided parameters.
-        2. Default values are applied when optional parameters are not provided.
-        3. The _process_data method is called once.
-        4. The indexer_denylist is properly applied.
-        5. The 'data' DataFrame maintains its original content, while adding the new columns.
-        6. Optional parameters (existing_agreements, indexer_denylist) default empty if not set.
-
-        The test uses mock objects and patch decorators for _process_data
-        and derive_timestamps to avoid actual data fetching and ensure consistent test behavior.
-        """
-        # Define test input parameters
-        deployment_id = DeploymentId("test_subgraph")
-        existing_agreements = {
-            DeploymentId("subgraph1"): [IndexerId("A")],
-            DeploymentId("subgraph2"): [IndexerId("B")],
-        }
-        indexer_denylist = [IndexerId("D")]
-
-        # Create a IndexerSelector instance
-        processor = IndexerSelector(
-            history=sample_data,
-            deployment_id=deployment_id,
-            existing_agreements=existing_agreements,
-            indexer_denylist=indexer_denylist,
-        )
-
-        # Verify that all instance variables are set correctly
-        assert processor.deployment_id == deployment_id
-        assert processor.existing_agreements == existing_agreements
-        assert processor.indexer_denylist == indexer_denylist
-
-        # Verify default values for optional parameters
-        processor_default = IndexerSelector(
-            history=sample_data,
-            deployment_id=deployment_id,
-        )
-        assert processor_default.existing_agreements == {}
-        assert processor_default.indexer_denylist == []
 
     @pytest.mark.parametrize(
         "initial_group, current_group, expected_added, expected_cancelled",
@@ -444,40 +326,6 @@ class TestIndexerSelector:
             [0.8] * len(sample_data), name="weighted_score", index=result.index
         )
         pd.testing.assert_series_equal(result["weighted_score"], expected_scores)
-
-    @pytest.mark.skip(reason="Flaky test: high dependency on internal details")
-    def test_assign_indexers_to_subgraph(self, sample_data, mock__provider):
-        """
-        Test the _assign_indexers_to_subgraph method of IndexerSelector.
-
-        This test verifies:
-        1. The method calls _add_indexers_to_group when there are fewer than 3 indexers.
-        2. The method calls _replace_underperforming_indexers when there are 3 or more indexers.
-        """
-        with patch("iisa.indexer_selection.IndexerSelector._add_indexers_to_group") as mock_add:
-            with patch(
-                "iisa.indexer_selection.IndexerSelector._replace_underperforming_indexers)"
-            ) as mock_replace:
-                processor = IndexerSelector(
-                    history=sample_data,
-                    deployment_id=DeploymentId("test_subgraph"),
-                )
-
-                # Test with fewer than 3 indexers
-                processor.current_group = ["A", "B"]
-                processor._assign_indexers_to_subgraph()
-                assert mock_add.call_count > 0
-                mock_replace.assert_not_called()
-
-                # Reset mocks
-                mock_add.reset_mock()
-                mock_replace.reset_mock()
-
-                # Test with 3 or more indexers
-                processor.current_group = ["A", "B", "C"]
-                processor._assign_indexers_to_subgraph()
-                mock_add.assert_not_called()
-                mock_replace.assert_called_once()
 
     @pytest.mark.parametrize(
         "initial_group, expected_calls, expected_final_group",
