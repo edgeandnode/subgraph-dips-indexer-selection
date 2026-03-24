@@ -1259,6 +1259,149 @@ class TestTargetSize:
         assert len(processor.current_group) == 4
 
 
+class TestSyncedIndexerPreference:
+    """Tests for two-pool selection: prefer synced indexers."""
+
+    @pytest.fixture
+    def five_indexers(self):
+        """Five indexers with distinct orgs/locations and descending scores."""
+        return pd.DataFrame(
+            {
+                "indexer": ["A", "B", "C", "D", "E"],
+                "deployment_hash": ["hash1"] * 5,
+                "destination_loc": ["loc1", "loc2", "loc3", "loc4", "loc5"],
+                "org": ["org1", "org2", "org3", "org4", "org5"],
+                "weighted_score": [0.9, 0.8, 0.7, 0.6, 0.5],
+                "Latency Coefficient + Error Confidence Interval": [1] * 5,
+                "% up_x": [99] * 5,
+                "stake_to_fees": [1.0] * 5,
+                "average_status": [0.99] * 5,
+                "base_price_per_epoch": [100] * 5,
+                "price_per_entity": [0.1] * 5,
+            }
+        )
+
+    def test_prefers_synced_over_higher_scored_unsynced(self, five_indexers):
+        """Synced indexer C (score 0.7) chosen over unsynced A (0.9)."""
+        processor = IndexerSelector(
+            history=five_indexers,
+            deployment_id="hash1",
+            target_size=1,
+            synced_indexers={"C", "D"},
+        )
+        # C is the highest-scored synced indexer
+        assert "C" in processor.current_group
+
+    def test_falls_back_to_unsynced_when_synced_pool_empty(self, five_indexers):
+        """No synced indexers provided — behaves as before."""
+        processor = IndexerSelector(
+            history=five_indexers,
+            deployment_id="hash1",
+            target_size=1,
+            synced_indexers=set(),
+        )
+        assert "A" in processor.current_group
+
+    def test_falls_back_when_synced_exhausted(self, five_indexers):
+        """Need 3, only 1 synced — remaining 2 from unsynced."""
+        processor = IndexerSelector(
+            history=five_indexers,
+            deployment_id="hash1",
+            target_size=3,
+            synced_indexers={"C"},
+        )
+        assert len(processor.current_group) == 3
+        assert "C" in processor.current_group
+
+    def test_synced_still_respects_denylist(self, five_indexers):
+        """Synced but denylisted indexer is skipped."""
+        processor = IndexerSelector(
+            history=five_indexers,
+            deployment_id="hash1",
+            target_size=1,
+            synced_indexers={"C", "D"},
+            indexer_denylist=["C"],
+        )
+        assert "D" in processor.current_group
+
+    def test_synced_still_respects_decentralization(self, five_indexers):
+        """Synced indexers with same org — draws unsynced for diversity."""
+        # Make C and D share org/location
+        five_indexers.loc[five_indexers["indexer"] == "D", "org"] = "org3"
+        five_indexers.loc[five_indexers["indexer"] == "D", "destination_loc"] = "loc3"
+        processor = IndexerSelector(
+            history=five_indexers,
+            deployment_id="hash1",
+            target_size=2,
+            synced_indexers={"C", "D"},
+        )
+        assert len(processor.current_group) == 2
+        # C selected from synced, but D skipped for decentralisation
+        # — second slot filled from unsynced pool
+        assert "C" in processor.current_group
+        unsynced_in_group = [i for i in processor.current_group if i != "C"]
+        assert unsynced_in_group[0] in {"A", "B", "E"}
+
+    def test_empty_synced_set_backward_compatible(self, five_indexers):
+        """synced_indexers=set() identical to synced_indexers=None."""
+        result_empty = IndexerSelector(
+            history=five_indexers.copy(),
+            deployment_id="hash1",
+            target_size=3,
+            synced_indexers=set(),
+        ).current_group
+
+        result_none = IndexerSelector(
+            history=five_indexers.copy(),
+            deployment_id="hash1",
+            target_size=3,
+            synced_indexers=None,
+        ).current_group
+
+        assert set(result_empty) == set(result_none)
+
+    def test_replacement_prefers_synced(self):
+        """Replacement path also draws from synced pool first."""
+        # A has terrible raw metrics so it scores below MIN_INDEXER_SCORE
+        # after normalisation against the other 4
+        df = pd.DataFrame(
+            {
+                "indexer": ["A", "B", "C", "D", "E"],
+                "deployment_hash": ["hash1"] * 5,
+                "destination_loc": [
+                    "loc1",
+                    "loc2",
+                    "loc3",
+                    "loc4",
+                    "loc5",
+                ],
+                "org": ["org1", "org2", "org3", "org4", "org5"],
+                "Latency Coefficient + Error Confidence Interval": [
+                    100,
+                    1,
+                    1,
+                    1,
+                    1,
+                ],
+                "% up_x": [10, 99, 99, 99, 99],
+                "stake_to_fees": [0.001, 1.0, 1.0, 1.0, 1.0],
+                "average_status": [0.1, 0.99, 0.99, 0.99, 0.99],
+                "base_price_per_epoch": [900, 100, 100, 100, 100],
+                "price_per_entity": [9.0, 0.1, 0.1, 0.1, 0.1],
+            }
+        )
+        processor = IndexerSelector(
+            history=df,
+            deployment_id="hash1",
+            existing_agreements={"hash1": ["A"]},
+            target_size=1,
+            synced_indexers={"D", "E"},
+        )
+        # A replaced — D or E selected from synced pool
+        assert "A" not in processor.current_group
+        assert processor.current_group[0] in {"D", "E"}
+
+
 class TestDecentralizationBestEffort:
     """Tests for best-effort decentralization behavior."""
 
