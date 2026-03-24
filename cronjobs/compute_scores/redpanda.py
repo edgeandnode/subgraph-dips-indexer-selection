@@ -10,9 +10,9 @@ regression window using a two-pass architecture:
   Pass 2 (sample): reservoir sampling with cap = rows_to_use (from adjust_rows).
   Uses raw byte keys and deferred string conversion.
 
-Both passes consume partitions in parallel via ThreadPoolExecutor with batch
-polling (consumer.consume). Partition offsets resolved in pass 1 are cached
-for reuse in pass 2.
+Both passes consume partitions in parallel via ProcessPoolExecutor to bypass
+the GIL during CPU-bound protobuf parsing. Partition offsets resolved in
+pass 1 are cached for reuse in pass 2.
 
 Stake data is fetched via GraphQL from the Graph Network subgraph.
 Computed scores are written to a JSON file on a shared PVC.
@@ -23,7 +23,7 @@ import logging
 import os
 import random
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -74,6 +74,171 @@ def _bytes_to_hex(b: bytes) -> str:
 def _map_result_to_status(result: str) -> str:
     """Map a protobuf result value to the status string processing.py expects."""
     return "200 OK" if result == "success" else result
+
+
+# ---------------------------------------------------------------------------
+# Module-level partition workers (must be picklable for ProcessPoolExecutor)
+# ---------------------------------------------------------------------------
+
+
+def _count_partition_worker(args: tuple) -> tuple:
+    """
+    Count pass for a single partition. Runs in a child process.
+
+    Args is a tuple: (topic, partition, offset, end_ts_ms,
+                       consumer_config, gateway_id_filter)
+    Returns: (counts, fees, message_count, filtered_count)
+    """
+    topic, partition, offset, end_ts_ms, config, gw_filter = args
+
+    from confluent_kafka import Consumer, TopicPartition
+
+    consumer = Consumer(config)
+    counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
+    fees: Dict[bytes, float] = defaultdict(float)
+    total_messages = 0
+    filtered_count = 0
+    consecutive_empty = 0
+
+    try:
+        consumer.assign([TopicPartition(topic, partition, offset)])
+
+        while True:
+            messages = consumer.consume(num_messages=1000, timeout=30.0)
+
+            if not messages:
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    break
+                continue
+
+            consecutive_empty = 0
+
+            for msg in messages:
+                if msg.error():
+                    continue
+
+                ts_type, ts_ms = msg.timestamp()
+                if ts_ms < 0:
+                    ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+                if ts_ms > end_ts_ms:
+                    return (counts, fees, total_messages, filtered_count)
+
+                total_messages += 1
+
+                try:
+                    query = ClientQueryProtobuf()
+                    query.ParseFromString(msg.value())
+                except Exception:
+                    continue
+
+                if gw_filter and query.gateway_id not in gw_filter:
+                    filtered_count += 1
+                    continue
+
+                for attempt in query.indexer_queries:
+                    idx_bytes = bytes(attempt.indexer)
+                    dep_bytes = bytes(attempt.deployment)
+                    if len(dep_bytes) == 32 and len(idx_bytes) == 20:
+                        counts[(dep_bytes, idx_bytes)] += 1
+                        fees[idx_bytes] += attempt.fee_grt
+    finally:
+        consumer.close()
+
+    return (counts, fees, total_messages, filtered_count)
+
+
+def _sample_partition_worker(args: tuple) -> tuple:
+    """
+    Sample pass for a single partition. Runs in a child process.
+
+    Args is a tuple: (topic, partition, offset, end_ts_ms,
+                       consumer_config, gateway_id_filter, rows_to_use)
+    Returns: (reservoirs, counts, filtered_count)
+    """
+    topic, partition, offset, end_ts_ms, config, gw_filter, rows_to_use = args
+
+    from confluent_kafka import Consumer, TopicPartition
+
+    rng = random.Random()
+    consumer = Consumer(config)
+    reservoirs: Dict[Tuple[bytes, bytes], List[dict]] = defaultdict(list)
+    counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
+    filtered_count = 0
+    consecutive_empty = 0
+
+    try:
+        consumer.assign([TopicPartition(topic, partition, offset)])
+
+        while True:
+            messages = consumer.consume(num_messages=1000, timeout=30.0)
+
+            if not messages:
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    break
+                continue
+
+            consecutive_empty = 0
+
+            for msg in messages:
+                if msg.error():
+                    continue
+
+                ts_type, ts_ms = msg.timestamp()
+                if ts_ms < 0:
+                    ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+                if ts_ms > end_ts_ms:
+                    return (reservoirs, counts, filtered_count)
+
+                try:
+                    query = ClientQueryProtobuf()
+                    query.ParseFromString(msg.value())
+                except Exception:
+                    continue
+
+                if gw_filter and query.gateway_id not in gw_filter:
+                    filtered_count += 1
+                    continue
+
+                for attempt in query.indexer_queries:
+                    idx_bytes = bytes(attempt.indexer)
+                    dep_bytes = bytes(attempt.deployment)
+                    url = attempt.url
+
+                    if len(dep_bytes) != 32 or len(idx_bytes) != 20 or not url:
+                        continue
+
+                    key = (dep_bytes, idx_bytes)
+                    n = counts[key]
+
+                    row = {
+                        "query_id": query.query_id,
+                        "indexer_bytes": idx_bytes,
+                        "deployment_bytes": dep_bytes,
+                        "fee": attempt.fee_grt,
+                        "ts_ms": ts_ms,
+                        "blocks_behind": attempt.blocks_behind,
+                        "response_time_ms": attempt.response_time_ms,
+                        "status": _map_result_to_status(attempt.result),
+                        "subgraph_network": attempt.indexed_chain,
+                        "url": url if url.endswith("/") else url + "/",
+                    }
+
+                    if n < rows_to_use:
+                        reservoirs[key].append(row)
+                    else:
+                        j = rng.randint(0, n)
+                        if j < rows_to_use:
+                            reservoirs[key][j] = row
+
+                    counts[key] += 1
+    finally:
+        consumer.close()
+
+    return (reservoirs, counts, filtered_count)
 
 
 # ---------------------------------------------------------------------------
@@ -387,20 +552,14 @@ class RedpandaProvider:
             self._count_cache_num_days = num_days
             return
 
-        # Consume partitions in parallel
-        def count_partition(tp):
-            from confluent_kafka import Consumer
-            from confluent_kafka import TopicPartition as TP
-
-            consumer = Consumer(self._consumer_config())
-            try:
-                consumer.assign([TP(tp.topic, tp.partition, tp.offset)])
-                return self._count_partition_loop(consumer, end_ts_ms)
-            finally:
-                consumer.close()
-
-        with ThreadPoolExecutor(max_workers=min(len(partitions), MAX_PARTITION_WORKERS)) as pool:
-            results = list(pool.map(count_partition, partitions))
+        # Consume partitions in parallel across processes to bypass the GIL.
+        config = self._consumer_config()
+        gw_filter = self._gateway_id_filter
+        args = [
+            (tp.topic, tp.partition, tp.offset, end_ts_ms, config, gw_filter) for tp in partitions
+        ]
+        with ProcessPoolExecutor(max_workers=min(len(partitions), MAX_PARTITION_WORKERS)) as pool:
+            results = list(pool.map(_count_partition_worker, args))
 
         # Merge per-partition counts and fees
         merged_counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
@@ -439,65 +598,6 @@ class RedpandaProvider:
             f"{len(self._count_cache)} (deployment, indexer) pairs"
         )
 
-    def _count_partition_loop(
-        self, consumer, end_ts_ms: int
-    ) -> Tuple[Dict[Tuple[bytes, bytes], int], Dict[bytes, float], int, int]:
-        """
-        Consume one partition for the count pass.
-
-        Returns (counts_by_pair, fees_by_indexer, message_count, filtered_count).
-        """
-        counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
-        fees: Dict[bytes, float] = defaultdict(float)
-        total_messages = 0
-        filtered_count = 0
-        consecutive_empty = 0
-
-        while True:
-            messages = consumer.consume(num_messages=1000, timeout=30.0)
-
-            if not messages:
-                consecutive_empty += 1
-                if consecutive_empty >= 3:
-                    break
-                continue
-
-            consecutive_empty = 0
-
-            for msg in messages:
-                if msg.error():
-                    continue
-
-                ts_type, ts_ms = msg.timestamp()
-                if ts_ms < 0:
-                    ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-                if ts_ms > end_ts_ms:
-                    return (counts, fees, total_messages, filtered_count)
-
-                total_messages += 1
-
-                try:
-                    query = ClientQueryProtobuf()
-                    query.ParseFromString(msg.value())
-                except Exception:
-                    continue
-
-                # Skip messages from non-matching gateways (defense in depth
-                # for mixed mainnet/testnet topics).
-                if self._gateway_id_filter and query.gateway_id not in self._gateway_id_filter:
-                    filtered_count += 1
-                    continue
-
-                for attempt in query.indexer_queries:
-                    idx_bytes = bytes(attempt.indexer)
-                    dep_bytes = bytes(attempt.deployment)
-                    if len(dep_bytes) == 32 and len(idx_bytes) == 20:
-                        counts[(dep_bytes, idx_bytes)] += 1
-                        fees[idx_bytes] += attempt.fee_grt
-
-        return (counts, fees, total_messages, filtered_count)
-
     # -----------------------------------------------------------------------
     # Internal: Pass 2 — sample
     # -----------------------------------------------------------------------
@@ -508,7 +608,7 @@ class RedpandaProvider:
 
         Uses extract_sample_fields for selective parsing, raw byte keys,
         batch polling, cached partitions, deferred string conversion,
-        parallel partition consumption, and thread-local PRNG.
+        parallel partition consumption, and process-local PRNG.
         """
         start_dt = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=timezone.utc)
         end_dt = datetime.now(timezone.utc)
@@ -534,21 +634,15 @@ class RedpandaProvider:
             self._row_cache_rows_to_use = rows_to_use
             return
 
-        # Consume partitions in parallel, each with a thread-local PRNG
-        def sample_partition(tp):
-            from confluent_kafka import Consumer
-            from confluent_kafka import TopicPartition as TP
-
-            rng = random.Random()
-            consumer = Consumer(self._consumer_config())
-            try:
-                consumer.assign([TP(tp.topic, tp.partition, tp.offset)])
-                return self._sample_partition_loop(consumer, end_ts_ms, rows_to_use, rng)
-            finally:
-                consumer.close()
-
-        with ThreadPoolExecutor(max_workers=min(len(partitions), MAX_PARTITION_WORKERS)) as pool:
-            results = list(pool.map(sample_partition, partitions))
+        # Consume partitions in parallel across processes to bypass the GIL.
+        config = self._consumer_config()
+        gw_filter = self._gateway_id_filter
+        args = [
+            (tp.topic, tp.partition, tp.offset, end_ts_ms, config, gw_filter, rows_to_use)
+            for tp in partitions
+        ]
+        with ProcessPoolExecutor(max_workers=min(len(partitions), MAX_PARTITION_WORKERS)) as pool:
+            results = list(pool.map(_sample_partition_worker, args))
 
         # Merge per-partition reservoirs
         merged_reservoirs: Dict[Tuple[bytes, bytes], List[dict]] = defaultdict(list)
@@ -583,92 +677,6 @@ class RedpandaProvider:
             f"{len(merged_reservoirs)} pairs "
             f"({total_filtered:,} messages filtered by gateway ID)"
         )
-
-    def _sample_partition_loop(
-        self,
-        consumer,
-        end_ts_ms: int,
-        rows_to_use: int,
-        rng: random.Random,
-    ) -> Tuple[Dict[Tuple[bytes, bytes], List[dict]], Dict[Tuple[bytes, bytes], int], int]:
-        """
-        Consume one partition for the sample pass.
-
-        Returns (reservoirs, counts, filtered_count) where reservoirs maps
-        (dep_bytes, idx_bytes) to a list of row dicts with raw bytes and
-        ts_ms (deferred conversion).
-        """
-        reservoirs: Dict[Tuple[bytes, bytes], List[dict]] = defaultdict(list)
-        counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
-        filtered_count = 0
-        consecutive_empty = 0
-
-        while True:
-            messages = consumer.consume(num_messages=1000, timeout=30.0)
-
-            if not messages:
-                consecutive_empty += 1
-                if consecutive_empty >= 3:
-                    break
-                continue
-
-            consecutive_empty = 0
-
-            for msg in messages:
-                if msg.error():
-                    continue
-
-                ts_type, ts_ms = msg.timestamp()
-                if ts_ms < 0:
-                    ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-                if ts_ms > end_ts_ms:
-                    return (reservoirs, counts, filtered_count)
-
-                try:
-                    query = ClientQueryProtobuf()
-                    query.ParseFromString(msg.value())
-                except Exception:
-                    continue
-
-                if self._gateway_id_filter and query.gateway_id not in self._gateway_id_filter:
-                    filtered_count += 1
-                    continue
-
-                for attempt in query.indexer_queries:
-                    idx_bytes = bytes(attempt.indexer)
-                    dep_bytes = bytes(attempt.deployment)
-                    url = attempt.url
-
-                    if len(dep_bytes) != 32 or len(idx_bytes) != 20 or not url:
-                        continue
-
-                    key = (dep_bytes, idx_bytes)
-                    n = counts[key]
-
-                    row = {
-                        "query_id": query.query_id,
-                        "indexer_bytes": idx_bytes,
-                        "deployment_bytes": dep_bytes,
-                        "fee": attempt.fee_grt,
-                        "ts_ms": ts_ms,
-                        "blocks_behind": attempt.blocks_behind,
-                        "response_time_ms": attempt.response_time_ms,
-                        "status": _map_result_to_status(attempt.result),
-                        "subgraph_network": attempt.indexed_chain,
-                        "url": url if url.endswith("/") else url + "/",
-                    }
-
-                    if n < rows_to_use:
-                        reservoirs[key].append(row)
-                    else:
-                        j = rng.randint(0, n)
-                        if j < rows_to_use:
-                            reservoirs[key][j] = row
-
-                    counts[key] += 1
-
-        return (reservoirs, counts, filtered_count)
 
     # -----------------------------------------------------------------------
     # Internal: GraphQL pagination
