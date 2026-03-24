@@ -102,6 +102,18 @@ class TestSyncStatusData:
 
         assert "0xaabbccdd" in data.synced_indexers_for("QmTest")
 
+    def test_naive_timestamp_treated_as_utc(self):
+        """Timezone-naive fetched_at is assumed UTC, not rejected."""
+        raw = {
+            "0xAAA": {
+                "deployments": ["QmA"],
+                "fetched_at": "2026-03-24T14:00:00",
+            },
+        }
+        data = SyncStatusData(raw, staleness_threshold_hours=99999)
+
+        assert data.synced_indexers_for("QmA") == {"0xaaa"}
+
 
 class TestSyncStatusLoader:
     def test_load_success(self, tmp_path):

@@ -36,6 +36,8 @@ class SyncStatusData:
 
             try:
                 fetched_at = datetime.fromisoformat(fetched_at_str)
+                if fetched_at.tzinfo is None:
+                    fetched_at = fetched_at.replace(tzinfo=timezone.utc)
             except (ValueError, TypeError):
                 logger.warning(
                     "sync_status: invalid fetched_at for %s: %s",
