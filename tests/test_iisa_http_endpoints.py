@@ -926,6 +926,114 @@ class TestSelectWithProcessor:
         # Act
         _select_with_processor(request)
 
-        # Assert
+        # Assert - target_size
         call_kwargs = mock_processor_class.call_args[1]
         assert call_kwargs["target_size"] == 5
+
+    @patch("iisa.iisa_http_endpoints.IndexerSelector")
+    def test_select_with_processor_passes_synced_indexers(
+        self, mock_processor_class, mock_history_df
+    ):
+        """Verify synced indexers from sync status threaded to IndexerSelector."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import SelectionRequest, _select_with_processor
+
+        mock_processor = MagicMock()
+        mock_processor.current_group = []
+        mock_processor_class.return_value = mock_processor
+
+        iisa_http_endpoints._state._history = mock_history_df
+
+        # Set up sync status with known synced indexers
+        mock_sync = MagicMock()
+        mock_sync.synced_indexers_for.return_value = {"0xaaa", "0xbbb"}
+        iisa_http_endpoints._state._sync_status = mock_sync
+
+        request = SelectionRequest(
+            deployment_id="Qm123",
+            num_candidates=3,
+        )
+
+        # Act
+        _select_with_processor(request)
+
+        # Assert
+        call_kwargs = mock_processor_class.call_args[1]
+        assert call_kwargs["synced_indexers"] == {"0xaaa", "0xbbb"}
+
+        # Cleanup
+        iisa_http_endpoints._state._sync_status = None
+
+    @patch("iisa.iisa_http_endpoints.IndexerSelector")
+    def test_select_with_processor_no_sync_status(self, mock_processor_class, mock_history_df):
+        """Without sync status, synced_indexers is empty set."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import SelectionRequest, _select_with_processor
+
+        mock_processor = MagicMock()
+        mock_processor.current_group = []
+        mock_processor_class.return_value = mock_processor
+
+        iisa_http_endpoints._state._history = mock_history_df
+        iisa_http_endpoints._state._sync_status = None
+
+        request = SelectionRequest(
+            deployment_id="Qm123",
+            num_candidates=3,
+        )
+
+        # Act
+        _select_with_processor(request)
+
+        # Assert
+        call_kwargs = mock_processor_class.call_args[1]
+        assert call_kwargs["synced_indexers"] == set()
+
+
+class TestRefreshSyncStatusEndpoint:
+    """Tests for POST /refresh-sync-status endpoint."""
+
+    def test_refresh_sync_status_success(self):
+        """Verify refresh returns indexer and deployment counts."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        mock_sync = MagicMock()
+        mock_sync.total_indexers = 5
+        mock_sync.total_deployments = 100
+        iisa_http_endpoints._state._sync_status = mock_sync
+        iisa_http_endpoints._state.settings = MagicMock()
+
+        with patch.object(
+            iisa_http_endpoints._state,
+            "refresh_sync_status",
+            return_value=True,
+        ):
+            client = TestClient(app, raise_server_exceptions=False)
+            response = client.post("/refresh-sync-status")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "success"
+        assert data["indexers"] == 5
+        assert data["deployments"] == 100
+
+        # Cleanup
+        iisa_http_endpoints._state._sync_status = None
+
+    def test_refresh_sync_status_no_data(self):
+        """Verify refresh returns no_data when file not found."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        with patch.object(
+            iisa_http_endpoints._state,
+            "refresh_sync_status",
+            return_value=False,
+        ):
+            client = TestClient(app, raise_server_exceptions=False)
+            response = client.post("/refresh-sync-status")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "no_data"

@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     port: int = 8080
     log_level: str = "INFO"
     scores_reload_interval: int = 300  # seconds between file-mtime checks (fallback)
+    sync_status_file_path: str = "/app/scores/sync_status.json"
+    sync_status_reload_interval: int = 120  # seconds
+    sync_status_staleness_hours: float = 6.0
 
 
 @lru_cache
@@ -117,6 +120,7 @@ class HealthResponse(BaseModel):
 
     status: str
     data_loaded: bool
+    sync_status_loaded: bool = False
 
 
 class ScoreRequest(BaseModel):
@@ -161,6 +165,7 @@ class IISAState:
         self.settings: Optional[Settings] = None
         self.data_manager: Optional[DataManager] = None
         self._history: Optional[pd.DataFrame] = None
+        self._sync_status = None
         self._initialized: bool = False
 
     def initialize(self, settings: Settings) -> bool:
@@ -220,6 +225,25 @@ class IISAState:
             logger.error(f"Failed to load scores: {e}")
             return False
 
+    def refresh_sync_status(self) -> bool:
+        """Load sync status from file. Returns True on success."""
+        if self.settings is None:
+            return False
+
+        from .sync_status_loader import SyncStatusLoader
+
+        loader = SyncStatusLoader(self.settings.sync_status_file_path)
+        data = loader.load(self.settings.sync_status_staleness_hours)
+        if data is not None:
+            self._sync_status = data
+            return True
+        return False
+
+    @property
+    def sync_status(self):
+        """Get the cached SyncStatusData, or None."""
+        return getattr(self, "_sync_status", None)
+
     @property
     def history(self) -> Optional[pd.DataFrame]:
         """Get the cached history DataFrame."""
@@ -227,7 +251,7 @@ class IISAState:
 
     @property
     def is_ready(self) -> bool:
-        """Check if the service has data loaded and is ready to make selections."""
+        """Check if the service has data loaded and is ready."""
         return self._history is not None and not self._history.empty
 
 
@@ -302,10 +326,40 @@ async def lifespan(app: FastAPI):
 
     reload_task = asyncio.create_task(_periodic_reload())
 
+    # Sync status: optional, non-blocking
+    if _state.refresh_sync_status():
+        logger.info("Sync status loaded on startup")
+    else:
+        logger.info("No sync status file found (optional)")
+
+    sync_path = settings.sync_status_file_path
+    sync_interval = settings.sync_status_reload_interval
+
+    async def _periodic_sync_reload():
+        last_mtime: float = 0.0
+        try:
+            last_mtime = os.path.getmtime(sync_path)
+        except OSError:
+            pass
+
+        while True:
+            await asyncio.sleep(sync_interval)
+            try:
+                mtime = os.path.getmtime(sync_path)
+            except OSError:
+                continue
+            if mtime != last_mtime:
+                last_mtime = mtime
+                logger.info("Sync status file changed, reloading")
+                _state.refresh_sync_status()
+
+    sync_reload_task = asyncio.create_task(_periodic_sync_reload())
+
     yield
 
     # Cleanup
     reload_task.cancel()
+    sync_reload_task.cancel()
     logger.info("Shutting down IISA service...")
 
 
@@ -332,6 +386,7 @@ async def health_check() -> HealthResponse:
     return HealthResponse(
         status="healthy",
         data_loaded=_state.is_ready,
+        sync_status_loaded=_state.sync_status is not None,
     )
 
 
@@ -354,6 +409,20 @@ async def refresh_data():
         return {"status": "success", "rows": row_count}
     else:
         raise HTTPException(status_code=500, detail="Failed to refresh data")
+
+
+@app.post("/refresh-sync-status")
+async def refresh_sync_status():
+    """Reload sync status from the sync_status.json file."""
+    success = _state.refresh_sync_status()
+    if success:
+        ss = _state.sync_status
+        return {
+            "status": "success",
+            "indexers": ss.total_indexers if ss else 0,
+            "deployments": ss.total_deployments if ss else 0,
+        }
+    return {"status": "no_data"}
 
 
 @app.post("/get-score", response_model=ScoreResponse)
@@ -699,7 +768,17 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     # Build pending_agreements dict - convert to expected format
     pending_agreements: dict[str, list[str]] = request.pending_agreements or {}
 
-    # Create IndexerSelector instance with target_size from num_candidates
+    # Look up which indexers are already synced for this deployment
+    synced_indexers: set[str] = set()
+    if _state.sync_status is not None:
+        synced_indexers = _state.sync_status.synced_indexers_for(request.deployment_id)
+        if synced_indexers:
+            logger.info(
+                "deployment=%s %d synced indexers available",
+                request.deployment_id,
+                len(synced_indexers),
+            )
+
     processor = IndexerSelector(
         history=enriched_history,
         deployment_id=request.deployment_id,
@@ -710,6 +789,7 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
         target_size=request.num_candidates,
         optimistic_dips_fees=request.optimistic_dips_fees,
         price_ceiling=request.max_grt_per_30_days,
+        synced_indexers=synced_indexers,
     )
 
     # Build response with pricing info
