@@ -792,6 +792,36 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
         synced_indexers=synced_indexers,
     )
 
+    # Log selection reasoning for auditability
+    if processor.data is not None and not processor.data.empty and processor.current_group:
+        scored = processor.data[processor.data["indexer"].isin(processor.current_group)]
+        component_cols = [
+            ("norm_stake_to_fees", "stake_to_fees"),
+            ("norm_base_price_per_epoch", "base_price"),
+            ("norm_lat_lin_reg_coefficient", "latency"),
+            ("norm_uptime_score", "uptime"),
+            ("norm_success_rate", "success_rate"),
+            ("norm_price_per_entity", "price_per_entity"),
+        ]
+        for _, row in scored.iterrows():
+            components = {
+                label: round(float(row[col]), 3)
+                for col, label in component_cols
+                if col in row.index and pd.notna(row[col])
+            }
+            weighted = (
+                round(float(row["weighted_score"]), 4)
+                if "weighted_score" in row.index and pd.notna(row["weighted_score"])
+                else None
+            )
+            logger.info(
+                "selected indexer=%s score=%.4f components=%s deployment=%s",
+                row["indexer"],
+                weighted if weighted is not None else 0.0,
+                components,
+                request.deployment_id,
+            )
+
     # Build response with pricing info
     selected = _build_selected_indexers(
         list(processor.current_group),
