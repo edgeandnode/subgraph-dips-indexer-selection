@@ -1387,3 +1387,114 @@ class TestSelectIndexersEndToEndPricing:
                 f"indexer {indexer['id']} returned with None pricing -- "
                 "dipper would fall back to static pricing_table"
             )
+
+    @staticmethod
+    def _row(address, chain, price, loc="US", org="org1"):
+        """Build a minimal indexer row with all columns IndexerSelector needs."""
+        return {
+            "indexer": address,
+            "dips_info_available": True,
+            "dips_supported_networks": json.dumps([chain]),
+            "dips_min_grt_per_30_days": json.dumps({chain: price}),
+            "dips_min_grt_per_billion_entities_per_30_days": 500.0,
+            "destination_loc": loc,
+            "org": org,
+        }
+
+    def test_budget_enforcement_excludes_expensive_indexers(self):
+        """Indexers whose price exceeds max_grt_per_30_days must be excluded."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        history = pd.DataFrame(
+            [
+                self._row("0xcheap", "arb", 100.0),
+                self._row("0xmid", "arb", 300.0),
+                self._row("0xexpensive", "arb", 5000.0),
+            ]
+        )
+
+        iisa_http_endpoints._state._history = history
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/select-indexers",
+            json={
+                "deployment_id": "QmBudgetTest",
+                "chain_id": "arb",
+                "num_candidates": 3,
+                "max_grt_per_30_days": 400.0,
+            },
+        )
+
+        assert response.status_code == 200
+        indexer_ids = [i["id"] for i in response.json()["indexers"]]
+        assert "0xcheap" in indexer_ids
+        assert "0xmid" in indexer_ids
+        assert "0xexpensive" not in indexer_ids, (
+            "indexer priced at 5000 GRT/30d should be excluded with budget of 400"
+        )
+
+    def test_blocklist_excludes_indexers(self):
+        """Blocklisted indexers must not appear in the response."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        history = pd.DataFrame(
+            [
+                self._row("0xgood", "arb", 100.0),
+                self._row("0xblocked", "arb", 100.0),
+            ]
+        )
+
+        iisa_http_endpoints._state._history = history
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/select-indexers",
+            json={
+                "deployment_id": "QmBlocklistTest",
+                "chain_id": "arb",
+                "num_candidates": 2,
+                "blocklist": ["0xblocked"],
+            },
+        )
+
+        assert response.status_code == 200
+        indexer_ids = [i["id"] for i in response.json()["indexers"]]
+        assert "0xgood" in indexer_ids
+        assert "0xblocked" not in indexer_ids, "blocklisted indexer should be excluded"
+
+    def test_num_candidates_caps_response_size(self):
+        """Response must not contain more indexers than num_candidates."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        history = pd.DataFrame(
+            [
+                self._row(f"0x{i:040x}", "arb", 100.0 + i, loc=f"loc{i}", org=f"org{i}")
+                for i in range(5)
+            ]
+        )
+
+        iisa_http_endpoints._state._history = history
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/select-indexers",
+            json={
+                "deployment_id": "QmCapTest",
+                "chain_id": "arb",
+                "num_candidates": 2,
+            },
+        )
+
+        assert response.status_code == 200
+        indexers = response.json()["indexers"]
+        assert len(indexers) <= 2, f"requested 2 candidates but got {len(indexers)}"
