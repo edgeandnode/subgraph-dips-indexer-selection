@@ -1312,3 +1312,78 @@ class TestEnrichWithChainPrices:
         )
         result = _enrich_with_chain_prices(df, None)
         assert result.iloc[0]["base_price_per_epoch"] == 0.0
+
+
+class TestSelectIndexersEndToEndPricing:
+    """Integration test: /select-indexers must not return indexers with None pricing."""
+
+    def test_excludes_indexers_without_dips_info_from_response(self):
+        """Indexers without DIP info or without pricing for the requested chain
+        must not appear in the /select-indexers response. If they did, dipper
+        would fall back to its static pricing_table (potentially 10x the market
+        rate) with no signal."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        # 3 indexers:
+        #   0xa - has DIP info and pricing for "arb" (should be selected)
+        #   0xb - has DIP info but pricing only for "mainnet" (wrong chain)
+        #   0xc - dips_info_available = False (no DIP info at all)
+        history = pd.DataFrame(
+            [
+                {
+                    "indexer": "0xa",
+                    "dips_info_available": True,
+                    "dips_supported_networks": json.dumps(["arb"]),
+                    "dips_min_grt_per_30_days": json.dumps({"arb": 450.0}),
+                    "dips_min_grt_per_billion_entities_per_30_days": 2000.0,
+                },
+                {
+                    "indexer": "0xb",
+                    "dips_info_available": True,
+                    "dips_supported_networks": json.dumps(["mainnet"]),
+                    "dips_min_grt_per_30_days": json.dumps({"mainnet": 200.0}),
+                    "dips_min_grt_per_billion_entities_per_30_days": 1000.0,
+                },
+                {
+                    "indexer": "0xc",
+                    "dips_info_available": False,
+                    "dips_supported_networks": json.dumps(["arb"]),
+                    "dips_min_grt_per_30_days": json.dumps({"arb": 100.0}),
+                    "dips_min_grt_per_billion_entities_per_30_days": 500.0,
+                },
+            ]
+        )
+
+        iisa_http_endpoints._state._history = history
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/select-indexers",
+            json={
+                "deployment_id": "QmTest123",
+                "chain_id": "arb",
+                "num_candidates": 3,
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        indexers = data["indexers"]
+
+        # Only 0xa should be returned
+        indexer_ids = [i["id"] for i in indexers]
+        assert "0xa" in indexer_ids
+        assert "0xb" not in indexer_ids, (
+            "indexer without pricing for requested chain should be excluded"
+        )
+        assert "0xc" not in indexer_ids, "indexer without DIP info should be excluded"
+
+        # The returned indexer must have a non-None price
+        for indexer in indexers:
+            assert indexer["min_grt_per_30_days"] is not None, (
+                f"indexer {indexer['id']} returned with None pricing -- "
+                "dipper would fall back to static pricing_table"
+            )
