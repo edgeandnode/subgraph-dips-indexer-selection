@@ -1,5 +1,6 @@
 """Tests for the IISA HTTP API endpoints."""
 
+import json
 import os
 from unittest.mock import MagicMock, patch
 
@@ -1037,3 +1038,463 @@ class TestRefreshSyncStatusEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "no_data"
+
+
+class TestExtractChainPrice:
+    """Tests for _extract_chain_price -- parses per-chain price from JSON blob."""
+
+    def test_extracts_price_for_matching_chain(self):
+        from iisa.iisa_http_endpoints import _extract_chain_price
+
+        prices_json = json.dumps({"arbitrum-one": 450.0, "mainnet": 200.0})
+        assert _extract_chain_price(prices_json, "arbitrum-one") == 450.0
+        assert _extract_chain_price(prices_json, "mainnet") == 200.0
+
+    def test_returns_none_for_missing_chain(self):
+        from iisa.iisa_http_endpoints import _extract_chain_price
+
+        prices_json = json.dumps({"arbitrum-one": 450.0})
+        assert _extract_chain_price(prices_json, "optimism") is None
+
+    def test_returns_none_for_empty_json(self):
+        from iisa.iisa_http_endpoints import _extract_chain_price
+
+        assert _extract_chain_price("{}", "arbitrum-one") is None
+
+    def test_returns_none_for_malformed_json(self):
+        from iisa.iisa_http_endpoints import _extract_chain_price
+
+        assert _extract_chain_price("not json", "arbitrum-one") is None
+
+    def test_returns_none_for_none_input(self):
+        from iisa.iisa_http_endpoints import _extract_chain_price
+
+        assert _extract_chain_price(None, "arbitrum-one") is None
+
+    def test_converts_string_price_to_float(self):
+        from iisa.iisa_http_endpoints import _extract_chain_price
+
+        prices_json = json.dumps({"arbitrum-one": "450.5"})
+        assert _extract_chain_price(prices_json, "arbitrum-one") == 450.5
+
+
+class TestFilterByPrice:
+    """Tests for _filter_by_price -- excludes indexers by DIP info, chain, and budget."""
+
+    def _make_history(self, rows):
+        return pd.DataFrame(rows)
+
+    def test_no_filtering_when_chain_id_is_none(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history([{"indexer": "0xA", "dips_info_available": False}])
+        result, reason = _filter_by_price(df, None, None)
+        assert len(result) == 1
+
+    def test_excludes_indexers_without_dips_info(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [
+                {
+                    "indexer": "0xA",
+                    "dips_info_available": True,
+                    "dips_supported_networks": json.dumps(["arb"]),
+                    "dips_min_grt_per_30_days": json.dumps({"arb": 100}),
+                },
+                {
+                    "indexer": "0xB",
+                    "dips_info_available": False,
+                    "dips_supported_networks": json.dumps(["arb"]),
+                    "dips_min_grt_per_30_days": json.dumps({"arb": 100}),
+                },
+            ]
+        )
+        result, reason = _filter_by_price(df, "arb", None)
+        assert len(result) == 1
+        assert result.iloc[0]["indexer"] == "0xA"
+
+    def test_all_lacking_dips_info_returns_empty_with_reason(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [
+                {"indexer": "0xA", "dips_info_available": False},
+                {"indexer": "0xB", "dips_info_available": False},
+            ]
+        )
+        result, reason = _filter_by_price(df, "arb", None)
+        assert result.empty
+        assert "lack DIP info" in reason
+
+    def test_excludes_indexers_not_supporting_chain(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [
+                {
+                    "indexer": "0xA",
+                    "dips_info_available": True,
+                    "dips_supported_networks": json.dumps(["arbitrum-one"]),
+                    "dips_min_grt_per_30_days": json.dumps({"arbitrum-one": 100}),
+                },
+                {
+                    "indexer": "0xB",
+                    "dips_info_available": True,
+                    "dips_supported_networks": json.dumps(["mainnet"]),
+                    "dips_min_grt_per_30_days": json.dumps({"mainnet": 200}),
+                },
+            ]
+        )
+        result, reason = _filter_by_price(df, "arbitrum-one", None)
+        assert len(result) == 1
+        assert result.iloc[0]["indexer"] == "0xA"
+
+    def test_excludes_indexers_over_budget(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [
+                {
+                    "indexer": "0xA",
+                    "dips_info_available": True,
+                    "dips_supported_networks": json.dumps(["arb"]),
+                    "dips_min_grt_per_30_days": json.dumps({"arb": 100}),
+                },
+                {
+                    "indexer": "0xB",
+                    "dips_info_available": True,
+                    "dips_supported_networks": json.dumps(["arb"]),
+                    "dips_min_grt_per_30_days": json.dumps({"arb": 500}),
+                },
+            ]
+        )
+        result, reason = _filter_by_price(df, "arb", 200.0)
+        assert len(result) == 1
+        assert result.iloc[0]["indexer"] == "0xA"
+
+    def test_all_over_budget_returns_empty_with_reason(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [
+                {
+                    "indexer": "0xA",
+                    "dips_info_available": True,
+                    "dips_supported_networks": json.dumps(["arb"]),
+                    "dips_min_grt_per_30_days": json.dumps({"arb": 500}),
+                },
+            ]
+        )
+        result, reason = _filter_by_price(df, "arb", 200.0)
+        assert result.empty
+        assert "exceed payment ceiling" in reason
+
+    def test_indexer_without_chain_pricing_excluded(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [
+                {
+                    "indexer": "0xA",
+                    "dips_info_available": True,
+                    "dips_supported_networks": json.dumps(["arb"]),
+                    "dips_min_grt_per_30_days": json.dumps({"mainnet": 100}),
+                },
+            ]
+        )
+        result, reason = _filter_by_price(df, "arb", None)
+        assert result.empty
+
+
+class TestBuildSelectedIndexers:
+    """Tests for _build_selected_indexers -- extracts chain-specific price into response."""
+
+    def test_returns_chain_specific_price(self):
+        from iisa.iisa_http_endpoints import _build_selected_indexers
+
+        history = pd.DataFrame(
+            [
+                {
+                    "indexer": "0xa",
+                    "dips_min_grt_per_30_days": json.dumps(
+                        {"arbitrum-one": 450.0, "mainnet": 200.0}
+                    ),
+                    "dips_min_grt_per_billion_entities_per_30_days": 2000.0,
+                }
+            ]
+        )
+        result = _build_selected_indexers(["0xa"], history, "arbitrum-one")
+        assert len(result) == 1
+        assert result[0].min_grt_per_30_days == 450.0
+        assert result[0].min_grt_per_billion_entities_per_30_days == 2000.0
+
+    def test_returns_none_when_chain_not_in_pricing(self):
+        from iisa.iisa_http_endpoints import _build_selected_indexers
+
+        history = pd.DataFrame(
+            [
+                {
+                    "indexer": "0xa",
+                    "dips_min_grt_per_30_days": json.dumps({"mainnet": 200.0}),
+                    "dips_min_grt_per_billion_entities_per_30_days": None,
+                }
+            ]
+        )
+        result = _build_selected_indexers(["0xa"], history, "arbitrum-one")
+        assert result[0].min_grt_per_30_days is None
+
+    def test_returns_none_when_no_chain_id(self):
+        from iisa.iisa_http_endpoints import _build_selected_indexers
+
+        history = pd.DataFrame(
+            [
+                {
+                    "indexer": "0xa",
+                    "dips_min_grt_per_30_days": json.dumps({"arbitrum-one": 450.0}),
+                }
+            ]
+        )
+        result = _build_selected_indexers(["0xa"], history, None)
+        assert result[0].min_grt_per_30_days is None
+
+    def test_indexer_not_in_history_returns_none_pricing(self):
+        from iisa.iisa_http_endpoints import _build_selected_indexers
+
+        history = pd.DataFrame([{"indexer": "0xother"}])
+        result = _build_selected_indexers(["0xa"], history, "arbitrum-one")
+        assert result[0].min_grt_per_30_days is None
+
+
+class TestEnrichWithChainPrices:
+    """Tests for _enrich_with_chain_prices -- adds price columns for scoring."""
+
+    def test_adds_chain_specific_base_price(self):
+        from iisa.iisa_http_endpoints import _enrich_with_chain_prices
+
+        df = pd.DataFrame(
+            [
+                {
+                    "indexer": "0xa",
+                    "dips_min_grt_per_30_days": json.dumps({"arb": 450.0}),
+                    "dips_min_grt_per_billion_entities_per_30_days": 2000.0,
+                }
+            ]
+        )
+        result = _enrich_with_chain_prices(df, "arb")
+        assert result.iloc[0]["base_price_per_epoch"] == 450.0
+        assert result.iloc[0]["price_per_entity"] == 2000.0
+
+    def test_zero_price_when_chain_not_found(self):
+        from iisa.iisa_http_endpoints import _enrich_with_chain_prices
+
+        df = pd.DataFrame(
+            [
+                {
+                    "indexer": "0xa",
+                    "dips_min_grt_per_30_days": json.dumps({"mainnet": 200.0}),
+                }
+            ]
+        )
+        result = _enrich_with_chain_prices(df, "arb")
+        assert result.iloc[0]["base_price_per_epoch"] == 0.0
+
+    def test_zero_price_when_no_chain_id(self):
+        from iisa.iisa_http_endpoints import _enrich_with_chain_prices
+
+        df = pd.DataFrame(
+            [
+                {
+                    "indexer": "0xa",
+                    "dips_min_grt_per_30_days": json.dumps({"arb": 450.0}),
+                }
+            ]
+        )
+        result = _enrich_with_chain_prices(df, None)
+        assert result.iloc[0]["base_price_per_epoch"] == 0.0
+
+
+class TestSelectIndexersEndToEndPricing:
+    """Integration test: /select-indexers must not return indexers with None pricing."""
+
+    def test_excludes_indexers_without_dips_info_from_response(self):
+        """Indexers without DIP info or without pricing for the requested chain
+        must not appear in the /select-indexers response. If they did, dipper
+        would fall back to its static pricing_table (potentially 10x the market
+        rate) with no signal."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        # 3 indexers:
+        #   0xa - has DIP info and pricing for "arb" (should be selected)
+        #   0xb - has DIP info but pricing only for "mainnet" (wrong chain)
+        #   0xc - dips_info_available = False (no DIP info at all)
+        history = pd.DataFrame(
+            [
+                {
+                    "indexer": "0xa",
+                    "dips_info_available": True,
+                    "dips_supported_networks": json.dumps(["arb"]),
+                    "dips_min_grt_per_30_days": json.dumps({"arb": 450.0}),
+                    "dips_min_grt_per_billion_entities_per_30_days": 2000.0,
+                },
+                {
+                    "indexer": "0xb",
+                    "dips_info_available": True,
+                    "dips_supported_networks": json.dumps(["mainnet"]),
+                    "dips_min_grt_per_30_days": json.dumps({"mainnet": 200.0}),
+                    "dips_min_grt_per_billion_entities_per_30_days": 1000.0,
+                },
+                {
+                    "indexer": "0xc",
+                    "dips_info_available": False,
+                    "dips_supported_networks": json.dumps(["arb"]),
+                    "dips_min_grt_per_30_days": json.dumps({"arb": 100.0}),
+                    "dips_min_grt_per_billion_entities_per_30_days": 500.0,
+                },
+            ]
+        )
+
+        iisa_http_endpoints._state._history = history
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/select-indexers",
+            json={
+                "deployment_id": "QmTest123",
+                "chain_id": "arb",
+                "num_candidates": 3,
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        indexers = data["indexers"]
+
+        # Only 0xa should be returned
+        indexer_ids = [i["id"] for i in indexers]
+        assert "0xa" in indexer_ids
+        assert "0xb" not in indexer_ids, (
+            "indexer without pricing for requested chain should be excluded"
+        )
+        assert "0xc" not in indexer_ids, "indexer without DIP info should be excluded"
+
+        # The returned indexer must have a non-None price
+        for indexer in indexers:
+            assert indexer["min_grt_per_30_days"] is not None, (
+                f"indexer {indexer['id']} returned with None pricing -- "
+                "dipper would fall back to static pricing_table"
+            )
+
+    @staticmethod
+    def _row(address, chain, price, loc="US", org="org1"):
+        """Build a minimal indexer row with all columns IndexerSelector needs."""
+        return {
+            "indexer": address,
+            "dips_info_available": True,
+            "dips_supported_networks": json.dumps([chain]),
+            "dips_min_grt_per_30_days": json.dumps({chain: price}),
+            "dips_min_grt_per_billion_entities_per_30_days": 500.0,
+            "destination_loc": loc,
+            "org": org,
+        }
+
+    def test_budget_enforcement_excludes_expensive_indexers(self):
+        """Indexers whose price exceeds max_grt_per_30_days must be excluded."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        history = pd.DataFrame(
+            [
+                self._row("0xcheap", "arb", 100.0),
+                self._row("0xmid", "arb", 300.0),
+                self._row("0xexpensive", "arb", 5000.0),
+            ]
+        )
+
+        iisa_http_endpoints._state._history = history
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/select-indexers",
+            json={
+                "deployment_id": "QmBudgetTest",
+                "chain_id": "arb",
+                "num_candidates": 3,
+                "max_grt_per_30_days": 400.0,
+            },
+        )
+
+        assert response.status_code == 200
+        indexer_ids = [i["id"] for i in response.json()["indexers"]]
+        assert "0xcheap" in indexer_ids
+        assert "0xmid" in indexer_ids
+        assert "0xexpensive" not in indexer_ids, (
+            "indexer priced at 5000 GRT/30d should be excluded with budget of 400"
+        )
+
+    def test_blocklist_excludes_indexers(self):
+        """Blocklisted indexers must not appear in the response."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        history = pd.DataFrame(
+            [
+                self._row("0xgood", "arb", 100.0),
+                self._row("0xblocked", "arb", 100.0),
+            ]
+        )
+
+        iisa_http_endpoints._state._history = history
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/select-indexers",
+            json={
+                "deployment_id": "QmBlocklistTest",
+                "chain_id": "arb",
+                "num_candidates": 2,
+                "blocklist": ["0xblocked"],
+            },
+        )
+
+        assert response.status_code == 200
+        indexer_ids = [i["id"] for i in response.json()["indexers"]]
+        assert "0xgood" in indexer_ids
+        assert "0xblocked" not in indexer_ids, "blocklisted indexer should be excluded"
+
+    def test_num_candidates_caps_response_size(self):
+        """Response must not contain more indexers than num_candidates."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        history = pd.DataFrame(
+            [
+                self._row(f"0x{i:040x}", "arb", 100.0 + i, loc=f"loc{i}", org=f"org{i}")
+                for i in range(5)
+            ]
+        )
+
+        iisa_http_endpoints._state._history = history
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/select-indexers",
+            json={
+                "deployment_id": "QmCapTest",
+                "chain_id": "arb",
+                "num_candidates": 2,
+            },
+        )
+
+        assert response.status_code == 200
+        indexers = response.json()["indexers"]
+        assert len(indexers) <= 2, f"requested 2 candidates but got {len(indexers)}"
