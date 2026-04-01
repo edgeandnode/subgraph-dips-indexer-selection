@@ -58,6 +58,7 @@ filterwarnings = [
 [tool.ruff]
 src = ["src", "tests"]
 line-length = 100
+extend-exclude = ["*_pb2.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]

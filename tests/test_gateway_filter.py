@@ -9,7 +9,32 @@ from unittest.mock import MagicMock, patch
 jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
-from redpanda import RedpandaProvider  # noqa: E402
+from gateway_queries_pb2 import ClientQueryProtobuf  # noqa: E402
+from redpanda import RedpandaProvider, _count_partition_worker  # noqa: E402
+
+
+def _build_message(gateway_id: str, indexer: bytes, deployment: bytes, fee: float) -> bytes:
+    """Build a serialised ClientQueryProtobuf with one indexer attempt."""
+    query = ClientQueryProtobuf()
+    query.gateway_id = gateway_id
+    query.query_id = "test-query-JFK"
+    attempt = query.indexer_queries.add()
+    attempt.indexer = indexer
+    attempt.deployment = deployment
+    attempt.fee_grt = fee
+    attempt.url = "https://indexer.example.com/"
+    attempt.result = "success"
+    return query.SerializeToString()
+
+
+def _fake_kafka_message(ts_ms: int, value: bytes):
+    """Create a mock Kafka message."""
+    msg = MagicMock()
+    msg.error.return_value = None
+    msg.timestamp.return_value = (1, ts_ms)
+    msg.value.return_value = value
+    msg.offset.return_value = 0
+    return msg
 
 
 class TestGatewayIdFilter:
@@ -48,66 +73,43 @@ class TestGatewayIdFilter:
             provider = RedpandaProvider()
         assert provider._gateway_id_filter == {"gw-1", "gw-2"}
 
-    def test_count_loop_skips_non_matching_gateway(self):
-        """Messages from non-matching gateways are skipped in the count loop."""
-        with patch.dict(os.environ, {"REDPANDA_GATEWAY_IDS": "mainnet-gw"}):
-            provider = RedpandaProvider()
-
-        # Mock a protobuf message from the wrong gateway
-        mock_query = MagicMock()
-        mock_query.gateway_id = "testnet-gw"
-        mock_query.indexer_queries = [MagicMock()]
-
-        # Mock consumer that returns one message then stops
-        mock_msg = MagicMock()
-        mock_msg.error.return_value = None
-        mock_msg.timestamp.return_value = (0, 1000)
-        mock_msg.value.return_value = b"fake"
+    def test_worker_skips_non_matching_gateway(self):
+        """Messages from non-matching gateways are skipped by the worker."""
+        indexer = b"\x01" * 20
+        deployment = b"\x02" * 32
+        value = _build_message("testnet-gw", indexer, deployment, 0.1)
+        msg = _fake_kafka_message(1000, value)
 
         mock_consumer = MagicMock()
-        mock_consumer.consume.side_effect = [[mock_msg], [], [], []]
+        mock_consumer.consume.side_effect = [[msg], [], [], []]
 
-        with patch("redpanda.ClientQueryProtobuf") as MockProto:
-            instance = MockProto.return_value
-            instance.ParseFromString.return_value = None
-            instance.gateway_id = "testnet-gw"
-            instance.indexer_queries = [
-                MagicMock(indexer=b"\x01" * 20, deployment=b"\x02" * 32, fee_grt=0.1)
-            ]
-
-            counts, fees, total, filtered = provider._count_partition_loop(
-                mock_consumer, end_ts_ms=999999999999
+        with patch("confluent_kafka.Consumer", return_value=mock_consumer):
+            config = {"bootstrap.servers": "localhost:9092"}
+            gw_filter = {"mainnet-gw"}
+            counts, fees, total, filtered = _count_partition_worker(
+                ("gateway_queries", 0, 0, 999999999999, config, gw_filter)
             )
 
-        # Message was consumed (total_messages incremented) but indexer data was skipped
         assert total == 1
         assert filtered == 1
         assert len(counts) == 0
         assert len(fees) == 0
 
-    def test_count_loop_accepts_matching_gateway(self):
-        """Messages from matching gateways are processed in the count loop."""
-        with patch.dict(os.environ, {"REDPANDA_GATEWAY_IDS": "mainnet-gw"}):
-            provider = RedpandaProvider()
-
-        mock_msg = MagicMock()
-        mock_msg.error.return_value = None
-        mock_msg.timestamp.return_value = (0, 1000)
-        mock_msg.value.return_value = b"fake"
+    def test_worker_accepts_matching_gateway(self):
+        """Messages from matching gateways are processed by the worker."""
+        indexer = b"\x01" * 20
+        deployment = b"\x02" * 32
+        value = _build_message("mainnet-gw", indexer, deployment, 0.1)
+        msg = _fake_kafka_message(1000, value)
 
         mock_consumer = MagicMock()
-        mock_consumer.consume.side_effect = [[mock_msg], [], [], []]
+        mock_consumer.consume.side_effect = [[msg], [], [], []]
 
-        with patch("redpanda.ClientQueryProtobuf") as MockProto:
-            instance = MockProto.return_value
-            instance.ParseFromString.return_value = None
-            instance.gateway_id = "mainnet-gw"
-            instance.indexer_queries = [
-                MagicMock(indexer=b"\x01" * 20, deployment=b"\x02" * 32, fee_grt=0.1)
-            ]
-
-            counts, fees, total, filtered = provider._count_partition_loop(
-                mock_consumer, end_ts_ms=999999999999
+        with patch("confluent_kafka.Consumer", return_value=mock_consumer):
+            config = {"bootstrap.servers": "localhost:9092"}
+            gw_filter = {"mainnet-gw"}
+            counts, fees, total, filtered = _count_partition_worker(
+                ("gateway_queries", 0, 0, 999999999999, config, gw_filter)
             )
 
         assert total == 1
@@ -115,31 +117,20 @@ class TestGatewayIdFilter:
         assert len(counts) == 1
         assert len(fees) == 1
 
-    def test_count_loop_no_filter_passes_all(self):
+    def test_worker_no_filter_passes_all(self):
         """When no filter is set, all messages are processed."""
-        with patch.dict(os.environ, {"REDPANDA_GATEWAY_IDS": ""}):
-            provider = RedpandaProvider()
-
-        assert provider._gateway_id_filter is None
-
-        mock_msg = MagicMock()
-        mock_msg.error.return_value = None
-        mock_msg.timestamp.return_value = (0, 1000)
-        mock_msg.value.return_value = b"fake"
+        indexer = b"\x01" * 20
+        deployment = b"\x02" * 32
+        value = _build_message("any-gateway", indexer, deployment, 0.1)
+        msg = _fake_kafka_message(1000, value)
 
         mock_consumer = MagicMock()
-        mock_consumer.consume.side_effect = [[mock_msg], [], [], []]
+        mock_consumer.consume.side_effect = [[msg], [], [], []]
 
-        with patch("redpanda.ClientQueryProtobuf") as MockProto:
-            instance = MockProto.return_value
-            instance.ParseFromString.return_value = None
-            instance.gateway_id = "any-gateway"
-            instance.indexer_queries = [
-                MagicMock(indexer=b"\x01" * 20, deployment=b"\x02" * 32, fee_grt=0.1)
-            ]
-
-            counts, fees, total, filtered = provider._count_partition_loop(
-                mock_consumer, end_ts_ms=999999999999
+        with patch("confluent_kafka.Consumer", return_value=mock_consumer):
+            config = {"bootstrap.servers": "localhost:9092"}
+            counts, fees, total, filtered = _count_partition_worker(
+                ("gateway_queries", 0, 0, 999999999999, config, None)
             )
 
         assert total == 1

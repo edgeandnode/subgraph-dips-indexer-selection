@@ -16,15 +16,16 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, cast
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .indexer_selection import IndexerSelector
+from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
 from .score_loader import DataManager, FileScoreLoader
+from .sync_status_loader import SyncStatusData
 
 __all__ = ["app", "Settings", "get_settings"]
 
@@ -165,7 +166,7 @@ class IISAState:
         self.settings: Optional[Settings] = None
         self.data_manager: Optional[DataManager] = None
         self._history: Optional[pd.DataFrame] = None
-        self._sync_status = None
+        self._sync_status: Optional["SyncStatusData"] = None
         self._initialized: bool = False
 
     def initialize(self, settings: Settings) -> bool:
@@ -781,15 +782,18 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
 
     processor = IndexerSelector(
         history=enriched_history,
-        deployment_id=request.deployment_id,
-        existing_agreements=existing_agreements,
-        pending_agreements=pending_agreements,
-        declined_indexers=request.declined_indexers or {},
-        indexer_denylist=request.blocklist or [],
+        deployment_id=cast(IpfsHashStr, request.deployment_id),
+        existing_agreements=cast(dict[IpfsHashStr, list[EthAddressStr]], existing_agreements),
+        pending_agreements=cast(dict[IpfsHashStr, list[EthAddressStr]], pending_agreements),
+        declined_indexers=cast(
+            dict[IpfsHashStr, EthAddressStr],
+            request.declined_indexers or {},
+        ),
+        indexer_denylist=cast(list[EthAddressStr], request.blocklist or []),
         target_size=request.num_candidates,
         optimistic_dips_fees=request.optimistic_dips_fees,
         price_ceiling=request.max_grt_per_30_days,
-        synced_indexers=synced_indexers,
+        synced_indexers=cast(set[EthAddressStr], synced_indexers),
     )
 
     # Log selection reasoning for auditability
