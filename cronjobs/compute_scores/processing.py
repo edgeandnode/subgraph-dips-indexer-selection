@@ -6,6 +6,7 @@ for computing latency regression, uptime, success rate, and stake-to-fees metric
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -874,7 +875,9 @@ def hash_sampled_queries(df: pd.DataFrame, integer_root: int) -> pd.DataFrame:
     result_df.loc[
         result_df["sampled_query_id"].notna(),
         "sampled_query_id_hashed_mod_integer_root",
-    ] = result_df["sampled_query_id"].apply(lambda x: hash(x) % integer_root)
+    ] = result_df["sampled_query_id"].apply(
+        lambda x: int.from_bytes(hashlib.sha256(x.encode()).digest()[:8]) % integer_root
+    )
     return result_df
 
 

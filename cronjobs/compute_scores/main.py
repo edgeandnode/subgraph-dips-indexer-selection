@@ -14,6 +14,7 @@ HTTP endpoints:
 import json
 import logging
 import os
+import random
 import resource
 import signal
 import sys
@@ -23,6 +24,7 @@ from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.request import Request, urlopen
 
+import numpy as np
 from processing import compute_all_scores, compute_degraded_scores, validate_geoip_databases
 from redpanda import RedpandaProvider
 
@@ -135,6 +137,13 @@ def run_scoring() -> bool:
     pipeline_start = time.time()
     logger.info("Starting score computation")
 
+    # Seed RNGs for deterministic scoring given the same input data.
+    # The date-based seed means re-runs on the same day produce identical results.
+    seed = int(date.today().strftime("%Y%m%d"))
+    random.seed(seed)
+    np.random.seed(seed)
+    logger.info(f"RNG seed: {seed}")
+
     geoip_available = validate_geoip_databases()
     if not geoip_available:
         logger.warning("GeoIP databases unavailable, latency scores will be neutral")
@@ -149,7 +158,8 @@ def run_scoring() -> bool:
         start_date = end_date - timedelta(days=NUM_DAYS)
         start_ts = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        logger.info(f"Attempting {'full' if geoip_available else 'partial (no GeoIP)'} pipeline for {start_date} to {end_date}")
+        mode_label = "full" if geoip_available else "partial (no GeoIP)"
+        logger.info(f"Attempting {mode_label} pipeline for {start_date} to {end_date}")
         scores_df = compute_all_scores(
             provider=provider,
             start_date=start_date,
@@ -206,31 +216,37 @@ def run_scoring() -> bool:
             _consecutive_degraded = 0
             _consecutive_failed += 1
 
-        _last_run.update({
-            "time": datetime.now(timezone.utc).isoformat(),
-            "success": success,
-            "indexers": len(scores_df) if success else 0,
-            "elapsed_seconds": round(elapsed, 1),
-            "mode": mode,
-            "consecutive_partial": _consecutive_partial,
-            "consecutive_degraded": _consecutive_degraded,
-            "consecutive_failed": _consecutive_failed,
-        })
+        _last_run.update(
+            {
+                "time": datetime.now(timezone.utc).isoformat(),
+                "success": success,
+                "indexers": len(scores_df) if success else 0,
+                "elapsed_seconds": round(elapsed, 1),
+                "mode": mode,
+                "consecutive_partial": _consecutive_partial,
+                "consecutive_degraded": _consecutive_degraded,
+                "consecutive_failed": _consecutive_failed,
+            }
+        )
 
     # Log outside the lock
     if mode == MODE_PARTIAL:
         logger.warning(
             f"Scoring ran without GeoIP ({_consecutive_partial} consecutive partial run(s)). "
-            f"Latency scores are neutral (0.5). Install MaxMind GeoLite2 databases for full scoring."
+            "Latency scores are neutral (0.5). "
+            "Install MaxMind GeoLite2 databases for full scoring."
         )
     elif mode == MODE_DEGRADED:
         if _consecutive_degraded >= DEGRADED_THRESHOLD:
             logger.error(
                 f"Scoring has been degraded for {_consecutive_degraded} consecutive runs. "
-                f"Full pipeline is not functioning — investigate GeoIP databases and Redpanda data availability."
+                "Full pipeline is not functioning — "
+                "investigate GeoIP databases and Redpanda data availability."
             )
         else:
-            logger.warning(f"Scoring degraded ({_consecutive_degraded}/{DEGRADED_THRESHOLD} before alert)")
+            logger.warning(
+                f"Scoring degraded ({_consecutive_degraded}/{DEGRADED_THRESHOLD} before alert)"
+            )
     elif mode == MODE_FAILED:
         logger.error(f"Scoring failed completely for {_consecutive_failed} consecutive runs")
 
@@ -252,16 +268,22 @@ class RequestHandler(BaseHTTPRequestHandler):
                 degraded = _consecutive_degraded
                 failed = _consecutive_failed
             if failed > 0:
-                self._json_response(503, {
-                    "status": "failing",
-                    "consecutive_failed": failed,
-                })
+                self._json_response(
+                    503,
+                    {
+                        "status": "failing",
+                        "consecutive_failed": failed,
+                    },
+                )
             elif degraded >= DEGRADED_THRESHOLD:
-                self._json_response(200, {
-                    "status": "degraded",
-                    "consecutive_degraded": degraded,
-                    "message": "Full pipeline not functioning, serving degraded scores",
-                })
+                self._json_response(
+                    200,
+                    {
+                        "status": "degraded",
+                        "consecutive_degraded": degraded,
+                        "message": "Full pipeline not functioning, serving degraded scores",
+                    },
+                )
             else:
                 self._json_response(200, {"status": "ok"})
         elif self.path == "/status":
@@ -303,8 +325,7 @@ def main() -> int:
     global _next_run_time
 
     logger.info(
-        f"Score computation service starting "
-        f"(interval={SCORING_INTERVAL}s, http_port={HTTP_PORT})"
+        f"Score computation service starting (interval={SCORING_INTERVAL}s, http_port={HTTP_PORT})"
     )
 
     if IISA_API_URL:
