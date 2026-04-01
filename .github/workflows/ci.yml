@@ -27,9 +27,23 @@ jobs:
       - name: Lint
         run: ruff check src/ tests/ cronjobs/compute_scores/*.py --exclude '*_pb2.py'
 
-      - name: Type check
-        run: mypy
-        continue-on-error: true
-
       - name: Test
         run: pytest --tb=short -q --cov=src --cov-fail-under=35
+
+  # Separate job so it shows as its own check in PRs. There are 12
+  # existing type errors in src/iisa/ so this is non-required for now.
+  type-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: mypy
+        run: mypy
