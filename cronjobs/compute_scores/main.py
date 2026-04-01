@@ -139,6 +139,9 @@ def run_scoring() -> bool:
 
     # Seed RNGs for deterministic scoring given the same input data.
     # Set SCORING_SEED to replay a previous run's exact sampling.
+    # Note: np.random.seed() seeds the legacy global RandomState which
+    # np.random.choice in strategic_sample draws from. If that code is
+    # migrated to np.random.default_rng(), this seed won't take effect.
     seed = int(os.environ.get("SCORING_SEED", date.today().strftime("%Y%m%d")))
     random.seed(seed)
     np.random.seed(seed)
