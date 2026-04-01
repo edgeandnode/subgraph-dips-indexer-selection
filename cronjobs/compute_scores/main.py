@@ -24,7 +24,6 @@ from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.request import Request, urlopen
 
-import numpy as np
 from processing import compute_all_scores, compute_degraded_scores, validate_geoip_databases
 from redpanda import RedpandaProvider
 
@@ -139,12 +138,8 @@ def run_scoring() -> bool:
 
     # Seed RNGs for deterministic scoring given the same input data.
     # Set SCORING_SEED to replay a previous run's exact sampling.
-    # Note: np.random.seed() seeds the legacy global RandomState which
-    # np.random.choice in strategic_sample draws from. If that code is
-    # migrated to np.random.default_rng(), this seed won't take effect.
     seed = int(os.environ.get("SCORING_SEED", date.today().strftime("%Y%m%d")))
     random.seed(seed)
-    np.random.seed(seed)
     logger.info(f"RNG seed: {seed}")
 
     geoip_available = validate_geoip_databases()
@@ -170,6 +165,7 @@ def run_scoring() -> bool:
             num_days=NUM_DAYS,
             target_rows=TARGET_ROWS,
             geoip_available=geoip_available,
+            seed=seed,
         )
         if scores_df.empty:
             logger.warning("Pipeline returned empty results")

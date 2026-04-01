@@ -311,6 +311,7 @@ def compute_all_scores(
     num_days: int,
     target_rows: int,
     geoip_available: bool = True,
+    seed: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Compute all indexer scores and return as a DataFrame.
@@ -409,7 +410,10 @@ def compute_all_scores(
                 "or the filter thresholds are too strict for the current dataset."
             )
 
-        filtered_data, integer_root = strategic_sample(filtered_data, target_rows_per_subgraph)
+        rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
+        filtered_data, integer_root = strategic_sample(
+            filtered_data, target_rows_per_subgraph, rng=rng
+        )
         filtered_data = hash_sampled_queries(filtered_data, integer_root)
 
         categorical = [
@@ -836,8 +840,13 @@ def iterative_filter(
     return pd.DataFrame(df)
 
 
-def strategic_sample(df: pd.DataFrame, target_rows_per_subgraph: int) -> Tuple[pd.DataFrame, int]:
+def strategic_sample(
+    df: pd.DataFrame, target_rows_per_subgraph: int, rng: Optional[np.random.Generator] = None
+) -> Tuple[pd.DataFrame, int]:
     """Sample queries to create balanced representation across indexers."""
+    if rng is None:
+        rng = np.random.default_rng()
+
     if df.empty:
         df["sampled_query_id"] = pd.Series(dtype="float64")
         return df, 0
@@ -856,7 +865,7 @@ def strategic_sample(df: pd.DataFrame, target_rows_per_subgraph: int) -> Tuple[p
 
     def sample_queries(query_ids, cap):
         query_ids = list(np.concatenate(query_ids)) if isinstance(query_ids[0], list) else query_ids
-        return np.random.choice(query_ids, size=min(len(query_ids), cap), replace=False)
+        return rng.choice(query_ids, size=min(len(query_ids), cap), replace=False)
 
     query_counts["sampled_query_id_list"] = query_counts.apply(
         lambda x: sample_queries(x["unique_query_ids"], x["cap"]), axis=1
@@ -872,10 +881,10 @@ def strategic_sample(df: pd.DataFrame, target_rows_per_subgraph: int) -> Tuple[p
 def hash_sampled_queries(df: pd.DataFrame, integer_root: int) -> pd.DataFrame:
     """Hash sampled query IDs for regression."""
     result_df = df.copy()
-    result_df.loc[
-        result_df["sampled_query_id"].notna(),
-        "sampled_query_id_hashed_mod_integer_root",
-    ] = result_df["sampled_query_id"].apply(
+    mask = result_df["sampled_query_id"].notna()
+    result_df.loc[mask, "sampled_query_id_hashed_mod_integer_root"] = result_df.loc[
+        mask, "sampled_query_id"
+    ].apply(
         lambda x: int.from_bytes(hashlib.sha256(str(x).encode()).digest()[:8], byteorder="big")
         % integer_root
     )
