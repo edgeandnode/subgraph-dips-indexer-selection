@@ -138,8 +138,8 @@ def run_scoring() -> bool:
     logger.info("Starting score computation")
 
     # Seed RNGs for deterministic scoring given the same input data.
-    # The date-based seed means re-runs on the same day produce identical results.
-    seed = int(date.today().strftime("%Y%m%d"))
+    # Set SCORING_SEED to replay a previous run's exact sampling.
+    seed = int(os.environ.get("SCORING_SEED", date.today().strftime("%Y%m%d")))
     random.seed(seed)
     np.random.seed(seed)
     logger.info(f"RNG seed: {seed}")
