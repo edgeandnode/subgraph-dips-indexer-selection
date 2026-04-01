@@ -99,7 +99,7 @@ class IndexerSelector:
         deployment_id: DeploymentId,
         existing_agreements: Optional[dict[DeploymentId, list[IndexerId]]] = None,
         pending_agreements: Optional[dict[DeploymentId, list[IndexerId]]] = None,
-        declined_indexers: Optional[dict[DeploymentId, IndexerId]] = None,
+        declined_indexers: Optional[dict[DeploymentId, list[IndexerId]]] = None,
         indexer_denylist: Optional[list[IndexerId]] = None,
         weights: Optional[WeightsDict] = None,
         target_size: int = 3,
