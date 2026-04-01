@@ -27,11 +27,9 @@ class _InlineExecutor(Executor):
         pass
 
     def map(self, fn, *iterables, **kwargs):
-        return (
-            [fn(args) for args in zip(*iterables) if True]
-            if len(iterables) > 1
-            else [fn(args) for args in iterables[0]]
-        )
+        if len(iterables) > 1:
+            return [fn(args) for args in zip(*iterables)]
+        return [fn(args) for args in iterables[0]]
 
     def submit(self, fn, *args, **kwargs):
         fut = Future()

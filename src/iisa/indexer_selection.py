@@ -830,7 +830,7 @@ def _normalize_generic(series: pd.Series) -> pd.Series:
     # Handle any potential NaN or inf values
     normalized = normalized.fillna(0)
 
-    return pd.Series(normalized)
+    return cast(pd.Series, normalized)
 
 
 def _normalize_uptime_and_success_rate(series: pd.Series) -> pd.Series:
@@ -863,7 +863,7 @@ def _normalize_uptime_and_success_rate(series: pd.Series) -> pd.Series:
     # Reindex and fill NaN's with 0.
     normalized = normalized.reindex(series.index).fillna(0)
 
-    return pd.Series(normalized)
+    return cast(pd.Series, normalized)
 
 
 def _calculate_weighted_score(row: pd.Series, weights: WeightsDict) -> float:

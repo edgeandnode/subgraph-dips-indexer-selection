@@ -83,13 +83,12 @@ class TestGatewayIdFilter:
         mock_consumer = MagicMock()
         mock_consumer.consume.side_effect = [[msg], [], [], []]
 
-        with patch("redpanda._count_partition_worker.__module__", "redpanda"):
-            with patch("confluent_kafka.Consumer", return_value=mock_consumer):
-                config = {"bootstrap.servers": "localhost:9092"}
-                gw_filter = {"mainnet-gw"}
-                counts, fees, total, filtered = _count_partition_worker(
-                    ("gateway_queries", 0, 0, 999999999999, config, gw_filter)
-                )
+        with patch("confluent_kafka.Consumer", return_value=mock_consumer):
+            config = {"bootstrap.servers": "localhost:9092"}
+            gw_filter = {"mainnet-gw"}
+            counts, fees, total, filtered = _count_partition_worker(
+                ("gateway_queries", 0, 0, 999999999999, config, gw_filter)
+            )
 
         assert total == 1
         assert filtered == 1
