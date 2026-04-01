@@ -3,10 +3,8 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
-
-from subgraph import paginate_subgraph_query
 from processing import discover_indexers_from_network_subgraph
-
+from subgraph import paginate_subgraph_query
 
 # ---------------------------------------------------------------------------
 # paginate_subgraph_query
@@ -75,9 +73,11 @@ def test_pagination_empty_response(mock_post):
 @patch("subgraph.requests.post")
 def test_pagination_graphql_errors(mock_post):
     """GraphQL errors in the response raise RuntimeError."""
-    mock_post.return_value = _mock_response({
-        "errors": [{"message": "something went wrong"}],
-    })
+    mock_post.return_value = _mock_response(
+        {
+            "errors": [{"message": "something went wrong"}],
+        }
+    )
 
     with pytest.raises(RuntimeError, match="GraphQL errors"):
         paginate_subgraph_query(DUMMY_URL, DUMMY_QUERY)
@@ -89,14 +89,12 @@ def test_pagination_custom_entity_and_page_size(mock_post):
     page = [{"id": "a"}, {"id": "b"}]
     mock_post.return_value = _mock_response({"data": {"allocations": page}})
 
-    result = paginate_subgraph_query(
-        DUMMY_URL, DUMMY_QUERY, entity="allocations", page_size=50
-    )
+    result = paginate_subgraph_query(DUMMY_URL, DUMMY_QUERY, entity="allocations", page_size=50)
 
     assert result == page
-    call_vars = mock_post.call_args.kwargs.get(
-        "json", mock_post.call_args[1].get("json", {})
-    )["variables"]
+    call_vars = mock_post.call_args.kwargs.get("json", mock_post.call_args[1].get("json", {}))[
+        "variables"
+    ]
     assert call_vars["first"] == 50
 
 
