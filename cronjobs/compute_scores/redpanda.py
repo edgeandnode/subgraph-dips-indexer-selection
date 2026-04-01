@@ -637,7 +637,7 @@ class RedpandaProvider:
         # Consume partitions in parallel across processes to bypass the GIL.
         config = self._consumer_config()
         gw_filter = self._gateway_id_filter
-        seed = int(start_date.strftime("%Y%m%d"))
+        seed = int(os.environ.get("SCORING_SEED", start_date.strftime("%Y%m%d")))
         args = [
             (tp.topic, tp.partition, tp.offset, end_ts_ms, config, gw_filter, rows_to_use, seed)
             for tp in partitions
