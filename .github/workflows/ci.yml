@@ -32,4 +32,4 @@ jobs:
         continue-on-error: true
 
       - name: Test
-        run: pytest --tb=short -q
+        run: pytest --tb=short -q --cov=src --cov-fail-under=35
