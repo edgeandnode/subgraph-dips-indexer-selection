@@ -8,12 +8,36 @@ so that imports resolve correctly without installing the cronjob package.
 import json
 import os
 import sys
+from concurrent.futures import Executor, Future
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+
+
+class _InlineExecutor(Executor):
+    """Executor that runs callables inline (no child processes).
+
+    Avoids pickling issues when mocking functions used by ProcessPoolExecutor.
+    """
+
+    def __init__(self, **_kwargs):
+        pass
+
+    def map(self, fn, *iterables, **kwargs):
+        return (
+            [fn(args) for args in zip(*iterables) if True]
+            if len(iterables) > 1
+            else [fn(args) for args in iterables[0]]
+        )
+
+    def submit(self, fn, *args, **kwargs):
+        fut = Future()
+        fut.set_result(fn(*args, **kwargs))
+        return fut
+
 
 # Make the cronjob package importable.
 jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
@@ -433,20 +457,16 @@ class TestRedpandaProviderCaching:
         msg_value = self._two_attempt_message("qid-001-JFK", deployment, indexer1, indexer2, ts_ms)
         fake_msg = _fake_kafka_message(ts_ms, msg_value)
 
-        # Resolution consumer (for _resolve_partitions)
         resolution_consumer = _make_resolution_consumer("gateway_queries", [0])
+        count_consumer = _make_partition_consumer([[fake_msg], [], [], []])
 
-        # Count pass partition consumer — one batch of messages then 3 empty batches
-        count_consumer = _make_partition_consumer(
-            [
-                [fake_msg],  # batch 1: one message
-                [],
-                [],
-                [],  # 3 empty = end of data
-            ]
-        )
-
-        with patch("confluent_kafka.Consumer", side_effect=[resolution_consumer, count_consumer]):
+        with (
+            patch(
+                "confluent_kafka.Consumer",
+                side_effect=[resolution_consumer, count_consumer],
+            ),
+            patch("redpanda.ProcessPoolExecutor", _InlineExecutor),
+        ):
             result = provider.fetch_initial_query_results(start_date, num_days)
 
         # Assert — two (deployment, indexer) pairs, each seen once
@@ -480,32 +500,16 @@ class TestRedpandaProviderCaching:
             raw = _build_client_query(f"qid-{i:03d}-JFK", [a])
             messages.append(_fake_kafka_message(base_ts_ms + i * 1000, raw))
 
-        # Resolution consumer (shared for both passes)
         resolution_consumer = _make_resolution_consumer("gateway_queries", [0])
+        count_consumer = _make_partition_consumer([messages, [], [], []])
+        sample_consumer = _make_partition_consumer([messages, [], [], []])
 
-        # Count pass consumer
-        count_consumer = _make_partition_consumer(
-            [
-                messages,  # all 5 messages in one batch
-                [],
-                [],
-                [],
-            ]
-        )
-
-        # Sample pass consumer (same messages replayed)
-        sample_consumer = _make_partition_consumer(
-            [
-                messages,
-                [],
-                [],
-                [],
-            ]
-        )
-
-        with patch(
-            "confluent_kafka.Consumer",
-            side_effect=[resolution_consumer, count_consumer, sample_consumer],
+        with (
+            patch(
+                "confluent_kafka.Consumer",
+                side_effect=[resolution_consumer, count_consumer, sample_consumer],
+            ),
+            patch("redpanda.ProcessPoolExecutor", _InlineExecutor),
         ):
             result = provider.fetch_combined_query_results(start_date, num_days, rows_to_use=3)
 
@@ -652,26 +656,24 @@ class TestParallelMerge:
         p0_msgs = make_messages(0)
         p1_msgs = make_messages(100)
 
-        # Resolution consumer: 2 partitions
         resolution_consumer = _make_resolution_consumer("gateway_queries", [0, 1])
-
-        # Count pass: one consumer per partition
         count_p0 = _make_partition_consumer([p0_msgs, [], [], []])
         count_p1 = _make_partition_consumer([p1_msgs, [], [], []])
-
-        # Sample pass: replay the same messages
         sample_p0 = _make_partition_consumer([p0_msgs, [], [], []])
         sample_p1 = _make_partition_consumer([p1_msgs, [], [], []])
 
-        with patch(
-            "confluent_kafka.Consumer",
-            side_effect=[
-                resolution_consumer,  # partition resolution
-                count_p0,
-                count_p1,  # count pass (2 partitions)
-                sample_p0,
-                sample_p1,  # sample pass (2 partitions)
-            ],
+        with (
+            patch(
+                "confluent_kafka.Consumer",
+                side_effect=[
+                    resolution_consumer,
+                    count_p0,
+                    count_p1,
+                    sample_p0,
+                    sample_p1,
+                ],
+            ),
+            patch("redpanda.ProcessPoolExecutor", _InlineExecutor),
         ):
             # Count pass
             initial = provider.fetch_initial_query_results(start_date, num_days)
@@ -894,7 +896,7 @@ class TestFeesAccumulatedDuringCountPass:
 
         deployment = bytes(range(32))
 
-        # Three messages: indexer1 earns 0.001 + 0.003 = 0.004, indexer2 earns 0.002
+        # Three attempts: indexer1 earns 0.001 + 0.003 = 0.004, indexer2 earns 0.002
         a1 = _build_indexer_attempt(
             indexer=INDEXER_BYTES,
             deployment=deployment,
@@ -929,21 +931,17 @@ class TestFeesAccumulatedDuringCountPass:
         msg1 = _fake_kafka_message(base_ts_ms, _build_client_query("q1-JFK", [a1, a2]))
         msg2 = _fake_kafka_message(base_ts_ms + 1000, _build_client_query("q2-JFK", [a3]))
 
-        # Resolution consumer
         resolution_consumer = _make_resolution_consumer("gateway_queries", [0])
-
-        # Count pass consumer
-        count_consumer = _make_partition_consumer(
-            [
-                [msg1, msg2],
-                [],
-                [],
-                [],
-            ]
-        )
+        count_consumer = _make_partition_consumer([[msg1, msg2], [], [], []])
 
         # Act
-        with patch("confluent_kafka.Consumer", side_effect=[resolution_consumer, count_consumer]):
+        with (
+            patch(
+                "confluent_kafka.Consumer",
+                side_effect=[resolution_consumer, count_consumer],
+            ),
+            patch("redpanda.ProcessPoolExecutor", _InlineExecutor),
+        ):
             provider.fetch_initial_query_results(start_date, num_days)
 
         # Assert
