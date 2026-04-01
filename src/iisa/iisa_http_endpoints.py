@@ -786,7 +786,7 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
         existing_agreements=cast(dict[IpfsHashStr, list[EthAddressStr]], existing_agreements),
         pending_agreements=cast(dict[IpfsHashStr, list[EthAddressStr]], pending_agreements),
         declined_indexers=cast(
-            dict[IpfsHashStr, EthAddressStr],
+            dict[IpfsHashStr, list[EthAddressStr]],
             request.declined_indexers or {},
         ),
         indexer_denylist=cast(list[EthAddressStr], request.blocklist or []),

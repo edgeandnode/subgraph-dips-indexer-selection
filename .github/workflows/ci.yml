@@ -25,10 +25,10 @@ jobs:
         run: pip install -e ".[dev]" confluent-kafka base58 protobuf
 
       - name: Lint
-        run: ruff check src/ tests/
+        run: ruff check src/ tests/ cronjobs/compute_scores/
 
       - name: Test
-        run: pytest --tb=short -q --cov=src --cov-fail-under=35
+        run: pytest --tb=short -q --cov=src --cov-fail-under=75
 
   type-check:
     runs-on: ubuntu-latest
