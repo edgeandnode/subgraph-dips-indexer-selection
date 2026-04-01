@@ -8,6 +8,7 @@ Tests the new functions introduced for the CronJob, particularly:
 """
 
 # Import from the jobs package - we need to add it to the path
+import hashlib
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -633,6 +634,62 @@ class TestHashSampledQueries:
 
         # Assert - all values within range
         assert all(0 <= x < large_root for x in result["sampled_query_id_hashed_mod_integer_root"])
+
+
+class TestDeterminism:
+    """Tests that scoring produces identical results given the same seed."""
+
+    def test_hash_produces_known_output(self):
+        """SHA256 bucketing produces a stable known value, guarding against
+        accidental reversion to hash()."""
+        df = pd.DataFrame({"sampled_query_id": ["query-abc-JFK"]})
+        result = hash_sampled_queries(df, 100)
+        value = result["sampled_query_id_hashed_mod_integer_root"].iloc[0]
+        # Re-running this test in a different process must produce the same value.
+        # hash() would fail this; sha256 will not.
+        assert (
+            value
+            == int.from_bytes(hashlib.sha256(b"query-abc-JFK").digest()[:8], byteorder="big") % 100
+        )
+
+    def test_strategic_sample_deterministic_with_seed(self):
+        """strategic_sample with the same seed produces identical output."""
+        df = pd.DataFrame(
+            {
+                "deployment_hash": ["QmA"] * 50 + ["QmB"] * 50,
+                "indexer": ["0x01"] * 25 + ["0x02"] * 25 + ["0x03"] * 25 + ["0x04"] * 25,
+                "query_id": [f"q{i}" for i in range(100)],
+            }
+        )
+
+        rng1 = np.random.default_rng(42)
+        rng2 = np.random.default_rng(42)
+        result1, root1 = strategic_sample(df.copy(), 10, rng=rng1)
+        result2, root2 = strategic_sample(df.copy(), 10, rng=rng2)
+
+        assert root1 == root2
+        sampled1 = set(result1["sampled_query_id"].dropna())
+        sampled2 = set(result2["sampled_query_id"].dropna())
+        assert sampled1 == sampled2
+
+    def test_strategic_sample_different_seeds_differ(self):
+        """Different seeds produce different samples."""
+        df = pd.DataFrame(
+            {
+                "deployment_hash": ["QmA"] * 100,
+                "indexer": ["0x01"] * 50 + ["0x02"] * 50,
+                "query_id": [f"q{i}" for i in range(100)],
+            }
+        )
+
+        rng1 = np.random.default_rng(1)
+        rng2 = np.random.default_rng(999)
+        result1, _ = strategic_sample(df.copy(), 5, rng=rng1)
+        result2, _ = strategic_sample(df.copy(), 5, rng=rng2)
+
+        sampled1 = set(result1["sampled_query_id"].dropna())
+        sampled2 = set(result2["sampled_query_id"].dropna())
+        assert sampled1 != sampled2
 
 
 class TestPerformLinearRegression:

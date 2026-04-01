@@ -28,6 +28,11 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import base58
+import pandas as pd
+import requests
+from gateway_queries_pb2 import ClientQueryProtobuf
+from subgraph import paginate_subgraph_query
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -35,20 +40,14 @@ from tenacity import (
     wait_exponential,
 )
 
+logger = logging.getLogger(__name__)
+
+SCORES_FILE_PATH = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_scores.json")
+
 # Cap parallel partition consumers to avoid unbounded thread/connection creation.
 # The CronJob runs with 8 CPUs; one consumer per core saturates throughput
 # without excessive Kafka connections on topics with many partitions.
 MAX_PARTITION_WORKERS = int(os.environ.get("REDPANDA_MAX_WORKERS", "8"))
-
-import base58
-import pandas as pd
-import requests
-from gateway_queries_pb2 import ClientQueryProtobuf
-from subgraph import paginate_subgraph_query
-
-logger = logging.getLogger(__name__)
-
-SCORES_FILE_PATH = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_scores.json")
 
 
 # ---------------------------------------------------------------------------
@@ -154,14 +153,15 @@ def _sample_partition_worker(args: tuple) -> tuple:
     Sample pass for a single partition. Runs in a child process.
 
     Args is a tuple: (topic, partition, offset, end_ts_ms,
-                       consumer_config, gateway_id_filter, rows_to_use)
+                       consumer_config, gateway_id_filter, rows_to_use,
+                       seed)
     Returns: (reservoirs, counts, filtered_count)
     """
-    topic, partition, offset, end_ts_ms, config, gw_filter, rows_to_use = args
+    topic, partition, offset, end_ts_ms, config, gw_filter, rows_to_use, seed = args
 
     from confluent_kafka import Consumer, TopicPartition
 
-    rng = random.Random()
+    rng = random.Random(seed + partition)
     consumer = Consumer(config)
     reservoirs: Dict[Tuple[bytes, bytes], List[dict]] = defaultdict(list)
     counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
@@ -637,8 +637,9 @@ class RedpandaProvider:
         # Consume partitions in parallel across processes to bypass the GIL.
         config = self._consumer_config()
         gw_filter = self._gateway_id_filter
+        seed = int(os.environ.get("SCORING_SEED", start_date.strftime("%Y%m%d")))
         args = [
-            (tp.topic, tp.partition, tp.offset, end_ts_ms, config, gw_filter, rows_to_use)
+            (tp.topic, tp.partition, tp.offset, end_ts_ms, config, gw_filter, rows_to_use, seed)
             for tp in partitions
         ]
         with ProcessPoolExecutor(max_workers=min(len(partitions), MAX_PARTITION_WORKERS)) as pool:
