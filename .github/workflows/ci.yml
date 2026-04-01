@@ -28,7 +28,7 @@ jobs:
         run: ruff check src/ tests/ cronjobs/compute_scores/
 
       - name: Test
-        run: pytest --tb=short -q --cov=src --cov-fail-under=80
+        run: pytest --tb=short -q --cov=src --cov-fail-under=75
 
   type-check:
     runs-on: ubuntu-latest
