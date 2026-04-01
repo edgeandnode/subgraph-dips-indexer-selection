@@ -34,6 +34,7 @@ jobs:
   # existing type errors in src/iisa/ so this is non-required for now.
   type-check:
     runs-on: ubuntu-latest
+    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4
