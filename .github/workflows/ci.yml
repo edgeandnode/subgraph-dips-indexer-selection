@@ -1,0 +1,35 @@
+# Runs ruff linting, mypy type checking, and the pytest suite on every PR
+# and push to main. confluent-kafka, base58, and protobuf are installed
+# alongside the dev extras because the cronjob tests import them but they
+# aren't declared in pyproject.toml dev dependencies (they live in the
+# cronjob Dockerfile).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]" confluent-kafka base58 protobuf
+
+      - name: Lint
+        run: ruff check src/ tests/ cronjobs/compute_scores/*.py --exclude '*_pb2.py'
+
+      - name: Type check
+        run: mypy
+        continue-on-error: true
+
+      - name: Test
+        run: pytest --tb=short -q
