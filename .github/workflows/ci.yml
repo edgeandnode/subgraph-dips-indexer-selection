@@ -30,11 +30,8 @@ jobs:
       - name: Test
         run: pytest --tb=short -q --cov=src --cov-fail-under=35
 
-  # Separate job so it shows as its own check in PRs. There are 12
-  # existing type errors in src/iisa/ so this is non-required for now.
   type-check:
     runs-on: ubuntu-latest
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4

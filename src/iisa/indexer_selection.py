@@ -670,7 +670,7 @@ class IndexerSelector:
                         indexer[:10],
                         score,
                     )
-                    return indexer
+                    return cast(EthAddressStr, indexer)
 
         # Fallback: best scorer regardless of decentralisation or
         # sync status. Decentralisation is best-effort.
@@ -684,7 +684,7 @@ class IndexerSelector:
                 fallback[:10],
                 fallback_score,
             )
-            return fallback
+            return cast(EthAddressStr, fallback)
 
         logger.info(
             "deployment=%s zero candidates remain after filtering %d total indexers",
@@ -830,7 +830,7 @@ def _normalize_generic(series: pd.Series) -> pd.Series:
     # Handle any potential NaN or inf values
     normalized = normalized.fillna(0)
 
-    return normalized
+    return pd.Series(normalized)
 
 
 def _normalize_uptime_and_success_rate(series: pd.Series) -> pd.Series:
@@ -863,10 +863,10 @@ def _normalize_uptime_and_success_rate(series: pd.Series) -> pd.Series:
     # Reindex and fill NaN's with 0.
     normalized = normalized.reindex(series.index).fillna(0)
 
-    return normalized
+    return pd.Series(normalized)
 
 
-def _calculate_weighted_score(row: pd.Series, weights: dict) -> float:
+def _calculate_weighted_score(row: pd.Series, weights: WeightsDict) -> float:
     """
     Calculate a weighted score for an indexer based on multiple normalized metrics.
 
@@ -881,11 +881,11 @@ def _calculate_weighted_score(row: pd.Series, weights: dict) -> float:
     :return: The calculated weighted score.
     :raises ValueError: If the total weight is 0.
     """
-    weighted_sum = 0
-    weight_total = 0
+    weighted_sum: float = 0
+    weight_total: float = 0
     missing_columns = []
 
-    for metric, weight in weights.items():
+    for metric, weight in cast(dict[str, float], weights).items():
         column_name = f"norm_{metric}"
 
         # Append any missing columns to the list
