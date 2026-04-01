@@ -23,12 +23,12 @@ class _InlineExecutor(Executor):
     Avoids pickling issues when mocking functions used by ProcessPoolExecutor.
     """
 
-    def __init__(self, **_kwargs):
+    def __init__(self, *_args, **_kwargs):
         pass
 
     def map(self, fn, *iterables, **kwargs):
         if len(iterables) > 1:
-            return [fn(args) for args in zip(*iterables)]
+            return [fn(*args) for args in zip(*iterables)]
         return [fn(args) for args in iterables[0]]
 
     def submit(self, fn, *args, **kwargs):
