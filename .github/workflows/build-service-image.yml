@@ -14,7 +14,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/iisa
+  IMAGE_NAME: ${{ github.repository_owner }}/subgraph-dips-indexer-selection
 
 jobs:
   build-and-push:

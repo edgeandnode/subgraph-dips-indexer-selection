@@ -14,7 +14,8 @@ on:
     # Allow manual trigger
 
 env:
-  IMAGE_NAME: dockermoonboi9001/iisa-score-computation
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/subgraph-dips-indexer-selection-cronjob
   DOCKERFILE_PATH: cronjobs/compute_scores/Dockerfile
 
 jobs:
@@ -23,6 +24,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      packages: write
 
     steps:
       - name: Checkout code
@@ -30,31 +32,33 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate image tags
         id: tags
         run: |
           SHA_SHORT=$(echo ${{ github.sha }} | cut -c1-7)
           echo "sha_short=$SHA_SHORT" >> $GITHUB_OUTPUT
-          echo "sha_tag=${{ env.IMAGE_NAME }}:sha-$SHA_SHORT" >> $GITHUB_OUTPUT
+          echo "sha_tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-$SHA_SHORT" >> $GITHUB_OUTPUT
+          echo "latest_tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_OUTPUT
 
       - name: Build Docker image
         run: |
           docker build \
             --build-arg MAXMIND_LICENSE_KEY=${{ secrets.MAXMIND_LICENSE_KEY }} \
-            -t ${{ env.IMAGE_NAME }}:latest \
+            -t ${{ steps.tags.outputs.latest_tag }} \
             -t ${{ steps.tags.outputs.sha_tag }} \
             -f ${{ env.DOCKERFILE_PATH }} \
             cronjobs/compute_scores/
 
       - name: Push Docker image
         run: |
-          docker push ${{ env.IMAGE_NAME }}:latest
+          docker push ${{ steps.tags.outputs.latest_tag }}
           docker push ${{ steps.tags.outputs.sha_tag }}
 
       - name: Update CronJob image tag
@@ -62,7 +66,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH_NAME="chore/update-cronjob-image-${{ steps.tags.outputs.sha_short }}"
-          sed -i 's|image: ${{ env.IMAGE_NAME }}:.*|image: ${{ steps.tags.outputs.sha_tag }}|' k8s/score-computation-cronjob.yaml
+          sed -i 's|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:.*|image: ${{ steps.tags.outputs.sha_tag }}|' k8s/score-computation-cronjob.yaml
 
           # Check if there are actual changes
           if git diff --quiet k8s/score-computation-cronjob.yaml; then
@@ -90,7 +94,7 @@ jobs:
         run: |
           echo "## Docker Image Rebuilt" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image**: \`${{ env.IMAGE_NAME }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: \`${{ steps.tags.outputs.latest_tag }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **SHA tag**: \`${{ steps.tags.outputs.sha_tag }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **GeoLite2-City**: location lookups" >> $GITHUB_STEP_SUMMARY
           echo "- **GeoLite2-ASN**: organization lookups" >> $GITHUB_STEP_SUMMARY
