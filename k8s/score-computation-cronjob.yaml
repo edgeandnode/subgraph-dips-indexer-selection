@@ -32,7 +32,7 @@ spec:
           - name: ghcr-pull-secret
           containers:
           - name: compute-scores
-            image: ghcr.io/edgeandnode/subgraph-dips-indexer-selection-cronjob:latest
+            image: ghcr.io/edgeandnode/subgraph-dips-indexer-selection-cronjob:sha-3e530ce
             imagePullPolicy: Always
             resources:
               requests:
