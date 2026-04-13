@@ -29,7 +29,7 @@ spec:
             runAsGroup: 1000
             fsGroup: 1000
           imagePullSecrets:
-          - name: ghcr-pull-secret
+          - name: github-registry-secret
           containers:
           - name: compute-scores
             image: ghcr.io/edgeandnode/subgraph-dips-indexer-selection-cronjob:latest
