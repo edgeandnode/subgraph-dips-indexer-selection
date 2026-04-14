@@ -26,7 +26,7 @@ import random
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from datetime import date, datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, cast
 
 import base58
 import pandas as pd
@@ -64,7 +64,7 @@ def _bytes_to_cid(b: bytes) -> str:
     if len(b) != 32:
         return ""
     multihash = b"\x12\x20" + b  # sha2-256 function code + 32-byte length prefix
-    return base58.b58encode(multihash).decode("ascii")
+    return cast(str, base58.b58encode(multihash).decode("ascii"))
 
 
 def _bytes_to_hex(b: bytes) -> str:
