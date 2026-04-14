@@ -23,7 +23,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from iisa_client import get_push_token
+from iisa_client import IISAPushError, get_push_token
 from processing import compute_all_scores, compute_degraded_scores, validate_geoip_databases
 from redpanda import RedpandaProvider
 
@@ -95,6 +95,9 @@ def validate_configuration() -> None:
 
     if not os.environ.get("REDPANDA_BOOTSTRAP_SERVERS"):
         errors.append("REDPANDA_BOOTSTRAP_SERVERS is required")
+
+    if not IISA_API_URL:
+        errors.append("IISA_API_URL is required")
 
     if errors:
         for error in errors:
@@ -176,7 +179,17 @@ def run_scoring() -> bool:
     success = scores_df is not None and not scores_df.empty
 
     if scores_df is not None and not scores_df.empty:
-        provider.write_scores(scores_df)
+        try:
+            provider.write_scores(scores_df)
+        except IISAPushError as e:
+            # Push failure (auth, validation, or retry exhaustion) must not
+            # escape run accounting. Mark the run failed, let the mode-specific
+            # logging fire, and return False so the scheduling loop retries
+            # at the next interval — consistent with the degraded-fallback
+            # pattern above.
+            logger.error("Failed to push scores to iisa: %s", e)
+            success = False
+            mode = MODE_FAILED
 
     # Track consecutive non-full runs (under lock — health endpoint reads these)
     with _status_lock:
@@ -321,11 +334,6 @@ def main() -> int:
 
     if IISA_API_URL:
         logger.info("IISA push target: %s", IISA_API_URL)
-    else:
-        logger.error(
-            "IISA_API_URL is not set -- scores cannot be pushed to iisa. "
-            "Set IISA_API_URL or the scoring run will fail at write time."
-        )
 
     if IISA_REQUIRE_PUSH_TOKEN and not IISA_PUSH_TOKEN:
         logger.critical(
