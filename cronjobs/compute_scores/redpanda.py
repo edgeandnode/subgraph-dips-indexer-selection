@@ -614,11 +614,11 @@ class RedpandaProvider:
         self._count_cache_num_days = num_days
 
         logger.info(
-            "Count pass complete: %d messages (%d filtered by gateway ID), "
-            "%d attempts across %d (deployment, indexer) pairs",
-            total_messages,
-            total_filtered,
-            sum(self._count_cache.values()),
+            "Count pass complete: %s messages (%s filtered by gateway ID), "
+            "%s attempts across %d (deployment, indexer) pairs",
+            f"{total_messages:,}",
+            f"{total_filtered:,}",
+            f"{sum(self._count_cache.values()):,}",
             len(self._count_cache),
         )
 
@@ -700,11 +700,11 @@ class RedpandaProvider:
         self._row_cache_rows_to_use = rows_to_use
 
         logger.info(
-            "Sample pass complete: %d rows buffered across %d pairs "
-            "(%d messages filtered by gateway ID)",
-            len(all_rows),
+            "Sample pass complete: %s rows buffered across %d pairs "
+            "(%s messages filtered by gateway ID)",
+            f"{len(all_rows):,}",
             len(merged_reservoirs),
-            total_filtered,
+            f"{total_filtered:,}",
         )
 
     # -----------------------------------------------------------------------
