@@ -2,6 +2,7 @@
 
 import json
 import os
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -410,73 +411,159 @@ class TestHealthEndpoint:
         assert data["data_loaded"] is False
 
 
-class TestRefreshEndpoint:
-    """Tests for POST /refresh endpoint."""
+class TestPushScoresEndpoint:
+    """Tests for POST /scores endpoint (cronjob → iisa push)."""
+
+    @staticmethod
+    def _sample_payload():
+        return [
+            {
+                "indexer": "0xABC",
+                "computed_at": "2026-04-14T09:00:00+00:00",
+                "lat_normalized_score": 0.8,
+                "uptime_score": 0.95,
+                "success_rate": 0.99,
+            }
+        ]
 
     @patch("iisa.iisa_http_endpoints.DataManager")
     @patch("iisa.iisa_http_endpoints.FileScoreLoader")
-    def test_refresh_success(self, mock_loader_class, mock_dm_class, mock_history_df):
-        """Mock refresh_data()=True, verify 200 with row count."""
-        # Arrange
+    def test_push_scores_success(self, mock_loader_class, mock_dm_class, tmp_path, monkeypatch):
+        """Valid body + no auth required (unset token) → 200 with row count."""
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import Settings, app
 
+        monkeypatch.setattr(iisa_http_endpoints, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
+
         mock_dm_instance = MagicMock()
-        mock_dm_instance.load_scores.return_value = True
-        mock_dm_instance.get_data.return_value = mock_history_df
+        mock_dm_instance.load_scores_from_df.return_value = True
+        mock_dm_instance.get_data.return_value = pd.DataFrame({"indexer": ["0xABC"]})
         mock_dm_class.return_value = mock_dm_instance
 
-        settings = Settings()
+        settings = Settings()  # push_token unset in test env
         iisa_http_endpoints._state.initialize(settings)
 
         client = TestClient(app, raise_server_exceptions=False)
+        response = client.post("/scores", json=self._sample_payload())
 
-        # Act
-        response = client.post("/refresh")
-
-        # Assert
         assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "success"
-        assert data["rows"] == 3
+        body = response.json()
+        assert body["status"] == "success"
+        assert body["rows"] == 1
+        # Disk was written atomically
+        assert (tmp_path / "scores.json").exists()
 
-    def test_refresh_not_initialized(self):
-        """_initialized=False, verify 503 Service Unavailable."""
-        # Arrange
-        from iisa.iisa_http_endpoints import app
-
-        client = TestClient(app, raise_server_exceptions=False)
-
-        # Act
-        response = client.post("/refresh")
-
-        # Assert
-        assert response.status_code == 503
-        assert "not initialized" in response.json()["detail"]
-
-    @patch("iisa.iisa_http_endpoints.DataManager")
-    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
-    def test_refresh_failure(self, mock_loader_class, mock_dm_class):
-        """Mock refresh_data()=False, verify 500 Internal Server Error."""
-        # Arrange
+    def test_push_scores_empty_body_rejected(self):
+        """Empty payload → 422."""
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import Settings, app
 
-        mock_dm_instance = MagicMock()
-        mock_dm_instance.load_scores.return_value = False
-        mock_dm_class.return_value = mock_dm_instance
-
-        settings = Settings()
-        iisa_http_endpoints._state.initialize(settings)
-
+        iisa_http_endpoints._state.initialize(Settings())
         client = TestClient(app, raise_server_exceptions=False)
 
-        # Act
-        response = client.post("/refresh")
+        response = client.post("/scores", json=[])
+        assert response.status_code == 422
 
-        # Assert
-        assert response.status_code == 500
-        assert "Failed to refresh" in response.json()["detail"]
+    def test_push_scores_rejects_missing_token_when_required(self, monkeypatch):
+        """IISA_PUSH_TOKEN set + no header → 401."""
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post("/scores", json=self._sample_payload())
+        assert response.status_code == 401
+        assert "Authorization" in response.json()["detail"] or "token" in response.json()["detail"]
+
+    def test_push_scores_rejects_wrong_token(self, monkeypatch):
+        """IISA_PUSH_TOKEN set + wrong bearer → 401."""
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/scores",
+            json=self._sample_payload(),
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert response.status_code == 401
+        assert "Invalid" in response.json()["detail"]
+
+    @patch("iisa.iisa_http_endpoints.DataManager")
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_push_scores_accepts_valid_token(
+        self, mock_loader_class, mock_dm_class, tmp_path, monkeypatch
+    ):
+        """IISA_PUSH_TOKEN set + matching bearer → 200."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+        monkeypatch.setattr(iisa_http_endpoints, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
+        iisa_http_endpoints.get_settings.cache_clear()
+
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.load_scores_from_df.return_value = True
+        mock_dm_instance.get_data.return_value = pd.DataFrame({"indexer": ["0xABC"]})
+        mock_dm_class.return_value = mock_dm_instance
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/scores",
+            json=self._sample_payload(),
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert response.status_code == 200
+
+
+class TestScoresStatusEndpoint:
+    """Tests for GET /scores/status endpoint (cronjob idempotency check)."""
+
+    def test_returns_computed_at_when_loaded(self, monkeypatch):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+
+        # Seed state with a fake DataManager that has a computed_at
+        mock_dm = MagicMock()
+        mock_dm._scores_computed_at = datetime(2026, 4, 14, 9, 0, tzinfo=timezone.utc)
+        iisa_http_endpoints._state.data_manager = mock_dm
+        iisa_http_endpoints._state._history = pd.DataFrame({"indexer": ["0xABC"]})
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get("/scores/status")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["computed_at"] is not None
+        assert "2026-04-14" in body["computed_at"]
+        assert body["rows"] == 1
+
+    def test_returns_null_when_no_scores_loaded(self):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.get("/scores/status")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["computed_at"] is None
+        assert body["rows"] == 0
 
 
 class TestGetScoreEndpoint:
@@ -991,53 +1078,67 @@ class TestSelectWithProcessor:
         assert call_kwargs["synced_indexers"] == set()
 
 
-class TestRefreshSyncStatusEndpoint:
-    """Tests for POST /refresh-sync-status endpoint."""
+class TestPushSyncStatusEndpoint:
+    """Tests for POST /sync-status endpoint (fetcher → iisa push)."""
 
-    def test_refresh_sync_status_success(self):
-        """Verify refresh returns indexer and deployment counts."""
+    @staticmethod
+    def _sample_payload():
+        return {
+            "0xAAA": {
+                "deployments": ["QmDeploy1"],
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+            }
+        }
+
+    def test_push_sync_status_success(self, tmp_path, monkeypatch):
         from iisa import iisa_http_endpoints
-        from iisa.iisa_http_endpoints import app
+        from iisa.iisa_http_endpoints import Settings, app
 
-        mock_sync = MagicMock()
-        mock_sync.total_indexers = 5
-        mock_sync.total_deployments = 100
-        iisa_http_endpoints._state._sync_status = mock_sync
-        iisa_http_endpoints._state.settings = MagicMock()
+        iisa_http_endpoints.get_settings.cache_clear()
+        settings = Settings()
+        # Redirect the sync-status cache path into tmp_path
+        settings.sync_status_file_path = str(tmp_path / "sync_status.json")
+        iisa_http_endpoints._state.initialize(settings)
 
-        with patch.object(
-            iisa_http_endpoints._state,
-            "refresh_sync_status",
-            return_value=True,
-        ):
-            client = TestClient(app, raise_server_exceptions=False)
-            response = client.post("/refresh-sync-status")
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post("/sync-status", json=self._sample_payload())
 
         assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "success"
-        assert data["indexers"] == 5
-        assert data["deployments"] == 100
+        body = response.json()
+        assert body["status"] == "success"
+        assert body["rows"] == 1
+        assert (tmp_path / "sync_status.json").exists()
 
-        # Cleanup
-        iisa_http_endpoints._state._sync_status = None
-
-    def test_refresh_sync_status_no_data(self):
-        """Verify refresh returns no_data when file not found."""
+    def test_push_sync_status_empty_object_accepted(self, tmp_path, monkeypatch):
+        """Empty dict payload (no indexers synced) should be accepted."""
         from iisa import iisa_http_endpoints
-        from iisa.iisa_http_endpoints import app
+        from iisa.iisa_http_endpoints import Settings, app
 
-        with patch.object(
-            iisa_http_endpoints._state,
-            "refresh_sync_status",
-            return_value=False,
-        ):
-            client = TestClient(app, raise_server_exceptions=False)
-            response = client.post("/refresh-sync-status")
+        iisa_http_endpoints.get_settings.cache_clear()
+        settings = Settings()
+        settings.sync_status_file_path = str(tmp_path / "sync_status.json")
+        iisa_http_endpoints._state.initialize(settings)
 
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post("/sync-status", json={})
         assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "no_data"
+        assert response.json()["rows"] == 0
+
+    def test_push_sync_status_rejects_wrong_token(self, monkeypatch):
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/sync-status",
+            json=self._sample_payload(),
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert response.status_code == 401
 
 
 class TestExtractChainPrice:

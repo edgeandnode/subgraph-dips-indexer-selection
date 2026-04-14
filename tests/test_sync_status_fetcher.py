@@ -1,6 +1,5 @@
 """Tests for the sync status fetcher service."""
 
-import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,7 +13,7 @@ sys.path.insert(0, str(jobs_path))
 from sync_status_fetcher import (  # noqa: E402
     _fetch_all_statuses,
     _fetch_single_status,
-    _write_sync_status,
+    _push_sync_status,
     run_fetch_cycle,
 )
 
@@ -158,37 +157,26 @@ class TestFetchAllStatuses:
         assert "0xDead" not in result
 
 
-class TestWriteSyncStatus:
-    """Tests for atomic file writing."""
+class TestPushSyncStatus:
+    """_push_sync_status forwards the payload to iisa_client.post_sync_status."""
 
-    def test_writes_valid_json(self, tmp_path):
+    def test_pushes_via_iisa_client(self):
         data = {"0xAAA": {"deployments": ["QmA"], "fetched_at": "now"}}
 
-        with patch(
-            "sync_status_fetcher.SYNC_STATUS_FILE_PATH",
-            str(tmp_path / "sync_status.json"),
+        with (
+            patch("sync_status_fetcher.IISA_API_URL", "http://iisa:8080"),
+            patch("sync_status_fetcher.get_push_token", return_value="test-token"),
+            patch("sync_status_fetcher.post_sync_status") as mock_post,
         ):
-            _write_sync_status(data)
+            _push_sync_status(data)
 
-        written = json.loads((tmp_path / "sync_status.json").read_text())
-        assert written == data
-
-    def test_no_tmp_file_left_behind(self, tmp_path):
-        data = {"0xAAA": {"deployments": ["QmA"], "fetched_at": "now"}}
-        out = str(tmp_path / "sync_status.json")
-
-        with patch("sync_status_fetcher.SYNC_STATUS_FILE_PATH", out):
-            _write_sync_status(data)
-
-        assert not Path(out + ".tmp").exists()
-        assert Path(out).exists()
+        mock_post.assert_called_once_with("http://iisa:8080", "test-token", data)
 
 
 class TestRunFetchCycle:
-    """Tests for the full fetch-filter-write pipeline."""
+    """Tests for the full fetch-filter-push pipeline."""
 
-    def test_writes_file_on_success(self, tmp_path):
-        out = str(tmp_path / "sync_status.json")
+    def test_pushes_to_iisa_on_success(self):
         indexer_urls = {"0xAAA": "https://indexer.example.com"}
         fetch_result = {
             "0xAAA": {
@@ -206,14 +194,42 @@ class TestRunFetchCycle:
                 "sync_status_fetcher.asyncio.run",
                 return_value=fetch_result,
             ),
-            patch("sync_status_fetcher.SYNC_STATUS_FILE_PATH", out),
-            patch("sync_status_fetcher._notify_iisa"),
+            patch("sync_status_fetcher._push_sync_status") as mock_push,
         ):
             result = run_fetch_cycle()
 
         assert result is True
-        written = json.loads(Path(out).read_text())
-        assert "0xAAA" in written
+        mock_push.assert_called_once_with(fetch_result)
+
+    def test_returns_false_on_push_failure(self):
+        """A push that exhausts all retries should fail the cycle (returns False)."""
+        from iisa_client import IISAPushError
+
+        indexer_urls = {"0xAAA": "https://indexer.example.com"}
+        fetch_result = {
+            "0xAAA": {
+                "deployments": ["QmDeploy1"],
+                "fetched_at": "2026-03-24T00:00:00+00:00",
+            }
+        }
+
+        with (
+            patch(
+                "sync_status_fetcher.discover_indexers_from_network_subgraph",
+                return_value=indexer_urls,
+            ),
+            patch(
+                "sync_status_fetcher.asyncio.run",
+                return_value=fetch_result,
+            ),
+            patch(
+                "sync_status_fetcher._push_sync_status",
+                side_effect=IISAPushError("retries exhausted"),
+            ),
+        ):
+            result = run_fetch_cycle()
+
+        assert result is False
 
     def test_skips_when_no_indexers(self):
         with patch(

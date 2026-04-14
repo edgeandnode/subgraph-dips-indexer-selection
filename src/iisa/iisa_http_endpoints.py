@@ -6,25 +6,29 @@ contract expected by the Rust HTTP client in dipper-iisa.
 
 Endpoints:
 - GET /health - Health check, reports if data is loaded
-- POST /refresh - Reload scores from the scores file
+- POST /scores - Push computed indexer scores from the cronjob (bearer-auth)
+- GET /scores/status - Report last computed_at for idempotency (bearer-auth)
+- POST /sync-status - Push sync-status snapshot from the fetcher (bearer-auth)
+- POST /get-score - Return weighted score and components for one indexer
 - POST /select-indexers - Select optimal indexers for a deployment
 """
 
-import asyncio
+import hmac
 import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Optional, cast
+from typing import Any, Optional, cast
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
-from .score_loader import DataManager, FileScoreLoader
+from .score_loader import SCORES_FILE_PATH, DataManager, FileScoreLoader
 from .sync_status_loader import SyncStatusData
 
 __all__ = ["app", "Settings", "get_settings"]
@@ -54,10 +58,12 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8080
     log_level: str = "INFO"
-    scores_reload_interval: int = 300  # seconds between file-mtime checks (fallback)
     sync_status_file_path: str = "/app/scores/sync_status.json"
-    sync_status_reload_interval: int = 120  # seconds
     sync_status_staleness_hours: float = 6.0
+    # Bearer token required on POST /scores, POST /sync-status, GET /scores/status.
+    # When unset, push endpoints accept unauthenticated requests and a WARNING
+    # is logged at startup — local development convenience only.
+    push_token: Optional[str] = None
 
 
 @lru_cache
@@ -145,6 +151,25 @@ class ScoreResponse(BaseModel):
     found: bool
 
 
+class ScoresStatusResponse(BaseModel):
+    """
+    Response for the GET /scores/status endpoint.
+
+    Used by the cronjob to decide whether today's scores have already been
+    computed and pushed — lets the job skip a redundant run.
+    """
+
+    computed_at: Optional[str] = None
+    rows: int = 0
+
+
+class PushAcceptedResponse(BaseModel):
+    """Response returned by POST /scores and POST /sync-status on success."""
+
+    status: str
+    rows: int
+
+
 # =============================================================================
 # Service State
 # =============================================================================
@@ -171,7 +196,7 @@ class IISAState:
 
     def initialize(self, settings: Settings) -> bool:
         """
-        Initialize the IISA providers and fetch initial data.
+        Initialize the IISA providers.
 
         Returns True if initialization succeeded, False if we should fall back
         to random selection mode.
@@ -182,7 +207,7 @@ class IISAState:
             logger.info("Initializing IISA providers...")
 
             provider = FileScoreLoader()
-            logger.info("Score source: file (shared PVC)")
+            logger.info("Score source: cache file (iisa-owned RWO PVC)")
 
             self.data_manager = DataManager(provider)
 
@@ -198,10 +223,10 @@ class IISAState:
 
     def refresh_data(self) -> bool:
         """
-        Load pre-computed indexer scores from the scores file.
+        Load pre-computed indexer scores from the cache file on disk.
 
-        This method loads scores from the scores JSON file (populated by CronJob)
-        instead of computing them in-container. This is much faster and uses less memory.
+        Called on startup to recover the last successful push. Graceful empty
+        fallback is already handled by FileScoreLoader on a cache miss.
 
         Returns True if scores were loaded successfully, False otherwise.
         """
@@ -210,7 +235,7 @@ class IISAState:
             return False
 
         try:
-            logger.info("Loading pre-computed indexer scores...")
+            logger.info("Loading pre-computed indexer scores from cache...")
             success = self.data_manager.load_scores()
 
             if success:
@@ -226,8 +251,34 @@ class IISAState:
             logger.error(f"Failed to load scores: {e}")
             return False
 
+    def load_scores_from_records(self, records: list[dict[str, Any]]) -> int:
+        """
+        Accept a pushed scores payload from the cronjob.
+
+        The payload is written atomically to SCORES_FILE_PATH on the cache
+        PVC FIRST (so disk is always at-least-as-fresh-as memory), then
+        parsed into a DataFrame and handed to DataManager.
+
+        Returns the number of loaded rows. Raises on parse or write failure.
+        """
+        if self.data_manager is None:
+            raise RuntimeError("DataManager not initialized")
+
+        # Write to disk first so a crash never leaves memory-new-disk-old.
+        _atomic_write_json(SCORES_FILE_PATH, records)
+
+        scores_df = pd.DataFrame(records)
+        if scores_df.empty:
+            self._history = None
+            return 0
+
+        computed_at = _extract_computed_at(scores_df)
+        self.data_manager.load_scores_from_df(scores_df, computed_at)
+        self._history = self.data_manager.get_data()
+        return len(self._history) if self._history is not None else 0
+
     def refresh_sync_status(self) -> bool:
-        """Load sync status from file. Returns True on success."""
+        """Load sync status from the cache file. Returns True on success."""
         if self.settings is None:
             return False
 
@@ -239,6 +290,23 @@ class IISAState:
             self._sync_status = data
             return True
         return False
+
+    def load_sync_status_from_dict(self, raw: dict[str, Any]) -> int:
+        """
+        Accept a pushed sync-status payload.
+
+        Writes the payload atomically to the configured sync-status cache
+        file, then constructs a SyncStatusData in memory and returns the
+        number of indexers that passed the staleness filter.
+        """
+        if self.settings is None:
+            raise RuntimeError("Settings not initialized")
+
+        _atomic_write_json(self.settings.sync_status_file_path, raw)
+
+        data = SyncStatusData(raw, self.settings.sync_status_staleness_hours)
+        self._sync_status = data
+        return data.total_indexers
 
     @property
     def sync_status(self):
@@ -254,6 +322,53 @@ class IISAState:
     def is_ready(self) -> bool:
         """Check if the service has data loaded and is ready."""
         return self._history is not None and not self._history.empty
+
+
+def _atomic_write_json(path: str, payload: Any) -> None:
+    """Write JSON to `path` atomically via tmp + os.replace.
+
+    The temporary file lives in the same directory so the rename is within
+    a single filesystem. Callers must hold no other reference to `path`
+    during the replace.
+    """
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(payload, f, default=str)
+    os.replace(tmp_path, path)
+
+
+def _extract_computed_at(scores_df: pd.DataFrame) -> Optional[datetime]:
+    """Extract the first record's computed_at as a UTC datetime, or None."""
+    if "computed_at" not in scores_df.columns or scores_df.empty:
+        return None
+    try:
+        series = pd.to_datetime(scores_df["computed_at"], utc=True, errors="coerce")
+    except (ValueError, TypeError):
+        return None
+    first = series.iloc[0]
+    if pd.isna(first):
+        return None
+    return first.to_pydatetime()
+
+
+def _require_push_token(authorization: Optional[str]) -> None:
+    """Validate the bearer token against IISA_PUSH_TOKEN.
+
+    When IISA_PUSH_TOKEN is unset, authentication is disabled (local dev
+    convenience). Token comparison uses hmac.compare_digest to avoid
+    timing oracles.
+    """
+    expected = get_settings().push_token
+    if not expected:
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
+    provided = authorization[len("Bearer ") :].strip()
+    if not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
 
 
 # Global state
@@ -272,10 +387,13 @@ async def lifespan(app: FastAPI):
 
     On startup:
     1. Load settings from environment
-    2. Initialize FileScoreLoader and DataManager
-    3. Load pre-computed scores from the scores file
+    2. Initialize FileScoreLoader and DataManager (cache-backed, RWO PVC)
+    3. Recover the last cached scores + sync-status from disk if present
+    4. Warn if IISA_PUSH_TOKEN is unset (auth disabled; acceptable in local dev)
 
-    If any step fails, the service continues in fallback mode with random selection.
+    Under the push model the cronjob POSTs new data directly to this service;
+    there is no background polling of the scores file. Restarts recover state
+    from the cache mount written by previous successful POSTs.
     """
     global _state
 
@@ -287,80 +405,39 @@ async def lifespan(app: FastAPI):
 
     logger.info("Starting IISA service...")
 
-    # Initialize providers and load data
+    if not settings.push_token:
+        logger.warning(
+            "IISA_PUSH_TOKEN is not set; push endpoints will accept unauthenticated "
+            "requests. This is acceptable in local development only."
+        )
+
+    # Initialize providers
     if not _state.initialize(settings):
         logger.error("IISA initialization failed - cannot start service")
         raise RuntimeError("Failed to initialize IISA providers")
 
-    # Load data on startup - service won't accept requests until ready
-    logger.info("Loading indexer scores...")
-    if not _state.refresh_data():
-        logger.error("Failed to load indexer scores - cannot start service")
-        raise RuntimeError("Failed to load indexer scores")
+    # Recover last cached scores from the RWO cache mount. Missing/empty cache
+    # is acceptable — the service comes up in fallback mode and the next push
+    # from the cronjob will populate it.
+    logger.info("Attempting to recover cached scores from disk...")
+    if _state.refresh_data():
+        logger.info("Recovered cached scores on startup")
+    else:
+        logger.warning(
+            "No cached scores found on startup; serving in random-selection "
+            "fallback mode until the first POST /scores arrives."
+        )
+
+    # Sync status: also optional on startup
+    if _state.refresh_sync_status():
+        logger.info("Recovered cached sync status on startup")
+    else:
+        logger.info("No cached sync status on startup (optional)")
 
     logger.info("IISA service ready")
 
-    # Background task: periodically check if the scores file has been updated
-    # and reload when it changes.  This is a fallback mechanism -- the cronjob
-    # should also POST /refresh after writing scores for immediate freshness.
-    scores_path = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_scores.json")
-    reload_interval = settings.scores_reload_interval
-    logger.info(f"Scores auto-reload enabled: checking {scores_path} every {reload_interval}s")
-
-    async def _periodic_reload():
-        last_mtime: float = 0.0
-        try:
-            last_mtime = os.path.getmtime(scores_path)
-        except OSError:
-            pass
-
-        while True:
-            await asyncio.sleep(reload_interval)
-            try:
-                mtime = os.path.getmtime(scores_path)
-            except OSError:
-                continue
-            if mtime != last_mtime:
-                last_mtime = mtime
-                logger.info("Scores file changed on disk, reloading")
-                _state.refresh_data()
-
-    reload_task = asyncio.create_task(_periodic_reload())
-
-    # Sync status: optional, non-blocking
-    if _state.refresh_sync_status():
-        logger.info("Sync status loaded on startup")
-    else:
-        logger.info("No sync status file found (optional)")
-
-    sync_path = settings.sync_status_file_path
-    sync_interval = settings.sync_status_reload_interval
-
-    async def _periodic_sync_reload():
-        last_mtime: float = 0.0
-        try:
-            last_mtime = os.path.getmtime(sync_path)
-        except OSError:
-            pass
-
-        while True:
-            await asyncio.sleep(sync_interval)
-            try:
-                mtime = os.path.getmtime(sync_path)
-            except OSError:
-                continue
-            if mtime != last_mtime:
-                last_mtime = mtime
-                logger.info("Sync status file changed, reloading")
-                _state.refresh_sync_status()
-
-    sync_reload_task = asyncio.create_task(_periodic_sync_reload())
-
     yield
 
-    # Cleanup
-    reload_task.cancel()
-    sync_reload_task.cancel()
     logger.info("Shutting down IISA service...")
 
 
@@ -391,39 +468,100 @@ async def health_check() -> HealthResponse:
     )
 
 
-@app.post("/refresh")
-async def refresh_data():
+@app.post("/scores", response_model=PushAcceptedResponse)
+async def push_scores(
+    payload: list[dict[str, Any]],
+    authorization: Optional[str] = Header(None),
+) -> PushAcceptedResponse:
     """
-    Trigger a data refresh from the scores file.
+    Accept a pushed scores snapshot from the cronjob.
 
-    This endpoint reloads scores from the shared PVC.
+    Handler order: validate token → validate body → atomic write to the
+    cache PVC → update in-memory DataFrame → return row count. Writing to
+    disk before memory guarantees that a crash at any step leaves the
+    on-disk cache at-least-as-fresh-as memory, so a restart never silently
+    regresses one cycle of freshness.
     """
+    _require_push_token(authorization)
+
+    if not payload:
+        raise HTTPException(
+            status_code=422,
+            detail="scores payload must be a non-empty list of records",
+        )
+
     if not _state._initialized:
         raise HTTPException(
             status_code=503,
-            detail="IISA providers not initialized. Check configuration.",
+            detail="IISA providers not initialized",
         )
 
-    success = _state.refresh_data()
-    if success:
-        row_count = len(_state.history) if _state.history is not None else 0
-        return {"status": "success", "rows": row_count}
-    else:
-        raise HTTPException(status_code=500, detail="Failed to refresh data")
+    try:
+        rows = _state.load_scores_from_records(payload)
+    except Exception as e:
+        logger.exception("Failed to accept pushed scores")
+        raise HTTPException(status_code=500, detail=f"Failed to accept scores: {e}")
+
+    logger.info("Accepted pushed scores: %d rows", rows)
+    return PushAcceptedResponse(status="success", rows=rows)
 
 
-@app.post("/refresh-sync-status")
-async def refresh_sync_status():
-    """Reload sync status from the sync_status.json file."""
-    success = _state.refresh_sync_status()
-    if success:
-        ss = _state.sync_status
-        return {
-            "status": "success",
-            "indexers": ss.total_indexers if ss else 0,
-            "deployments": ss.total_deployments if ss else 0,
-        }
-    return {"status": "no_data"}
+@app.get("/scores/status", response_model=ScoresStatusResponse)
+async def scores_status(
+    authorization: Optional[str] = Header(None),
+) -> ScoresStatusResponse:
+    """
+    Report the computed_at of the currently loaded scores.
+
+    The cronjob GETs this before running to skip redundant recomputation
+    when today's scores are already pushed.
+    """
+    _require_push_token(authorization)
+
+    computed_at: Optional[str] = None
+    if _state.data_manager is not None and _state.data_manager._scores_computed_at is not None:
+        ts = _state.data_manager._scores_computed_at
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        computed_at = ts.isoformat()
+
+    rows = len(_state.history) if _state.history is not None else 0
+    return ScoresStatusResponse(computed_at=computed_at, rows=rows)
+
+
+@app.post("/sync-status", response_model=PushAcceptedResponse)
+async def push_sync_status(
+    payload: dict[str, Any],
+    authorization: Optional[str] = Header(None),
+) -> PushAcceptedResponse:
+    """
+    Accept a pushed sync-status snapshot from the sync_status_fetcher.
+
+    Same atomic-write-then-update-memory ordering as POST /scores.
+    Empty payloads are accepted (means "no indexers currently synced").
+    """
+    _require_push_token(authorization)
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="sync-status payload must be a JSON object",
+        )
+
+    if _state.settings is None:
+        raise HTTPException(
+            status_code=503,
+            detail="IISA service not initialized",
+        )
+
+    try:
+        indexer_count = _state.load_sync_status_from_dict(payload)
+    except Exception as e:
+        logger.exception("Failed to accept pushed sync status")
+        raise HTTPException(status_code=500, detail=f"Failed to accept sync status: {e}")
+
+    logger.info("Accepted pushed sync status: %d indexers", indexer_count)
+    return PushAcceptedResponse(status="success", rows=indexer_count)
 
 
 @app.post("/get-score", response_model=ScoreResponse)

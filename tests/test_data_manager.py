@@ -151,3 +151,28 @@ class TestDataManager:
         assert "norm_success_rate" in data.columns
         assert data["norm_uptime_score"].iloc[0] == pytest.approx(0.9)
         assert data["norm_success_rate"].iloc[0] == pytest.approx(0.85)
+
+    def test_load_scores_from_df_success(self, mock_scores_df):
+        """load_scores_from_df accepts an in-memory DataFrame and runs the full transform."""
+        data_manager = DataManager(MagicMock())
+
+        computed_at = datetime(2024, 1, 15, 12, 0, tzinfo=timezone.utc)
+        result = data_manager.load_scores_from_df(mock_scores_df, computed_at)
+
+        assert result is True
+        data = data_manager.get_data()
+        assert data is not None
+        assert len(data) == 3
+        # Same transform as the file path
+        assert "Latency Coefficient + Error Confidence Interval" in data.columns
+        assert "% up_x" in data.columns
+        assert data["% up_x"].iloc[0] == pytest.approx(98.0)
+        assert data_manager.get_scores_age() is not None
+
+    def test_load_scores_from_df_empty_df(self):
+        """Empty DataFrame should return False and clear state."""
+        data_manager = DataManager(MagicMock())
+        result = data_manager.load_scores_from_df(pd.DataFrame(), datetime.now(timezone.utc))
+
+        assert result is False
+        assert data_manager.get_data() is None

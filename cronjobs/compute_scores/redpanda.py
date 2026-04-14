@@ -15,7 +15,8 @@ the GIL during CPU-bound protobuf parsing. Partition offsets resolved in
 pass 1 are cached for reuse in pass 2.
 
 Stake data is fetched via GraphQL from the Graph Network subgraph.
-Computed scores are written to a JSON file on a shared PVC.
+Computed scores are POSTed directly to the iisa HTTP service via iisa_client;
+there is no shared filesystem between the cronjob and the iisa service.
 """
 
 import json
@@ -25,13 +26,18 @@ import random
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from datetime import date, datetime, timezone
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import base58
 import pandas as pd
 import requests
 from gateway_queries_pb2 import ClientQueryProtobuf
+from iisa_client import (
+    IISAPushError,
+    get_push_token,
+    get_scores_status,
+    post_scores,
+)
 from subgraph import paginate_subgraph_query
 from tenacity import (
     retry,
@@ -41,8 +47,6 @@ from tenacity import (
 )
 
 logger = logging.getLogger(__name__)
-
-SCORES_FILE_PATH = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_scores.json")
 
 # Cap parallel partition consumers to avoid unbounded thread/connection creation.
 # The CronJob runs with 8 CPUs; one consumer per core saturates throughput
@@ -262,7 +266,8 @@ class RedpandaProvider:
         self._bootstrap_servers = os.environ.get("REDPANDA_BOOTSTRAP_SERVERS", "")
         self._topic = os.environ.get("REDPANDA_TOPIC", "gateway_queries")
         self.graph_network_url = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
-        self._scores_path = SCORES_FILE_PATH
+        self._iisa_api_url = os.environ.get("IISA_API_URL", "")
+        self._iisa_push_token = get_push_token()
 
         # SASL authentication (optional — omit for plaintext local-network)
         self._sasl_username = os.environ.get("REDPANDA_SASL_USERNAME", "")
@@ -427,42 +432,52 @@ class RedpandaProvider:
 
     def write_scores(self, scores_df: pd.DataFrame) -> None:
         """
-        Serialise the scores DataFrame to a JSON file atomically.
+        POST the scores DataFrame to the iisa HTTP service.
 
-        Uses a write-to-tmp-then-rename pattern so the HTTP service never
-        reads a partially-written file.
+        iisa is the authoritative consumer; it persists the payload to its
+        own cache PVC atomically and updates the in-memory DataFrame used
+        to serve /select-indexers. The cronjob no longer touches a shared
+        filesystem.
+
+        Raises IISAPushError if iisa rejects the push or all retries are
+        exhausted — the caller should let the job fail rather than silently
+        running with stale data.
         """
-        scores_path = Path(self._scores_path)
-        scores_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = str(scores_path) + ".tmp"
-
-        scores_df.to_json(tmp_path, orient="records", date_format="iso", date_unit="s")
-        os.replace(tmp_path, str(scores_path))
+        payload_json = scores_df.to_json(orient="records", date_format="iso", date_unit="s")
+        assert payload_json is not None
+        payload: list[dict] = json.loads(payload_json)
 
         memory_mb = scores_df.memory_usage(deep=True).sum() / (1024 * 1024)
-        logger.info(f"Wrote {len(scores_df)} scores ({memory_mb:.2f} MB) to {self._scores_path}")
+        logger.info(
+            f"Pushing {len(scores_df)} scores ({memory_mb:.2f} MB) to iisa at {self._iisa_api_url}"
+        )
+
+        post_scores(self._iisa_api_url, self._iisa_push_token, payload)
 
     def scores_exist_for_today(self) -> bool:
         """
-        Return True if the scores file already contains today's computation.
+        Return True if iisa reports today's scores are already loaded.
 
-        Loads the full JSON file and checks the first record's computed_at field.
+        Queries GET /scores/status on iisa for the last computed_at timestamp.
+        On any network or auth failure, returns False so the caller proceeds
+        with a fresh run — idempotency is best-effort and the daily cadence
+        plus concurrencyPolicy: Forbid on the CronJob prevents wasteful races.
         """
         try:
-            with open(self._scores_path, "r") as f:
-                data = json.load(f)
-            if not data:
-                return False
-            computed_at_str = data[0].get("computed_at", "")
-            if not computed_at_str:
-                return False
+            status = get_scores_status(self._iisa_api_url, self._iisa_push_token)
+        except IISAPushError as e:
+            logger.warning(f"Could not check scores status on iisa: {e}")
+            return False
+
+        computed_at_str = status.get("computed_at") if isinstance(status, dict) else None
+        if not computed_at_str:
+            return False
+        try:
             computed_at = pd.to_datetime(computed_at_str, utc=True)
-            return computed_at.date() == datetime.now(timezone.utc).date()
-        except FileNotFoundError:
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Unparseable computed_at from iisa: {computed_at_str!r} ({e})")
             return False
-        except Exception as e:
-            logger.warning(f"Could not check scores file: {e}")
-            return False
+        return computed_at.date() == datetime.now(timezone.utc).date()
 
     # -----------------------------------------------------------------------
     # Internal: cache management

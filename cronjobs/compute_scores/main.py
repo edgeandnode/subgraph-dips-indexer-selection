@@ -22,7 +22,6 @@ import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.request import Request, urlopen
 
 from processing import compute_all_scores, compute_degraded_scores, validate_geoip_databases
 from redpanda import RedpandaProvider
@@ -38,7 +37,6 @@ NUM_DAYS = int(os.environ.get("NUM_DAYS", "28"))
 TARGET_ROWS = int(os.environ.get("TARGET_ROWS", "20000000"))
 SCORING_INTERVAL = int(os.environ.get("SCORING_INTERVAL", "86400"))
 HTTP_PORT = int(os.environ.get("SCORING_HTTP_PORT", "9090"))
-SCORES_FILE_PATH = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_scores.json")
 GRAPH_NETWORK_SUBGRAPH_URL = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
 IISA_API_URL = os.environ.get("IISA_API_URL", "")
 
@@ -111,24 +109,6 @@ def get_peak_memory_mb() -> float:
     return usage / 1024
 
 
-def _refresh_iisa_scores() -> None:
-    """Trigger the IISA API to reload scores from disk.
-
-    Best-effort: logs a warning on failure but never raises.  Skipped when
-    IISA_API_URL is not configured.
-    """
-    if not IISA_API_URL:
-        return
-    url = f"{IISA_API_URL.rstrip('/')}/refresh"
-    try:
-        req = Request(url, data=b"", method="POST")
-        with urlopen(req, timeout=5) as resp:
-            body = json.loads(resp.read())
-            logger.info(f"IISA refresh succeeded: {body}")
-    except Exception as e:
-        logger.warning(f"Failed to notify IISA at {url}: {e}")
-
-
 def run_scoring() -> bool:
     """Run one scoring cycle. Returns True on success."""
     global _consecutive_partial, _consecutive_degraded, _consecutive_failed
@@ -194,7 +174,6 @@ def run_scoring() -> bool:
 
     if success:
         provider.write_scores(scores_df)
-        _refresh_iisa_scores()
 
     # Track consecutive non-full runs (under lock — health endpoint reads these)
     with _status_lock:
@@ -260,12 +239,13 @@ def run_scoring() -> bool:
 class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
-            if not os.path.exists(SCORES_FILE_PATH):
-                self._json_response(503, {"status": "waiting_for_first_run"})
-                return
             with _status_lock:
+                first_run_done = bool(_last_run)
                 degraded = _consecutive_degraded
                 failed = _consecutive_failed
+            if not first_run_done:
+                self._json_response(503, {"status": "waiting_for_first_run"})
+                return
             if failed > 0:
                 self._json_response(
                     503,
@@ -328,11 +308,11 @@ def main() -> int:
     )
 
     if IISA_API_URL:
-        logger.info(f"IISA API refresh enabled: {IISA_API_URL}")
+        logger.info(f"IISA push target: {IISA_API_URL}")
     else:
-        logger.warning(
-            "IISA_API_URL not set -- the IISA API will not be notified after "
-            "scores are written. Set IISA_API_URL to enable immediate score refresh."
+        logger.error(
+            "IISA_API_URL is not set -- scores cannot be pushed to iisa. "
+            "Set IISA_API_URL or the scoring run will fail at write time."
         )
 
     try:

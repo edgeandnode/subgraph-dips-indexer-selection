@@ -36,8 +36,11 @@ spec:
               value: "INFO"
             - name: SCORES_FILE_PATH
               value: "/app/scores/indexer_scores.json"
-            - name: IISA_SCORES_RELOAD_INTERVAL
-              value: "120"
+            - name: IISA_PUSH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: iisa-push-token
+                  key: IISA_PUSH_TOKEN
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -81,4 +84,4 @@ spec:
       volumes:
         - name: scores
           persistentVolumeClaim:
-            claimName: iisa-scores
+            claimName: iisa-scores-cache

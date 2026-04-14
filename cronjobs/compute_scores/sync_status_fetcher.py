@@ -2,7 +2,8 @@
 
 Long-running service that periodically polls each indexer's /status
 endpoint to discover which deployments they have synced and healthy.
-Writes sync_status.json to the shared PVC for the IISA API to load.
+Pushes the resulting snapshot directly to the iisa HTTP service via
+iisa_client.post_sync_status; no shared filesystem is involved.
 
 HTTP endpoints:
   GET /health  -- healthcheck (503 until first write)
@@ -17,11 +18,11 @@ import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import TYPE_CHECKING, Dict, Optional
-from urllib.request import Request, urlopen
 
 if TYPE_CHECKING:
     import aiohttp
 
+from iisa_client import IISAPushError, get_push_token, post_sync_status
 from processing import discover_indexers_from_network_subgraph
 
 logging.basicConfig(
@@ -31,7 +32,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-SYNC_STATUS_FILE_PATH = os.environ.get("SYNC_STATUS_FILE_PATH", "/app/scores/sync_status.json")
 FETCH_INTERVAL = int(os.environ.get("SYNC_STATUS_FETCH_INTERVAL", "3600"))
 FETCH_TIMEOUT = int(os.environ.get("SYNC_STATUS_FETCH_TIMEOUT", "10"))
 MAX_CONCURRENCY = int(os.environ.get("SYNC_STATUS_MAX_CONCURRENCY", "50"))
@@ -138,36 +138,10 @@ async def _fetch_all_statuses(
     return output
 
 
-def _ensure_output_dir() -> None:
-    """Create the output directory if it doesn't exist."""
-    parent = os.path.dirname(SYNC_STATUS_FILE_PATH)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-
-
-def _write_sync_status(data: dict) -> None:
-    """Write sync status to file atomically."""
-    tmp_path = SYNC_STATUS_FILE_PATH + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(data, f)
-    os.replace(tmp_path, SYNC_STATUS_FILE_PATH)
-
-
-def _notify_iisa() -> None:
-    """POST to IISA API to trigger sync status reload."""
-    if not IISA_API_URL:
-        return
-    try:
-        url = IISA_API_URL.rstrip("/") + "/refresh-sync-status"
-        req = Request(url, method="POST", data=b"")
-        with urlopen(req, timeout=5) as resp:
-            logger.info(
-                "Notified IISA API: %s %s",
-                resp.status,
-                resp.read().decode()[:100],
-            )
-    except Exception as e:
-        logger.warning("Failed to notify IISA API: %s", e)
+def _push_sync_status(data: dict) -> None:
+    """Push sync status to iisa. Raises IISAPushError on failure after retries."""
+    token = get_push_token()
+    post_sync_status(IISA_API_URL, token, data)
 
 
 def run_fetch_cycle() -> bool:
@@ -189,11 +163,14 @@ def run_fetch_cycle() -> bool:
         total_deployments,
     )
 
-    _write_sync_status(data)
-    _last_write_time = datetime.now(timezone.utc).isoformat()
-    logger.info("Wrote %s", SYNC_STATUS_FILE_PATH)
+    try:
+        _push_sync_status(data)
+    except IISAPushError as e:
+        logger.error("Failed to push sync status to iisa: %s", e)
+        return False
 
-    _notify_iisa()
+    _last_write_time = datetime.now(timezone.utc).isoformat()
+    logger.info("Pushed sync status for %d indexers to iisa", len(data))
     return True
 
 
@@ -250,8 +227,6 @@ def main():
         MAX_CONCURRENCY,
         MAX_RETRIES,
     )
-
-    _ensure_output_dir()
 
     # Start HTTP healthcheck server
     server = HTTPServer(("0.0.0.0", HTTP_PORT), HealthHandler)

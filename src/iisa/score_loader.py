@@ -110,6 +110,35 @@ class DataManager:
         logger.info(f"Loaded scores for {len(self._data)} indexers")
         return True
 
+    def load_scores_from_df(
+        self,
+        scores_df: pd.DataFrame,
+        computed_at: Optional[datetime],
+    ) -> bool:
+        """
+        Load scores from an already-parsed DataFrame (push path).
+
+        Runs the same transform + staleness check + _data assignment as
+        load_scores(), but takes the DataFrame directly instead of reading
+        from a provider. Used by the POST /scores endpoint, which receives
+        the payload over HTTP and has already written it to the cache mount
+        before calling this.
+
+        :return: True if scores were accepted, False if the DataFrame was empty.
+        """
+        if scores_df.empty:
+            logger.warning("load_scores_from_df called with empty DataFrame")
+            self._data = None
+            self._scores_computed_at = None
+            return False
+
+        self._scores_computed_at = computed_at
+        self._check_scores_staleness(computed_at)
+        self._data = self._transform_scores_to_perf_history(scores_df)
+
+        logger.info(f"Loaded {len(self._data)} scores from in-memory DataFrame")
+        return True
+
     def _transform_scores_to_perf_history(self, scores_df: pd.DataFrame) -> pd.DataFrame:
         """
         Transform indexer_scores table format to IndexerSelector-compatible format.
