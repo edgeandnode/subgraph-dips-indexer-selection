@@ -201,7 +201,7 @@ def run_scoring() -> bool:
             {
                 "time": datetime.now(timezone.utc).isoformat(),
                 "success": success,
-                "indexers": len(scores_df) if success else 0,
+                "indexers": len(scores_df) if scores_df is not None else 0,
                 "elapsed_seconds": round(elapsed, 1),
                 "mode": mode,
                 "consecutive_partial": _consecutive_partial,
@@ -238,7 +238,7 @@ def run_scoring() -> bool:
     logger.info(
         "Scoring complete: mode=%s, indexers=%d, elapsed=%.1fs, peak_memory=%.0fMB",
         mode,
-        len(scores_df) if success else 0,
+        len(scores_df) if scores_df is not None else 0,
         elapsed,
         get_peak_memory_mb(),
     )

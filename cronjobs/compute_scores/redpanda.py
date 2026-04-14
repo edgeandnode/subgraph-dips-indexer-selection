@@ -739,7 +739,10 @@ class RedpandaProvider:
           }
         }
         """
-        return paginate_subgraph_query(self.graph_network_url, query, entity="indexers")
+        indexers: List[dict] = paginate_subgraph_query(
+            self.graph_network_url, query, entity="indexers"
+        )
+        return indexers
 
 
 # ---------------------------------------------------------------------------

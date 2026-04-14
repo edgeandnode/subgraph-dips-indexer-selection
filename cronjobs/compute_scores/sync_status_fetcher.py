@@ -82,7 +82,8 @@ async def _fetch_single_status(
                     )
                 resp.raise_for_status()
                 data = await resp.json()
-                return data.get("data", {}).get("indexingStatuses", [])
+                statuses: list = data.get("data", {}).get("indexingStatuses", [])
+                return statuses
 
     last_error: Optional[Exception] = None
     for attempt in range(MAX_RETRIES):
