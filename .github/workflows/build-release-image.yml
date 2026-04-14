@@ -1,0 +1,65 @@
+# Publishes the versioned iisa service image to GHCR when a v* git tag is
+# pushed. Release-please creates these tags when its release PR merges,
+# which is what makes release-please-managed pins in k8s/deployment.yaml
+# (e.g. v2.0.0) resolve to a real image. The main-branch workflow
+# (build-service-image.yml) already handles :latest and :sha-* tags on
+# every push; this workflow only handles the versioned release artefact.
+#
+# workflow_dispatch is exposed so operators can retroactively publish an
+# existing tag (e.g. if a release image needs rebuilding).
+name: Build Release Image
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing git tag to build and publish (e.g. v2.0.0)'
+        required: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tag name
+        id: tag
+        run: |
+          TAG_NAME="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "image_tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.tag.outputs.image_tag }}
+
+      - name: Summary
+        run: |
+          echo "## Release Image Published to GHCR" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: \`${{ steps.tag.outputs.name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: \`${{ steps.tag.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
