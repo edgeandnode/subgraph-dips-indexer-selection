@@ -503,6 +503,39 @@ class TestPushScoresEndpoint:
 
     @patch("iisa.iisa_http_endpoints.DataManager")
     @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_push_scores_transform_failure_does_not_touch_disk(
+        self, mock_loader_class, mock_dm_class, tmp_path, monkeypatch
+    ):
+        """
+        Dry-run invariant: if transform_scores_df raises, the cache file
+        at SCORES_FILE_PATH must NOT be written. A restart should still
+        load the previous valid payload, not a poisoned one.
+        """
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(iisa_http_endpoints, "SCORES_FILE_PATH", str(scores_path))
+
+        # Transform raises — simulates a schema-invalid payload.
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.transform_scores_df.side_effect = KeyError("missing column")
+        mock_dm_class.return_value = mock_dm_instance
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post("/scores", json=self._sample_payload())
+
+        # Handler 500s on the transform failure.
+        assert response.status_code == 500
+        # Critical invariant: disk was never touched. commit_scores was also
+        # never called — memory and disk both untouched by the failed push.
+        assert not scores_path.exists()
+        mock_dm_instance.commit_scores.assert_not_called()
+
+    @patch("iisa.iisa_http_endpoints.DataManager")
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
     def test_push_scores_accepts_valid_token(
         self, mock_loader_class, mock_dm_class, tmp_path, monkeypatch
     ):

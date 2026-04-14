@@ -266,14 +266,16 @@ class IISAState:
         """
         Accept a pushed scores payload from the cronjob.
 
-        Parse-first ordering: the DataFrame is constructed and the
-        computed_at extracted before any disk I/O. Only after parsing
-        succeeds is the payload written atomically to SCORES_FILE_PATH
-        on the cache PVC; memory is updated last. A parse failure
-        raises before touching disk, so the cache never contains an
-        unparseable payload that a restart would try to reload.
+        Dry-run-then-commit ordering: parse the DataFrame, run the
+        transform against a local copy to prove it produces a usable
+        result, THEN write the payload to the cache file, THEN commit
+        the transformed result to in-memory state. A transform failure
+        raises before any disk I/O, so the cache file is always either
+        the previous valid payload or the new one — never a payload
+        that a restart would choke on.
 
-        Returns the number of loaded rows. Raises on parse or write failure.
+        Returns the number of loaded rows. Raises on parse, transform,
+        or write failure.
         """
         if self.data_manager is None:
             raise RuntimeError("DataManager not initialized")
@@ -286,9 +288,17 @@ class IISAState:
 
         computed_at = _extract_computed_at(scores_df)
 
+        # Dry-run: transform_scores_df is a pure function that raises on
+        # failure without touching state. If the payload is schema-invalid,
+        # this raises and the next two lines never execute.
+        transformed = self.data_manager.transform_scores_df(scores_df)
+
+        # Transform succeeded — the payload is known to be loadable.
+        # Safe to write to disk; a restart will now reload successfully.
         _atomic_write_json(SCORES_FILE_PATH, records)
 
-        self.data_manager.load_scores_from_df(scores_df, computed_at)
+        # Commit the already-validated transformed frame to in-memory state.
+        self.data_manager.commit_scores(transformed, computed_at)
         self._history = self.data_manager.get_data()
         return len(self._history) if self._history is not None else 0
 

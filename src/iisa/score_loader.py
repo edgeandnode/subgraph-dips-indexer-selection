@@ -110,19 +110,56 @@ class DataManager:
         logger.info(f"Loaded scores for {len(self._data)} indexers")
         return True
 
+    def transform_scores_df(self, scores_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Pure transform: run the same column mapping as load_scores() and
+        return the result without touching self._data or
+        self._scores_computed_at.
+
+        Used by the push path (POST /scores) to dry-run the transform
+        before committing anything to disk or in-memory state. A transform
+        failure raised here surfaces as an HTTP error with no side effects,
+        so a malformed payload can never poison the cache.
+
+        :raises ValueError: if the input DataFrame is empty.
+        :raises Exception: if the transform fails (e.g. missing columns).
+        """
+        if scores_df.empty:
+            raise ValueError("transform_scores_df called with empty DataFrame")
+        return self._transform_scores_to_perf_history(scores_df)
+
+    def commit_scores(
+        self,
+        transformed_df: pd.DataFrame,
+        computed_at: Optional[datetime],
+    ) -> None:
+        """
+        Commit an already-transformed scores DataFrame to in-memory state.
+
+        Callers must have run transform_scores_df() on the raw input first;
+        this method only updates self._data + self._scores_computed_at and
+        logs staleness. Split out from load_scores_from_df so the push
+        handler can validate-then-write-disk-then-commit in three distinct
+        steps instead of two coupled ones.
+        """
+        self._scores_computed_at = computed_at
+        self._check_scores_staleness(computed_at)
+        self._data = transformed_df
+        logger.info("Committed %d scores to in-memory state", len(transformed_df))
+
     def load_scores_from_df(
         self,
         scores_df: pd.DataFrame,
         computed_at: Optional[datetime],
     ) -> bool:
         """
-        Load scores from an already-parsed DataFrame (push path).
+        Load scores from an already-parsed DataFrame in one step.
 
-        Runs the same transform + staleness check + _data assignment as
-        load_scores(), but takes the DataFrame directly instead of reading
-        from a provider. Used by the POST /scores endpoint, which receives
-        the payload over HTTP and has already written it to the cache mount
-        before calling this.
+        Facade over transform_scores_df + commit_scores. Kept for the
+        non-push path and for backwards compatibility with existing
+        callers that want the transform-and-commit semantics without
+        the intermediate dry-run. The push handler uses the split
+        methods directly.
 
         :return: True if scores were accepted, False if the DataFrame was empty.
         """
@@ -132,11 +169,8 @@ class DataManager:
             self._scores_computed_at = None
             return False
 
-        self._scores_computed_at = computed_at
-        self._check_scores_staleness(computed_at)
-        self._data = self._transform_scores_to_perf_history(scores_df)
-
-        logger.info(f"Loaded {len(self._data)} scores from in-memory DataFrame")
+        transformed = self.transform_scores_df(scores_df)
+        self.commit_scores(transformed, computed_at)
         return True
 
     def _transform_scores_to_perf_history(self, scores_df: pd.DataFrame) -> pd.DataFrame:
