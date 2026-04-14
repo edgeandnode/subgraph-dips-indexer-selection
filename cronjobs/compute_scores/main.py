@@ -175,7 +175,7 @@ def run_scoring() -> bool:
     elapsed = time.time() - pipeline_start
     success = scores_df is not None and not scores_df.empty
 
-    if success:
+    if scores_df is not None and not scores_df.empty:
         provider.write_scores(scores_df)
 
     # Track consecutive non-full runs (under lock — health endpoint reads these)

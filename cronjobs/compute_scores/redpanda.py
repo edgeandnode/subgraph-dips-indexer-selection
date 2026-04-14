@@ -31,7 +31,7 @@ from typing import Dict, List, Optional, Tuple
 import base58
 import pandas as pd
 import requests
-from gateway_queries_pb2 import ClientQueryProtobuf
+from gateway_queries_pb2 import ClientQueryProtobuf  # type: ignore[attr-defined]
 from iisa_client import (
     IISAPushError,
     get_push_token,
