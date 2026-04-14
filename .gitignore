@@ -64,3 +64,4 @@ Thumbs.db
 !release-please-config.json
 !.release-please-manifest.json
 .secrets/
+.claude/
