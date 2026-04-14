@@ -318,18 +318,26 @@ class TestScoresPush:
         assert body[0]["indexer"] == EXPECTED_INDEXER
 
     def test_write_scores_raises_on_exhausted_retries(self):
-        """All-retries-exhausted should raise IISAPushError so the cronjob fails."""
-        # Arrange
+        """All-retries-exhausted should raise IISAPushError with the expected call count."""
+        import requests
+        from iisa_client import RETRY_ATTEMPTS, IISAPushError
+
         provider = self._build_provider()
 
-        from iisa_client import IISAPushError
+        with (
+            patch("iisa_client.requests.request") as mock_request,
+            patch("iisa_client.time.sleep") as mock_sleep,
+        ):
+            mock_request.side_effect = requests.ConnectionError("refused")
 
-        # Act / Assert
-        with patch("iisa_client.requests.request") as mock_request, patch("iisa_client.time.sleep"):
-            mock_request.side_effect = Exception("connection refused")
-
-            with pytest.raises((IISAPushError, Exception)):
+            with pytest.raises(IISAPushError) as exc_info:
                 provider.write_scores(self._make_scores_df())
+
+        # Exactly RETRY_ATTEMPTS calls were made, and one sleep fewer than
+        # that (no sleep after the final failing attempt).
+        assert mock_request.call_count == RETRY_ATTEMPTS
+        assert mock_sleep.call_count == RETRY_ATTEMPTS - 1
+        assert f"{RETRY_ATTEMPTS} attempts" in str(exc_info.value)
 
     def test_scores_exist_for_today_true(self):
         """GET /scores/status returning today's computed_at ⇒ skip recompute."""

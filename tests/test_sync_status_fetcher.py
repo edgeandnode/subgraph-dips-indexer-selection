@@ -165,7 +165,7 @@ class TestPushSyncStatus:
 
         with (
             patch("sync_status_fetcher.IISA_API_URL", "http://iisa:8080"),
-            patch("sync_status_fetcher.get_push_token", return_value="test-token"),
+            patch("sync_status_fetcher.IISA_PUSH_TOKEN", "test-token"),
             patch("sync_status_fetcher.post_sync_status") as mock_post,
         ):
             _push_sync_status(data)

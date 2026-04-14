@@ -281,7 +281,7 @@ class RedpandaProvider:
             set(gid.strip() for gid in _gw_ids.split(",") if gid.strip()) or None
         )
         if self._gateway_id_filter:
-            logger.info(f"Gateway ID filter active: {self._gateway_id_filter}")
+            logger.info("Gateway ID filter active: %s", self._gateway_id_filter)
         else:
             logger.info("No REDPANDA_GATEWAY_IDS set — processing all gateways")
 
@@ -339,7 +339,7 @@ class RedpandaProvider:
             df.sort_values(by="num_rows", ascending=False, inplace=True, ignore_index=True)
 
         memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
-        logger.info(f"Initial query results from Redpanda: {len(df)} pairs ({memory_mb:.1f} MB)")
+        logger.info("Initial query results from Redpanda: %d pairs (%.1f MB)", len(df), memory_mb)
         return df
 
     def fetch_combined_query_results(
@@ -371,7 +371,7 @@ class RedpandaProvider:
         )
 
         memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
-        logger.info(f"Combined query results from Redpanda: {len(df)} rows ({memory_mb:.1f} MB)")
+        logger.info("Combined query results from Redpanda: %d rows (%.1f MB)", len(df), memory_mb)
         return df
 
     def fetch_stake_to_fees(self, start_ts: str) -> pd.DataFrame:
@@ -395,7 +395,7 @@ class RedpandaProvider:
             )
             return pd.DataFrame(columns=["stake_to_fees"])
 
-        logger.info(f"Fetching stake data from {self.graph_network_url}")
+        logger.info("Fetching stake data from %s", self.graph_network_url)
         try:
             indexers = self._paginate_graphql_indexers()
         except Exception:
@@ -426,7 +426,9 @@ class RedpandaProvider:
 
         matched = df["stake_to_fees"].notna().sum()
         logger.info(
-            f"Computed stake-to-fees for {len(df)} indexers ({matched} with fee data from replay)"
+            "Computed stake-to-fees for %d indexers (%d with fee data from replay)",
+            len(df),
+            matched,
         )
         return df
 
@@ -449,7 +451,10 @@ class RedpandaProvider:
 
         memory_mb = scores_df.memory_usage(deep=True).sum() / (1024 * 1024)
         logger.info(
-            f"Pushing {len(scores_df)} scores ({memory_mb:.2f} MB) to iisa at {self._iisa_api_url}"
+            "Pushing %d scores (%.2f MB) to iisa at %s",
+            len(scores_df),
+            memory_mb,
+            self._iisa_api_url,
         )
 
         post_scores(self._iisa_api_url, self._iisa_push_token, payload)
@@ -466,16 +471,15 @@ class RedpandaProvider:
         try:
             status = get_scores_status(self._iisa_api_url, self._iisa_push_token)
         except IISAPushError as e:
-            logger.warning(f"Could not check scores status on iisa: {e}")
+            logger.warning("Could not check scores status on iisa: %s", e)
             return False
 
         computed_at_str = status.get("computed_at") if isinstance(status, dict) else None
         if not computed_at_str:
             return False
-        try:
-            computed_at = pd.to_datetime(computed_at_str, utc=True)
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Unparseable computed_at from iisa: {computed_at_str!r} ({e})")
+        computed_at = pd.to_datetime(computed_at_str, utc=True, errors="coerce")
+        if pd.isna(computed_at):
+            logger.warning("Unparseable computed_at from iisa: %r", computed_at_str)
             return False
         return computed_at.date() == datetime.now(timezone.utc).date()
 
@@ -551,15 +555,18 @@ class RedpandaProvider:
         end_ts_ms = int(end_dt.timestamp() * 1000)
 
         logger.info(
-            f"Starting count pass: topic={self._topic}, window={start_date} to {end_dt.isoformat()}"
+            "Starting count pass: topic=%s, window=%s to %s",
+            self._topic,
+            start_date,
+            end_dt.isoformat(),
         )
 
         partitions = self._resolve_partitions(start_ts_ms)
 
         if not partitions:
             logger.warning(
-                "No Redpanda messages found for the requested time window — "
-                f"start_ts_ms={start_ts_ms}"
+                "No Redpanda messages found for the requested time window — start_ts_ms=%d",
+                start_ts_ms,
             )
             self._count_cache = {}
             self._fees_per_indexer = {}
@@ -607,10 +614,12 @@ class RedpandaProvider:
         self._count_cache_num_days = num_days
 
         logger.info(
-            f"Count pass complete: {total_messages:,} messages "
-            f"({total_filtered:,} filtered by gateway ID), "
-            f"{sum(self._count_cache.values()):,} attempts across "
-            f"{len(self._count_cache)} (deployment, indexer) pairs"
+            "Count pass complete: %d messages (%d filtered by gateway ID), "
+            "%d attempts across %d (deployment, indexer) pairs",
+            total_messages,
+            total_filtered,
+            sum(self._count_cache.values()),
+            len(self._count_cache),
         )
 
     # -----------------------------------------------------------------------
@@ -631,9 +640,11 @@ class RedpandaProvider:
         end_ts_ms = int(end_dt.timestamp() * 1000)
 
         logger.info(
-            f"Starting sample pass: topic={self._topic}, "
-            f"window={start_date} to {end_dt.isoformat()}, "
-            f"rows_to_use={rows_to_use}"
+            "Starting sample pass: topic=%s, window=%s to %s, rows_to_use=%d",
+            self._topic,
+            start_date,
+            end_dt.isoformat(),
+            rows_to_use,
         )
 
         # Reuse cached partitions from pass 1 if available
@@ -689,9 +700,11 @@ class RedpandaProvider:
         self._row_cache_rows_to_use = rows_to_use
 
         logger.info(
-            f"Sample pass complete: {len(all_rows):,} rows buffered across "
-            f"{len(merged_reservoirs)} pairs "
-            f"({total_filtered:,} messages filtered by gateway ID)"
+            "Sample pass complete: %d rows buffered across %d pairs "
+            "(%d messages filtered by gateway ID)",
+            len(all_rows),
+            len(merged_reservoirs),
+            total_filtered,
         )
 
     # -----------------------------------------------------------------------

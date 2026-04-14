@@ -331,19 +331,22 @@ class TestIISAState:
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
-    """Reset global state before each test."""
-    # Clear settings cache before test
+def reset_state(monkeypatch):
+    """Reset global state and clean push-token env vars before each test.
+
+    The module-level _state singleton and the lru_cache on get_settings
+    otherwise leak between tests. Env vars set via monkeypatch.setenv in
+    one test (e.g. IISA_PUSH_TOKEN) must not be visible to the next.
+    """
     from iisa import iisa_http_endpoints
 
+    monkeypatch.delenv("IISA_PUSH_TOKEN", raising=False)
+    monkeypatch.delenv("IISA_REQUIRE_PUSH_TOKEN", raising=False)
     iisa_http_endpoints.get_settings.cache_clear()
-
-    # Reset state
     iisa_http_endpoints._state = iisa_http_endpoints.IISAState()
 
     yield
 
-    # Clean up after test
     iisa_http_endpoints._state = iisa_http_endpoints.IISAState()
     iisa_http_endpoints.get_settings.cache_clear()
 
@@ -477,7 +480,7 @@ class TestPushScoresEndpoint:
 
         response = client.post("/scores", json=self._sample_payload())
         assert response.status_code == 401
-        assert "Authorization" in response.json()["detail"] or "token" in response.json()["detail"]
+        assert response.json()["detail"] == "Missing or malformed Authorization header"
 
     def test_push_scores_rejects_wrong_token(self, monkeypatch):
         """IISA_PUSH_TOKEN set + wrong bearer → 401."""
@@ -1106,7 +1109,7 @@ class TestPushSyncStatusEndpoint:
         assert response.status_code == 200
         body = response.json()
         assert body["status"] == "success"
-        assert body["rows"] == 1
+        assert body["indexers"] == 1
         assert (tmp_path / "sync_status.json").exists()
 
     def test_push_sync_status_empty_object_accepted(self, tmp_path, monkeypatch):
@@ -1122,7 +1125,7 @@ class TestPushSyncStatusEndpoint:
         client = TestClient(app, raise_server_exceptions=False)
         response = client.post("/sync-status", json={})
         assert response.status_code == 200
-        assert response.json()["rows"] == 0
+        assert response.json()["indexers"] == 0
 
     def test_push_sync_status_rejects_wrong_token(self, monkeypatch):
         monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
@@ -1139,6 +1142,75 @@ class TestPushSyncStatusEndpoint:
             headers={"Authorization": "Bearer wrong"},
         )
         assert response.status_code == 401
+
+
+class TestRequirePushTokenStartup:
+    """Tests for the IISA_REQUIRE_PUSH_TOKEN hard-fail gate on lifespan."""
+
+    def test_startup_fails_when_required_and_token_missing(self, monkeypatch):
+        """IISA_REQUIRE_PUSH_TOKEN=true + unset token → RuntimeError at startup."""
+        monkeypatch.setenv("IISA_REQUIRE_PUSH_TOKEN", "true")
+        monkeypatch.delenv("IISA_PUSH_TOKEN", raising=False)
+
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+
+        # TestClient's context manager runs lifespan on __enter__. The
+        # RuntimeError from the gate surfaces there.
+        with pytest.raises(RuntimeError, match="IISA_PUSH_TOKEN is required"):
+            with TestClient(app) as _client:
+                pass
+
+    @patch("iisa.iisa_http_endpoints.DataManager")
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_startup_succeeds_when_required_and_token_set(
+        self, mock_loader_class, mock_dm_class, monkeypatch
+    ):
+        """IISA_REQUIRE_PUSH_TOKEN=true + token set → service starts normally."""
+        monkeypatch.setenv("IISA_REQUIRE_PUSH_TOKEN", "true")
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.load_scores.return_value = False  # empty cache is fine
+        mock_dm_class.return_value = mock_dm_instance
+
+        with TestClient(app) as client:
+            response = client.get("/health")
+            assert response.status_code == 200
+
+    @patch("iisa.iisa_http_endpoints.DataManager")
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_startup_warns_when_not_required_and_token_missing(
+        self, mock_loader_class, mock_dm_class, monkeypatch, caplog
+    ):
+        """No require flag, no token → startup WARNING, service accepts requests."""
+        import logging
+
+        monkeypatch.delenv("IISA_REQUIRE_PUSH_TOKEN", raising=False)
+        monkeypatch.delenv("IISA_PUSH_TOKEN", raising=False)
+
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.load_scores.return_value = False
+        mock_dm_class.return_value = mock_dm_instance
+
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            with TestClient(app) as client:
+                response = client.get("/health")
+                assert response.status_code == 200
+
+        assert any("IISA_PUSH_TOKEN is not set" in rec.message for rec in caplog.records)
 
 
 class TestExtractChainPrice:

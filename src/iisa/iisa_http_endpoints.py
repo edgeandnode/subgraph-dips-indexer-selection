@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     # When unset, push endpoints accept unauthenticated requests and a WARNING
     # is logged at startup — local development convenience only.
     push_token: Optional[str] = None
+    # When true, startup fails hard if push_token is unset. Set in k8s so a
+    # misconfigured Secret is caught at rollout rather than leaving production
+    # iisa accepting unauthenticated pushes. Default off for compose/local dev.
+    require_push_token: bool = False
 
 
 @lru_cache
@@ -163,11 +167,18 @@ class ScoresStatusResponse(BaseModel):
     rows: int = 0
 
 
-class PushAcceptedResponse(BaseModel):
-    """Response returned by POST /scores and POST /sync-status on success."""
+class ScoresAcceptedResponse(BaseModel):
+    """Response returned by POST /scores on success."""
 
     status: str
     rows: int
+
+
+class SyncStatusAcceptedResponse(BaseModel):
+    """Response returned by POST /sync-status on success."""
+
+    status: str
+    indexers: int
 
 
 # =============================================================================
@@ -216,7 +227,7 @@ class IISAState:
             return True
 
         except Exception as e:
-            logger.warning(f"Failed to initialize IISA providers: {e}")
+            logger.warning("Failed to initialize IISA providers: %s", e)
             logger.warning("Service will operate in random selection fallback mode")
             self._initialized = False
             return False
@@ -241,38 +252,42 @@ class IISAState:
             if success:
                 self._history = self.data_manager.get_data()
                 if self._history is not None:
-                    logger.info(f"Scores loaded successfully: {len(self._history)} indexers")
+                    logger.info("Scores loaded successfully: %d indexers", len(self._history))
                     return True
 
             logger.warning("Failed to load scores")
             return False
 
         except Exception as e:
-            logger.error(f"Failed to load scores: {e}")
+            logger.error("Failed to load scores: %s", e)
             return False
 
     def load_scores_from_records(self, records: list[dict[str, Any]]) -> int:
         """
         Accept a pushed scores payload from the cronjob.
 
-        The payload is written atomically to SCORES_FILE_PATH on the cache
-        PVC FIRST (so disk is always at-least-as-fresh-as memory), then
-        parsed into a DataFrame and handed to DataManager.
+        Parse-first ordering: the DataFrame is constructed and the
+        computed_at extracted before any disk I/O. Only after parsing
+        succeeds is the payload written atomically to SCORES_FILE_PATH
+        on the cache PVC; memory is updated last. A parse failure
+        raises before touching disk, so the cache never contains an
+        unparseable payload that a restart would try to reload.
 
         Returns the number of loaded rows. Raises on parse or write failure.
         """
         if self.data_manager is None:
             raise RuntimeError("DataManager not initialized")
 
-        # Write to disk first so a crash never leaves memory-new-disk-old.
-        _atomic_write_json(SCORES_FILE_PATH, records)
-
         scores_df = pd.DataFrame(records)
         if scores_df.empty:
+            _atomic_write_json(SCORES_FILE_PATH, records)
             self._history = None
             return 0
 
         computed_at = _extract_computed_at(scores_df)
+
+        _atomic_write_json(SCORES_FILE_PATH, records)
+
         self.data_manager.load_scores_from_df(scores_df, computed_at)
         self._history = self.data_manager.get_data()
         return len(self._history) if self._history is not None else 0
@@ -295,16 +310,19 @@ class IISAState:
         """
         Accept a pushed sync-status payload.
 
-        Writes the payload atomically to the configured sync-status cache
-        file, then constructs a SyncStatusData in memory and returns the
-        number of indexers that passed the staleness filter.
+        Parse-first ordering: constructs a SyncStatusData in memory
+        before touching disk. Once parsing succeeds, the raw payload
+        is written atomically to the configured cache path and the
+        in-memory snapshot is assigned. Returns the number of indexers
+        that passed the staleness filter.
         """
         if self.settings is None:
             raise RuntimeError("Settings not initialized")
 
+        data = SyncStatusData(raw, self.settings.sync_status_staleness_hours)
+
         _atomic_write_json(self.settings.sync_status_file_path, raw)
 
-        data = SyncStatusData(raw, self.settings.sync_status_staleness_hours)
         self._sync_status = data
         return data.total_indexers
 
@@ -341,13 +359,14 @@ def _atomic_write_json(path: str, payload: Any) -> None:
 
 
 def _extract_computed_at(scores_df: pd.DataFrame) -> Optional[datetime]:
-    """Extract the first record's computed_at as a UTC datetime, or None."""
+    """Extract the first record's computed_at as a UTC datetime, or None.
+
+    errors="coerce" turns any unparseable value into NaT, so the pd.isna
+    check below captures all parse failures without an explicit except.
+    """
     if "computed_at" not in scores_df.columns or scores_df.empty:
         return None
-    try:
-        series = pd.to_datetime(scores_df["computed_at"], utc=True, errors="coerce")
-    except (ValueError, TypeError):
-        return None
+    series = pd.to_datetime(scores_df["computed_at"], utc=True, errors="coerce")
     first = series.iloc[0]
     if pd.isna(first):
         return None
@@ -404,6 +423,14 @@ async def lifespan(app: FastAPI):
     logger.setLevel(getattr(logging, settings.log_level))
 
     logger.info("Starting IISA service...")
+
+    if settings.require_push_token and not settings.push_token:
+        logger.critical(
+            "IISA_REQUIRE_PUSH_TOKEN is true but IISA_PUSH_TOKEN is unset; "
+            "refusing to start. Provision the iisa-push-token Secret or "
+            "set IISA_REQUIRE_PUSH_TOKEN=false for local development."
+        )
+        raise RuntimeError("IISA_PUSH_TOKEN is required but unset")
 
     if not settings.push_token:
         logger.warning(
@@ -468,19 +495,19 @@ async def health_check() -> HealthResponse:
     )
 
 
-@app.post("/scores", response_model=PushAcceptedResponse)
+@app.post("/scores", response_model=ScoresAcceptedResponse)
 async def push_scores(
     payload: list[dict[str, Any]],
     authorization: Optional[str] = Header(None),
-) -> PushAcceptedResponse:
+) -> ScoresAcceptedResponse:
     """
     Accept a pushed scores snapshot from the cronjob.
 
-    Handler order: validate token → validate body → atomic write to the
-    cache PVC → update in-memory DataFrame → return row count. Writing to
-    disk before memory guarantees that a crash at any step leaves the
-    on-disk cache at-least-as-fresh-as memory, so a restart never silently
-    regresses one cycle of freshness.
+    Handler order: validate token → validate body → parse DataFrame →
+    atomic write to the cache PVC → update in-memory DataFrame → return
+    row count. Parsing before touching disk means a malformed payload
+    422s cleanly without mutating on-disk state; the cache is only
+    updated once the DataFrame is known to be well-formed.
     """
     _require_push_token(authorization)
 
@@ -503,7 +530,7 @@ async def push_scores(
         raise HTTPException(status_code=500, detail=f"Failed to accept scores: {e}")
 
     logger.info("Accepted pushed scores: %d rows", rows)
-    return PushAcceptedResponse(status="success", rows=rows)
+    return ScoresAcceptedResponse(status="success", rows=rows)
 
 
 @app.get("/scores/status", response_model=ScoresStatusResponse)
@@ -529,24 +556,18 @@ async def scores_status(
     return ScoresStatusResponse(computed_at=computed_at, rows=rows)
 
 
-@app.post("/sync-status", response_model=PushAcceptedResponse)
+@app.post("/sync-status", response_model=SyncStatusAcceptedResponse)
 async def push_sync_status(
     payload: dict[str, Any],
     authorization: Optional[str] = Header(None),
-) -> PushAcceptedResponse:
+) -> SyncStatusAcceptedResponse:
     """
     Accept a pushed sync-status snapshot from the sync_status_fetcher.
 
-    Same atomic-write-then-update-memory ordering as POST /scores.
-    Empty payloads are accepted (means "no indexers currently synced").
+    Same parse-first ordering as POST /scores. Empty payloads are
+    accepted (means "no indexers currently synced").
     """
     _require_push_token(authorization)
-
-    if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=422,
-            detail="sync-status payload must be a JSON object",
-        )
 
     if _state.settings is None:
         raise HTTPException(
@@ -561,7 +582,7 @@ async def push_sync_status(
         raise HTTPException(status_code=500, detail=f"Failed to accept sync status: {e}")
 
     logger.info("Accepted pushed sync status: %d indexers", indexer_count)
-    return PushAcceptedResponse(status="success", rows=indexer_count)
+    return SyncStatusAcceptedResponse(status="success", indexers=indexer_count)
 
 
 @app.post("/get-score", response_model=ScoreResponse)
@@ -660,12 +681,14 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
         response = _select_with_processor(request)
         indexer_ids = [i.id for i in response.indexers]
         logger.info(
-            f"Selected {len(response.indexers)} indexers for deployment "
-            f"{request.deployment_id}: {indexer_ids}"
+            "Selected %d indexers for deployment %s: %s",
+            len(response.indexers),
+            request.deployment_id,
+            indexer_ids,
         )
         return response
     except Exception as e:
-        logger.exception(f"Selection failed for deployment {request.deployment_id}")
+        logger.exception("Selection failed for deployment %s", request.deployment_id)
         raise HTTPException(status_code=500, detail=f"Selection failed: {e}")
 
 
@@ -881,11 +904,14 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     if filtered_history.empty:
         if filter_reason:
             logger.warning(
-                f"No indexers available for deployment {request.deployment_id}: {filter_reason}"
+                "No indexers available for deployment %s: %s",
+                request.deployment_id,
+                filter_reason,
             )
         else:
             logger.warning(
-                f"No indexers available for deployment {request.deployment_id} (unknown reason)"
+                "No indexers available for deployment %s (unknown reason)",
+                request.deployment_id,
             )
         return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
 
@@ -981,7 +1007,7 @@ if __name__ == "__main__":
     import uvicorn
 
     settings = get_settings()
-    logger.info(f"Starting IISA service on {settings.host}:{settings.port}")
+    logger.info("Starting IISA service on %s:%d", settings.host, settings.port)
     uvicorn.run(
         "iisa.iisa_http_endpoints:app",
         host=settings.host,

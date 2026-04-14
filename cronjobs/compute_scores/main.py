@@ -23,6 +23,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from iisa_client import get_push_token
 from processing import compute_all_scores, compute_degraded_scores, validate_geoip_databases
 from redpanda import RedpandaProvider
 
@@ -39,6 +40,8 @@ SCORING_INTERVAL = int(os.environ.get("SCORING_INTERVAL", "86400"))
 HTTP_PORT = int(os.environ.get("SCORING_HTTP_PORT", "9090"))
 GRAPH_NETWORK_SUBGRAPH_URL = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
 IISA_API_URL = os.environ.get("IISA_API_URL", "")
+IISA_REQUIRE_PUSH_TOKEN = os.environ.get("IISA_REQUIRE_PUSH_TOKEN", "").lower() == "true"
+IISA_PUSH_TOKEN = get_push_token()
 
 
 class ConfigurationError(Exception):
@@ -68,7 +71,7 @@ DEGRADED_THRESHOLD = int(os.environ.get("DEGRADED_ALERT_THRESHOLD", "3"))
 
 
 def _handle_signal(signum, frame):
-    logger.info(f"Received signal {signum}, shutting down")
+    logger.info("Received signal %d, shutting down", signum)
     _shutdown.set()
     _run_event.set()
 
@@ -95,7 +98,7 @@ def validate_configuration() -> None:
 
     if errors:
         for error in errors:
-            logger.error(f"Configuration error: {error}")
+            logger.error("Configuration error: %s", error)
         raise ConfigurationError(f"Found {len(errors)} configuration error(s)")
 
     logger.info("Configuration validation passed")
@@ -120,7 +123,7 @@ def run_scoring() -> bool:
     # Set SCORING_SEED to replay a previous run's exact sampling.
     seed = int(os.environ.get("SCORING_SEED", date.today().strftime("%Y%m%d")))
     random.seed(seed)
-    logger.info(f"RNG seed: {seed}")
+    logger.info("RNG seed: %d", seed)
 
     geoip_available = validate_geoip_databases()
     if not geoip_available:
@@ -137,7 +140,7 @@ def run_scoring() -> bool:
         start_ts = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         mode_label = "full" if geoip_available else "partial (no GeoIP)"
-        logger.info(f"Attempting {mode_label} pipeline for {start_date} to {end_date}")
+        logger.info("Attempting %s pipeline for %s to %s", mode_label, start_date, end_date)
         scores_df = compute_all_scores(
             provider=provider,
             start_date=start_date,
@@ -153,7 +156,7 @@ def run_scoring() -> bool:
         else:
             mode = MODE_FULL if geoip_available else MODE_PARTIAL
     except Exception as e:
-        logger.warning(f"Pipeline failed: {e}")
+        logger.warning("Pipeline failed: %s", e)
         scores_df = None
 
     # Degraded fallback: equal quality metrics + real pricing (no Redpanda data needed)
@@ -166,7 +169,7 @@ def run_scoring() -> bool:
             else:
                 scores_df = None
         except Exception as e:
-            logger.exception(f"Degraded scoring also failed: {e}")
+            logger.exception("Degraded scoring also failed: %s", e)
             scores_df = None
 
     elapsed = time.time() - pipeline_start
@@ -210,27 +213,34 @@ def run_scoring() -> bool:
     # Log outside the lock
     if mode == MODE_PARTIAL:
         logger.warning(
-            f"Scoring ran without GeoIP ({_consecutive_partial} consecutive partial run(s)). "
+            "Scoring ran without GeoIP (%d consecutive partial run(s)). "
             "Latency scores are neutral (0.5). "
-            "Install MaxMind GeoLite2 databases for full scoring."
+            "Install MaxMind GeoLite2 databases for full scoring.",
+            _consecutive_partial,
         )
     elif mode == MODE_DEGRADED:
         if _consecutive_degraded >= DEGRADED_THRESHOLD:
             logger.error(
-                f"Scoring has been degraded for {_consecutive_degraded} consecutive runs. "
+                "Scoring has been degraded for %d consecutive runs. "
                 "Full pipeline is not functioning — "
-                "investigate GeoIP databases and Redpanda data availability."
+                "investigate GeoIP databases and Redpanda data availability.",
+                _consecutive_degraded,
             )
         else:
             logger.warning(
-                f"Scoring degraded ({_consecutive_degraded}/{DEGRADED_THRESHOLD} before alert)"
+                "Scoring degraded (%d/%d before alert)",
+                _consecutive_degraded,
+                DEGRADED_THRESHOLD,
             )
     elif mode == MODE_FAILED:
-        logger.error(f"Scoring failed completely for {_consecutive_failed} consecutive runs")
+        logger.error("Scoring failed completely for %d consecutive runs", _consecutive_failed)
 
     logger.info(
-        f"Scoring complete: mode={mode}, indexers={len(scores_df) if success else 0}, "
-        f"elapsed={elapsed:.1f}s, peak_memory={get_peak_memory_mb():.0f}MB"
+        "Scoring complete: mode=%s, indexers=%d, elapsed=%.1fs, peak_memory=%.0fMB",
+        mode,
+        len(scores_df) if success else 0,
+        elapsed,
+        get_peak_memory_mb(),
     )
 
     return success
@@ -304,16 +314,26 @@ def main() -> int:
     global _next_run_time
 
     logger.info(
-        f"Score computation service starting (interval={SCORING_INTERVAL}s, http_port={HTTP_PORT})"
+        "Score computation service starting (interval=%ds, http_port=%d)",
+        SCORING_INTERVAL,
+        HTTP_PORT,
     )
 
     if IISA_API_URL:
-        logger.info(f"IISA push target: {IISA_API_URL}")
+        logger.info("IISA push target: %s", IISA_API_URL)
     else:
         logger.error(
             "IISA_API_URL is not set -- scores cannot be pushed to iisa. "
             "Set IISA_API_URL or the scoring run will fail at write time."
         )
+
+    if IISA_REQUIRE_PUSH_TOKEN and not IISA_PUSH_TOKEN:
+        logger.critical(
+            "IISA_REQUIRE_PUSH_TOKEN is true but IISA_PUSH_TOKEN is unset; "
+            "refusing to run. Provision the iisa-push-token Secret or "
+            "set IISA_REQUIRE_PUSH_TOKEN=false for local development."
+        )
+        return 2
 
     try:
         validate_configuration()
@@ -324,7 +344,7 @@ def main() -> int:
     server = HTTPServer(("0.0.0.0", HTTP_PORT), RequestHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    logger.info(f"HTTP server listening on port {HTTP_PORT}")
+    logger.info("HTTP server listening on port %d", HTTP_PORT)
 
     # Initial scoring run
     run_scoring()

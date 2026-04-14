@@ -41,6 +41,10 @@ RETRY_BACKOFF_MAX = int(os.environ.get("SYNC_STATUS_RETRY_BACKOFF_MAX", "5"))
 HTTP_PORT = int(os.environ.get("SYNC_STATUS_HTTP_PORT", "9091"))
 GRAPH_NETWORK_SUBGRAPH_URL = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
 IISA_API_URL = os.environ.get("IISA_API_URL", "")
+# Read the bearer token once at module load so rotation requires a restart —
+# consistent with RedpandaProvider's init-time read and the IISA_API_URL
+# pattern above. Rotation tooling is out of scope for this service.
+IISA_PUSH_TOKEN: Optional[str] = get_push_token()
 
 STATUS_QUERY = "{ indexingStatuses { subgraph synced health } }"
 
@@ -140,8 +144,7 @@ async def _fetch_all_statuses(
 
 def _push_sync_status(data: dict) -> None:
     """Push sync status to iisa. Raises IISAPushError on failure after retries."""
-    token = get_push_token()
-    post_sync_status(IISA_API_URL, token, data)
+    post_sync_status(IISA_API_URL, IISA_PUSH_TOKEN, data)
 
 
 def run_fetch_cycle() -> bool:
