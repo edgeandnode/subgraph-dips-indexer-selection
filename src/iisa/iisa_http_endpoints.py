@@ -28,7 +28,7 @@ from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
-from .score_loader import SCORES_FILE_PATH, DataManager, FileScoreLoader
+from .score_loader import DataManager, FileScoreLoader
 from .sync_status_loader import SyncStatusData
 
 __all__ = ["app", "Settings", "get_settings"]
@@ -275,27 +275,30 @@ class IISAState:
         that a restart would choke on.
 
         Returns the number of loaded rows. Raises on parse, transform,
-        or write failure.
+        or write failure. An empty records list propagates to
+        transform_scores_df which raises ValueError — the push endpoint
+        already 422s on empty bodies, so the direct-call path is the
+        only caller that hits that branch and we want it to fail loudly
+        rather than silently zero out the cache.
         """
         if self.data_manager is None:
             raise RuntimeError("DataManager not initialized")
 
-        scores_df = pd.DataFrame(records)
-        if scores_df.empty:
-            _atomic_write_json(SCORES_FILE_PATH, records)
-            self._history = None
-            return 0
+        scores_path = self.data_manager.scores_file_path
+        if scores_path is None:
+            raise RuntimeError("DataManager has no file-backed provider; cannot persist push")
 
+        scores_df = pd.DataFrame(records)
         computed_at = _extract_computed_at(scores_df)
 
         # Dry-run: transform_scores_df is a pure function that raises on
-        # failure without touching state. If the payload is schema-invalid,
-        # this raises and the next two lines never execute.
+        # failure without touching state. If the payload is schema-invalid
+        # (including empty), this raises and the next two lines never execute.
         transformed = self.data_manager.transform_scores_df(scores_df)
 
         # Transform succeeded — the payload is known to be loadable.
         # Safe to write to disk; a restart will now reload successfully.
-        _atomic_write_json(SCORES_FILE_PATH, records)
+        _atomic_write_json(scores_path, records)
 
         # Commit the already-validated transformed frame to in-memory state.
         self.data_manager.commit_scores(transformed, computed_at)
@@ -388,14 +391,15 @@ def _require_push_token(authorization: Optional[str]) -> None:
 
     When IISA_PUSH_TOKEN is unset, authentication is disabled (local dev
     convenience). Token comparison uses hmac.compare_digest to avoid
-    timing oracles.
+    timing oracles. The "Bearer" scheme prefix is matched case-insensitively
+    per RFC 6750 §2.1, but the token itself keeps its original case.
     """
     expected = get_settings().push_token
     if not expected:
         return
-    if not authorization or not authorization.startswith("Bearer "):
+    if not authorization or authorization[:7].lower() != "bearer ":
         raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
-    provided = authorization[len("Bearer ") :].strip()
+    provided = authorization[7:].strip()
     if not hmac.compare_digest(provided, expected):
         raise HTTPException(status_code=401, detail="Invalid bearer token")
 
@@ -506,7 +510,7 @@ async def health_check() -> HealthResponse:
 
 
 @app.post("/scores", response_model=ScoresAcceptedResponse)
-async def push_scores(
+def push_scores(
     payload: list[dict[str, Any]],
     authorization: Optional[str] = Header(None),
 ) -> ScoresAcceptedResponse:
@@ -518,6 +522,11 @@ async def push_scores(
     row count. Parsing before touching disk means a malformed payload
     422s cleanly without mutating on-disk state; the cache is only
     updated once the DataFrame is known to be well-formed.
+
+    Declared as sync def (not async) so FastAPI runs the body in a
+    threadpool — the _atomic_write_json call does blocking disk I/O
+    (~50-200ms on a 10 MiB payload) which would stall the event loop
+    if this were async.
     """
     _require_push_token(authorization)
 
@@ -535,23 +544,24 @@ async def push_scores(
 
     try:
         rows = _state.load_scores_from_records(payload)
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to accept pushed scores")
-        raise HTTPException(status_code=500, detail=f"Failed to accept scores: {e}")
+        raise HTTPException(status_code=500, detail="Failed to accept scores")
 
     logger.info("Accepted pushed scores: %d rows", rows)
     return ScoresAcceptedResponse(status="success", rows=rows)
 
 
 @app.get("/scores/status", response_model=ScoresStatusResponse)
-async def scores_status(
+def scores_status(
     authorization: Optional[str] = Header(None),
 ) -> ScoresStatusResponse:
     """
     Report the computed_at of the currently loaded scores.
 
     The cronjob GETs this before running to skip redundant recomputation
-    when today's scores are already pushed.
+    when today's scores are already pushed. Sync def for consistency with
+    the other push endpoints — body contains no awaitable work.
     """
     _require_push_token(authorization)
 
@@ -567,7 +577,7 @@ async def scores_status(
 
 
 @app.post("/sync-status", response_model=SyncStatusAcceptedResponse)
-async def push_sync_status(
+def push_sync_status(
     payload: dict[str, Any],
     authorization: Optional[str] = Header(None),
 ) -> SyncStatusAcceptedResponse:
@@ -575,7 +585,9 @@ async def push_sync_status(
     Accept a pushed sync-status snapshot from the sync_status_fetcher.
 
     Same parse-first ordering as POST /scores. Empty payloads are
-    accepted (means "no indexers currently synced").
+    accepted (means "no indexers currently synced"). Sync def so the
+    blocking _atomic_write_json runs in FastAPI's threadpool rather
+    than on the event loop.
     """
     _require_push_token(authorization)
 
@@ -587,9 +599,9 @@ async def push_sync_status(
 
     try:
         indexer_count = _state.load_sync_status_from_dict(payload)
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to accept pushed sync status")
-        raise HTTPException(status_code=500, detail=f"Failed to accept sync status: {e}")
+        raise HTTPException(status_code=500, detail="Failed to accept sync status")
 
     logger.info("Accepted pushed sync status: %d indexers", indexer_count)
     return SyncStatusAcceptedResponse(status="success", indexers=indexer_count)

@@ -176,3 +176,36 @@ class TestDataManager:
 
         assert result is False
         assert data_manager.get_data() is None
+
+    def test_transform_scores_df_empty_raises(self):
+        """transform_scores_df is pure and must raise loudly on empty input.
+
+        The push handler relies on this: a direct call with an empty
+        DataFrame should fail fast rather than silently zero out the
+        cache. The endpoint's own 422 on empty bodies is a separate
+        guard; this test covers the method invariant itself.
+        """
+        data_manager = DataManager(MagicMock())
+
+        with pytest.raises(ValueError, match="empty DataFrame"):
+            data_manager.transform_scores_df(pd.DataFrame())
+
+    def test_commit_scores_twice_keeps_most_recent(self, mock_scores_df):
+        """Back-to-back commits must leave the most recent frame in memory."""
+        data_manager = DataManager(MagicMock())
+
+        df1 = data_manager.transform_scores_df(mock_scores_df)
+        ts1 = datetime(2024, 1, 15, 12, 0, tzinfo=timezone.utc)
+        data_manager.commit_scores(df1, ts1)
+
+        df2_raw = mock_scores_df.copy()
+        df2_raw["uptime_score"] = [0.50, 0.60, 0.70]  # distinguishable values
+        df2 = data_manager.transform_scores_df(df2_raw)
+        ts2 = datetime(2024, 1, 16, 12, 0, tzinfo=timezone.utc)
+        data_manager.commit_scores(df2, ts2)
+
+        current = data_manager.get_data()
+        assert current is not None
+        # Second commit's values should be what's in memory, not the first.
+        assert list(current["% up_x"]) == pytest.approx([50.0, 60.0, 70.0])
+        assert data_manager._scores_computed_at == ts2

@@ -433,12 +433,14 @@ class TestPushScoresEndpoint:
     @patch("iisa.iisa_http_endpoints.FileScoreLoader")
     def test_push_scores_success(self, mock_loader_class, mock_dm_class, tmp_path, monkeypatch):
         """Valid body + no auth required (unset token) → 200 with row count."""
-        from iisa import iisa_http_endpoints
+        from iisa import iisa_http_endpoints, score_loader
         from iisa.iisa_http_endpoints import Settings, app
 
-        monkeypatch.setattr(iisa_http_endpoints, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
+        scores_path = str(tmp_path / "scores.json")
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", scores_path)
 
         mock_dm_instance = MagicMock()
+        mock_dm_instance.scores_file_path = scores_path
         mock_dm_instance.load_scores_from_df.return_value = True
         mock_dm_instance.get_data.return_value = pd.DataFrame({"indexer": ["0xABC"]})
         mock_dm_class.return_value = mock_dm_instance
@@ -508,17 +510,18 @@ class TestPushScoresEndpoint:
     ):
         """
         Dry-run invariant: if transform_scores_df raises, the cache file
-        at SCORES_FILE_PATH must NOT be written. A restart should still
-        load the previous valid payload, not a poisoned one.
+        must NOT be written. A restart should still load the previous
+        valid payload, not a poisoned one.
         """
-        from iisa import iisa_http_endpoints
+        from iisa import iisa_http_endpoints, score_loader
         from iisa.iisa_http_endpoints import Settings, app
 
         scores_path = tmp_path / "scores.json"
-        monkeypatch.setattr(iisa_http_endpoints, "SCORES_FILE_PATH", str(scores_path))
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
 
         # Transform raises — simulates a schema-invalid payload.
         mock_dm_instance = MagicMock()
+        mock_dm_instance.scores_file_path = str(scores_path)
         mock_dm_instance.transform_scores_df.side_effect = KeyError("missing column")
         mock_dm_class.return_value = mock_dm_instance
 
@@ -540,14 +543,16 @@ class TestPushScoresEndpoint:
         self, mock_loader_class, mock_dm_class, tmp_path, monkeypatch
     ):
         """IISA_PUSH_TOKEN set + matching bearer → 200."""
-        from iisa import iisa_http_endpoints
+        from iisa import iisa_http_endpoints, score_loader
         from iisa.iisa_http_endpoints import Settings, app
 
+        scores_path = str(tmp_path / "scores.json")
         monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
-        monkeypatch.setattr(iisa_http_endpoints, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", scores_path)
         iisa_http_endpoints.get_settings.cache_clear()
 
         mock_dm_instance = MagicMock()
+        mock_dm_instance.scores_file_path = scores_path
         mock_dm_instance.load_scores_from_df.return_value = True
         mock_dm_instance.get_data.return_value = pd.DataFrame({"indexer": ["0xABC"]})
         mock_dm_class.return_value = mock_dm_instance
@@ -561,6 +566,92 @@ class TestPushScoresEndpoint:
             headers={"Authorization": "Bearer secret"},
         )
         assert response.status_code == 200
+
+    @patch("iisa.iisa_http_endpoints.DataManager")
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_push_scores_accepts_lowercase_bearer(
+        self, mock_loader_class, mock_dm_class, tmp_path, monkeypatch
+    ):
+        """RFC 6750 §2.1: the scheme prefix is case-insensitive."""
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = str(tmp_path / "scores.json")
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", scores_path)
+        iisa_http_endpoints.get_settings.cache_clear()
+
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.scores_file_path = scores_path
+        mock_dm_instance.get_data.return_value = pd.DataFrame({"indexer": ["0xABC"]})
+        mock_dm_class.return_value = mock_dm_instance
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/scores",
+            json=self._sample_payload(),
+            headers={"Authorization": "bearer secret"},
+        )
+        assert response.status_code == 200
+
+    @patch("iisa.iisa_http_endpoints.DataManager")
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_push_scores_unparseable_computed_at_coerces_to_nat(
+        self, mock_loader_class, mock_dm_class, tmp_path, monkeypatch
+    ):
+        """
+        A payload whose computed_at is not a valid timestamp should still
+        succeed: the push path parses with errors="coerce", which turns
+        bad values into NaT, which _extract_computed_at normalises to None.
+        The computed_at on /scores/status should then be null.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = str(tmp_path / "scores.json")
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", scores_path)
+
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.scores_file_path = scores_path
+        mock_dm_instance._scores_computed_at = None
+        mock_dm_instance.get_data.return_value = pd.DataFrame({"indexer": ["0xABC"]})
+
+        def _commit(transformed_df, computed_at):
+            mock_dm_instance._scores_computed_at = computed_at
+
+        mock_dm_instance.commit_scores.side_effect = _commit
+        mock_dm_class.return_value = mock_dm_instance
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        payload = [
+            {
+                "indexer": "0xABC",
+                "computed_at": "not a real timestamp",
+                "lat_normalized_score": 0.8,
+                "uptime_score": 0.95,
+                "success_rate": 0.99,
+            }
+        ]
+
+        response = client.post("/scores", json=payload)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["rows"] == 1
+
+        # commit_scores was called with computed_at=None because the
+        # malformed timestamp was coerced to NaT and normalised to None.
+        commit_call = mock_dm_instance.commit_scores.call_args
+        assert commit_call is not None
+        assert commit_call.args[1] is None
+
+        # /scores/status reflects the None computed_at.
+        status_response = client.get("/scores/status")
+        assert status_response.status_code == 200
+        assert status_response.json()["computed_at"] is None
 
 
 class TestScoresStatusEndpoint:

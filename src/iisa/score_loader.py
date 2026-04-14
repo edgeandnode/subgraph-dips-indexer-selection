@@ -33,8 +33,17 @@ class FileScoreLoader:
     reads them back.
     """
 
-    def __init__(self, scores_file_path: str = SCORES_FILE_PATH) -> None:
-        self._path = scores_file_path
+    def __init__(self, scores_file_path: Optional[str] = None) -> None:
+        # Read the module-level default at call time (not definition time) so
+        # tests can monkeypatch `score_loader.SCORES_FILE_PATH` and have new
+        # instances pick it up. Default capture at def-time would lock in
+        # whatever value was present at module import.
+        self._path = scores_file_path if scores_file_path is not None else SCORES_FILE_PATH
+
+    @property
+    def path(self) -> str:
+        """The filesystem path this loader reads from and the push handler writes to."""
+        return self._path
 
     def fetch_indexer_scores(self) -> Tuple[pd.DataFrame, Optional[datetime]]:
         """
@@ -87,6 +96,18 @@ class DataManager:
         self._provider = provider
         self._data: Optional[pd.DataFrame] = None
         self._scores_computed_at: Optional[datetime] = None
+
+    @property
+    def scores_file_path(self) -> Optional[str]:
+        """
+        The on-disk path of the underlying file-backed provider, if any.
+
+        Returns None if the provider has no .path attribute — e.g. a future
+        non-FileScoreLoader provider that doesn't persist to a single file.
+        Callers in the push path must guard for None before attempting to
+        write to disk.
+        """
+        return getattr(self._provider, "path", None)
 
     def load_scores(self) -> bool:
         """
