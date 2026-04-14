@@ -15,7 +15,8 @@ the GIL during CPU-bound protobuf parsing. Partition offsets resolved in
 pass 1 are cached for reuse in pass 2.
 
 Stake data is fetched via GraphQL from the Graph Network subgraph.
-Computed scores are written to a JSON file on a shared PVC.
+Computed scores are POSTed directly to the iisa HTTP service via iisa_client;
+there is no shared filesystem between the cronjob and the iisa service.
 """
 
 import json
@@ -25,13 +26,18 @@ import random
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from datetime import date, datetime, timezone
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, cast
 
 import base58
 import pandas as pd
 import requests
-from gateway_queries_pb2 import ClientQueryProtobuf
+from gateway_queries_pb2 import ClientQueryProtobuf  # type: ignore[attr-defined]
+from iisa_client import (
+    IISAPushError,
+    get_push_token,
+    get_scores_status,
+    post_scores,
+)
 from subgraph import paginate_subgraph_query
 from tenacity import (
     retry,
@@ -41,8 +47,6 @@ from tenacity import (
 )
 
 logger = logging.getLogger(__name__)
-
-SCORES_FILE_PATH = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_scores.json")
 
 # Cap parallel partition consumers to avoid unbounded thread/connection creation.
 # The CronJob runs with 8 CPUs; one consumer per core saturates throughput
@@ -60,7 +64,7 @@ def _bytes_to_cid(b: bytes) -> str:
     if len(b) != 32:
         return ""
     multihash = b"\x12\x20" + b  # sha2-256 function code + 32-byte length prefix
-    return base58.b58encode(multihash).decode("ascii")
+    return cast(str, base58.b58encode(multihash).decode("ascii"))
 
 
 def _bytes_to_hex(b: bytes) -> str:
@@ -262,7 +266,8 @@ class RedpandaProvider:
         self._bootstrap_servers = os.environ.get("REDPANDA_BOOTSTRAP_SERVERS", "")
         self._topic = os.environ.get("REDPANDA_TOPIC", "gateway_queries")
         self.graph_network_url = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
-        self._scores_path = SCORES_FILE_PATH
+        self._iisa_api_url = os.environ.get("IISA_API_URL", "")
+        self._iisa_push_token = get_push_token()
 
         # SASL authentication (optional — omit for plaintext local-network)
         self._sasl_username = os.environ.get("REDPANDA_SASL_USERNAME", "")
@@ -276,7 +281,7 @@ class RedpandaProvider:
             set(gid.strip() for gid in _gw_ids.split(",") if gid.strip()) or None
         )
         if self._gateway_id_filter:
-            logger.info(f"Gateway ID filter active: {self._gateway_id_filter}")
+            logger.info("Gateway ID filter active: %s", self._gateway_id_filter)
         else:
             logger.info("No REDPANDA_GATEWAY_IDS set — processing all gateways")
 
@@ -334,7 +339,7 @@ class RedpandaProvider:
             df.sort_values(by="num_rows", ascending=False, inplace=True, ignore_index=True)
 
         memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
-        logger.info(f"Initial query results from Redpanda: {len(df)} pairs ({memory_mb:.1f} MB)")
+        logger.info("Initial query results from Redpanda: %d pairs (%.1f MB)", len(df), memory_mb)
         return df
 
     def fetch_combined_query_results(
@@ -366,7 +371,7 @@ class RedpandaProvider:
         )
 
         memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
-        logger.info(f"Combined query results from Redpanda: {len(df)} rows ({memory_mb:.1f} MB)")
+        logger.info("Combined query results from Redpanda: %d rows (%.1f MB)", len(df), memory_mb)
         return df
 
     def fetch_stake_to_fees(self, start_ts: str) -> pd.DataFrame:
@@ -390,7 +395,7 @@ class RedpandaProvider:
             )
             return pd.DataFrame(columns=["stake_to_fees"])
 
-        logger.info(f"Fetching stake data from {self.graph_network_url}")
+        logger.info("Fetching stake data from %s", self.graph_network_url)
         try:
             indexers = self._paginate_graphql_indexers()
         except Exception:
@@ -421,48 +426,62 @@ class RedpandaProvider:
 
         matched = df["stake_to_fees"].notna().sum()
         logger.info(
-            f"Computed stake-to-fees for {len(df)} indexers ({matched} with fee data from replay)"
+            "Computed stake-to-fees for %d indexers (%d with fee data from replay)",
+            len(df),
+            matched,
         )
         return df
 
     def write_scores(self, scores_df: pd.DataFrame) -> None:
         """
-        Serialise the scores DataFrame to a JSON file atomically.
+        POST the scores DataFrame to the iisa HTTP service.
 
-        Uses a write-to-tmp-then-rename pattern so the HTTP service never
-        reads a partially-written file.
+        iisa is the authoritative consumer; it persists the payload to its
+        own cache PVC atomically and updates the in-memory DataFrame used
+        to serve /select-indexers. The cronjob no longer touches a shared
+        filesystem.
+
+        Raises IISAPushError if iisa rejects the push or all retries are
+        exhausted — the caller should let the job fail rather than silently
+        running with stale data.
         """
-        scores_path = Path(self._scores_path)
-        scores_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = str(scores_path) + ".tmp"
-
-        scores_df.to_json(tmp_path, orient="records", date_format="iso", date_unit="s")
-        os.replace(tmp_path, str(scores_path))
+        payload_json = scores_df.to_json(orient="records", date_format="iso", date_unit="s")
+        assert payload_json is not None
+        payload: list[dict] = json.loads(payload_json)
 
         memory_mb = scores_df.memory_usage(deep=True).sum() / (1024 * 1024)
-        logger.info(f"Wrote {len(scores_df)} scores ({memory_mb:.2f} MB) to {self._scores_path}")
+        logger.info(
+            "Pushing %d scores (%.2f MB) to iisa at %s",
+            len(scores_df),
+            memory_mb,
+            self._iisa_api_url,
+        )
+
+        post_scores(self._iisa_api_url, self._iisa_push_token, payload)
 
     def scores_exist_for_today(self) -> bool:
         """
-        Return True if the scores file already contains today's computation.
+        Return True if iisa reports today's scores are already loaded.
 
-        Loads the full JSON file and checks the first record's computed_at field.
+        Queries GET /scores/status on iisa for the last computed_at timestamp.
+        On any network or auth failure, returns False so the caller proceeds
+        with a fresh run — idempotency is best-effort and the daily cadence
+        plus concurrencyPolicy: Forbid on the CronJob prevents wasteful races.
         """
         try:
-            with open(self._scores_path, "r") as f:
-                data = json.load(f)
-            if not data:
-                return False
-            computed_at_str = data[0].get("computed_at", "")
-            if not computed_at_str:
-                return False
-            computed_at = pd.to_datetime(computed_at_str, utc=True)
-            return computed_at.date() == datetime.now(timezone.utc).date()
-        except FileNotFoundError:
+            status = get_scores_status(self._iisa_api_url, self._iisa_push_token)
+        except IISAPushError as e:
+            logger.warning("Could not check scores status on iisa: %s", e)
             return False
-        except Exception as e:
-            logger.warning(f"Could not check scores file: {e}")
+
+        computed_at_str = status.get("computed_at") if isinstance(status, dict) else None
+        if not computed_at_str:
             return False
+        computed_at = pd.to_datetime(computed_at_str, utc=True, errors="coerce")
+        if pd.isna(computed_at):
+            logger.warning("Unparseable computed_at from iisa: %r", computed_at_str)
+            return False
+        return computed_at.date() == datetime.now(timezone.utc).date()
 
     # -----------------------------------------------------------------------
     # Internal: cache management
@@ -536,15 +555,18 @@ class RedpandaProvider:
         end_ts_ms = int(end_dt.timestamp() * 1000)
 
         logger.info(
-            f"Starting count pass: topic={self._topic}, window={start_date} to {end_dt.isoformat()}"
+            "Starting count pass: topic=%s, window=%s to %s",
+            self._topic,
+            start_date,
+            end_dt.isoformat(),
         )
 
         partitions = self._resolve_partitions(start_ts_ms)
 
         if not partitions:
             logger.warning(
-                "No Redpanda messages found for the requested time window — "
-                f"start_ts_ms={start_ts_ms}"
+                "No Redpanda messages found for the requested time window — start_ts_ms=%d",
+                start_ts_ms,
             )
             self._count_cache = {}
             self._fees_per_indexer = {}
@@ -592,10 +614,12 @@ class RedpandaProvider:
         self._count_cache_num_days = num_days
 
         logger.info(
-            f"Count pass complete: {total_messages:,} messages "
-            f"({total_filtered:,} filtered by gateway ID), "
-            f"{sum(self._count_cache.values()):,} attempts across "
-            f"{len(self._count_cache)} (deployment, indexer) pairs"
+            "Count pass complete: %s messages (%s filtered by gateway ID), "
+            "%s attempts across %d (deployment, indexer) pairs",
+            f"{total_messages:,}",
+            f"{total_filtered:,}",
+            f"{sum(self._count_cache.values()):,}",
+            len(self._count_cache),
         )
 
     # -----------------------------------------------------------------------
@@ -616,9 +640,11 @@ class RedpandaProvider:
         end_ts_ms = int(end_dt.timestamp() * 1000)
 
         logger.info(
-            f"Starting sample pass: topic={self._topic}, "
-            f"window={start_date} to {end_dt.isoformat()}, "
-            f"rows_to_use={rows_to_use}"
+            "Starting sample pass: topic=%s, window=%s to %s, rows_to_use=%d",
+            self._topic,
+            start_date,
+            end_dt.isoformat(),
+            rows_to_use,
         )
 
         # Reuse cached partitions from pass 1 if available
@@ -674,9 +700,11 @@ class RedpandaProvider:
         self._row_cache_rows_to_use = rows_to_use
 
         logger.info(
-            f"Sample pass complete: {len(all_rows):,} rows buffered across "
-            f"{len(merged_reservoirs)} pairs "
-            f"({total_filtered:,} messages filtered by gateway ID)"
+            "Sample pass complete: %s rows buffered across %d pairs "
+            "(%s messages filtered by gateway ID)",
+            f"{len(all_rows):,}",
+            len(merged_reservoirs),
+            f"{total_filtered:,}",
         )
 
     # -----------------------------------------------------------------------
@@ -711,7 +739,10 @@ class RedpandaProvider:
           }
         }
         """
-        return paginate_subgraph_query(self.graph_network_url, query, entity="indexers")
+        indexers: List[dict] = paginate_subgraph_query(
+            self.graph_network_url, query, entity="indexers"
+        )
+        return indexers
 
 
 # ---------------------------------------------------------------------------

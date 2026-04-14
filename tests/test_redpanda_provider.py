@@ -5,7 +5,6 @@ Tests use the path-insertion pattern established in test_compute_scores_job.py
 so that imports resolve correctly without installing the cronjob package.
 """
 
-import json
 import os
 import sys
 from concurrent.futures import Executor, Future
@@ -15,6 +14,7 @@ from typing import Dict, List
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
 
 
 class _InlineExecutor(Executor):
@@ -257,7 +257,9 @@ class TestProtobufRoundTrip:
 # ---------------------------------------------------------------------------
 
 
-class TestScoresFileIO:
+class TestScoresPush:
+    """Tests for the HTTP push path — write_scores POSTs to iisa, idempotency uses GET."""
+
     def _make_scores_df(self, today: bool = True) -> pd.DataFrame:
         """Build a minimal scores DataFrame."""
         computed_at = (
@@ -277,59 +279,122 @@ class TestScoresFileIO:
             ]
         )
 
-    def test_write_scores_creates_file(self, tmp_path):
+    def _build_provider(self, iisa_url: str = "http://iisa:8080") -> RedpandaProvider:
+        with patch.dict(
+            os.environ,
+            {
+                "REDPANDA_BOOTSTRAP_SERVERS": "localhost:9092",
+                "IISA_API_URL": iisa_url,
+                "IISA_PUSH_TOKEN": "test-token",
+            },
+        ):
+            return RedpandaProvider()
+
+    def test_write_scores_posts_to_iisa(self):
+        """write_scores should POST a JSON array to IISA_API_URL/scores with bearer auth."""
         # Arrange
-        scores_path = str(tmp_path / "scores" / "indexer_scores.json")
-        provider = RedpandaProvider.__new__(RedpandaProvider)
-        provider._scores_path = scores_path
+        provider = self._build_provider()
 
         # Act
-        provider.write_scores(self._make_scores_df())
+        with patch("iisa_client.requests.request") as mock_request:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"status": "success", "rows": 1}
+            mock_request.return_value = mock_response
 
-        # Assert
-        assert Path(scores_path).exists()
-        with open(scores_path) as f:
-            data = json.load(f)
-        assert len(data) == 1
-        assert data[0]["indexer"] == EXPECTED_INDEXER
+            provider.write_scores(self._make_scores_df())
 
-    def test_scores_exist_for_today_true(self, tmp_path):
+        # Assert — one POST against /scores with the bearer header
+        mock_request.assert_called_once()
+        call = mock_request.call_args
+        assert call.args[0] == "POST"
+        assert call.args[1] == "http://iisa:8080/scores"
+        assert call.kwargs["headers"]["Authorization"] == "Bearer test-token"
+        assert call.kwargs["headers"]["Content-Type"] == "application/json"
+
+        body = call.kwargs["json"]
+        assert isinstance(body, list)
+        assert len(body) == 1
+        assert body[0]["indexer"] == EXPECTED_INDEXER
+
+    def test_write_scores_raises_on_exhausted_retries(self):
+        """All-retries-exhausted should raise IISAPushError with the expected call count."""
+        import requests
+        from iisa_client import RETRY_ATTEMPTS, IISAPushError
+
+        provider = self._build_provider()
+
+        with (
+            patch("iisa_client.requests.request") as mock_request,
+            patch("iisa_client.time.sleep") as mock_sleep,
+        ):
+            mock_request.side_effect = requests.ConnectionError("refused")
+
+            with pytest.raises(IISAPushError) as exc_info:
+                provider.write_scores(self._make_scores_df())
+
+        # Exactly RETRY_ATTEMPTS calls were made, and one sleep fewer than
+        # that (no sleep after the final failing attempt).
+        assert mock_request.call_count == RETRY_ATTEMPTS
+        assert mock_sleep.call_count == RETRY_ATTEMPTS - 1
+        assert f"{RETRY_ATTEMPTS} attempts" in str(exc_info.value)
+
+    def test_scores_exist_for_today_true(self):
+        """GET /scores/status returning today's computed_at ⇒ skip recompute."""
         # Arrange
-        scores_path = str(tmp_path / "indexer_scores.json")
-        provider = RedpandaProvider.__new__(RedpandaProvider)
-        provider._scores_path = scores_path
-        provider.write_scores(self._make_scores_df(today=True))
+        provider = self._build_provider()
+        today_iso = datetime.now(timezone.utc).isoformat()
 
-        # Act / Assert
-        assert provider.scores_exist_for_today() is True
+        # Act
+        with patch("iisa_client.requests.request") as mock_request:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"computed_at": today_iso, "rows": 1}
+            mock_request.return_value = mock_response
 
-    def test_scores_exist_for_today_false_old_file(self, tmp_path):
-        # Arrange
-        scores_path = str(tmp_path / "indexer_scores.json")
-        provider = RedpandaProvider.__new__(RedpandaProvider)
-        provider._scores_path = scores_path
-        provider.write_scores(self._make_scores_df(today=False))
+            assert provider.scores_exist_for_today() is True
 
-        # Act / Assert
-        assert provider.scores_exist_for_today() is False
+        # Assert — GET with bearer auth
+        call = mock_request.call_args
+        assert call.args[0] == "GET"
+        assert call.args[1] == "http://iisa:8080/scores/status"
+        assert call.kwargs["headers"]["Authorization"] == "Bearer test-token"
 
-    def test_scores_exist_for_today_false_missing_file(self, tmp_path):
-        # Arrange
-        provider = RedpandaProvider.__new__(RedpandaProvider)
-        provider._scores_path = str(tmp_path / "nonexistent.json")
+    def test_scores_exist_for_today_false_old_timestamp(self):
+        """Pre-today computed_at ⇒ run again."""
+        provider = self._build_provider()
+        old_iso = datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()
 
-        # Act / Assert
-        assert provider.scores_exist_for_today() is False
+        with patch("iisa_client.requests.request") as mock_request:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"computed_at": old_iso, "rows": 1}
+            mock_request.return_value = mock_response
 
-    def test_write_scores_atomic(self, tmp_path):
-        """write_scores must not leave a .tmp file on disk."""
-        scores_path = str(tmp_path / "indexer_scores.json")
-        provider = RedpandaProvider.__new__(RedpandaProvider)
-        provider._scores_path = scores_path
-        provider.write_scores(self._make_scores_df())
+            assert provider.scores_exist_for_today() is False
 
-        assert not Path(scores_path + ".tmp").exists()
-        assert Path(scores_path).exists()
+    def test_scores_exist_for_today_false_on_push_error(self):
+        """Network failure on the status query ⇒ proceed with a fresh run (fail-safe)."""
+        import requests
+
+        provider = self._build_provider()
+
+        with patch("iisa_client.requests.request") as mock_request, patch("iisa_client.time.sleep"):
+            mock_request.side_effect = requests.ConnectionError("dns lookup failed")
+
+            assert provider.scores_exist_for_today() is False
+
+    def test_scores_exist_for_today_false_missing_computed_at(self):
+        """Empty/missing computed_at ⇒ proceed with a fresh run."""
+        provider = self._build_provider()
+
+        with patch("iisa_client.requests.request") as mock_request:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"computed_at": None, "rows": 0}
+            mock_request.return_value = mock_response
+
+            assert provider.scores_exist_for_today() is False
 
 
 # ---------------------------------------------------------------------------

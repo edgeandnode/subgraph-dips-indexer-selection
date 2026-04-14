@@ -22,8 +22,8 @@ import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.request import Request, urlopen
 
+from iisa_client import IISAPushError, get_push_token
 from processing import compute_all_scores, compute_degraded_scores, validate_geoip_databases
 from redpanda import RedpandaProvider
 
@@ -38,9 +38,10 @@ NUM_DAYS = int(os.environ.get("NUM_DAYS", "28"))
 TARGET_ROWS = int(os.environ.get("TARGET_ROWS", "20000000"))
 SCORING_INTERVAL = int(os.environ.get("SCORING_INTERVAL", "86400"))
 HTTP_PORT = int(os.environ.get("SCORING_HTTP_PORT", "9090"))
-SCORES_FILE_PATH = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_scores.json")
 GRAPH_NETWORK_SUBGRAPH_URL = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
 IISA_API_URL = os.environ.get("IISA_API_URL", "")
+IISA_REQUIRE_PUSH_TOKEN = os.environ.get("IISA_REQUIRE_PUSH_TOKEN", "").lower() == "true"
+IISA_PUSH_TOKEN = get_push_token()
 
 
 class ConfigurationError(Exception):
@@ -70,7 +71,7 @@ DEGRADED_THRESHOLD = int(os.environ.get("DEGRADED_ALERT_THRESHOLD", "3"))
 
 
 def _handle_signal(signum, frame):
-    logger.info(f"Received signal {signum}, shutting down")
+    logger.info("Received signal %d, shutting down", signum)
     _shutdown.set()
     _run_event.set()
 
@@ -95,9 +96,12 @@ def validate_configuration() -> None:
     if not os.environ.get("REDPANDA_BOOTSTRAP_SERVERS"):
         errors.append("REDPANDA_BOOTSTRAP_SERVERS is required")
 
+    if not IISA_API_URL:
+        errors.append("IISA_API_URL is required")
+
     if errors:
         for error in errors:
-            logger.error(f"Configuration error: {error}")
+            logger.error("Configuration error: %s", error)
         raise ConfigurationError(f"Found {len(errors)} configuration error(s)")
 
     logger.info("Configuration validation passed")
@@ -111,24 +115,6 @@ def get_peak_memory_mb() -> float:
     return usage / 1024
 
 
-def _refresh_iisa_scores() -> None:
-    """Trigger the IISA API to reload scores from disk.
-
-    Best-effort: logs a warning on failure but never raises.  Skipped when
-    IISA_API_URL is not configured.
-    """
-    if not IISA_API_URL:
-        return
-    url = f"{IISA_API_URL.rstrip('/')}/refresh"
-    try:
-        req = Request(url, data=b"", method="POST")
-        with urlopen(req, timeout=5) as resp:
-            body = json.loads(resp.read())
-            logger.info(f"IISA refresh succeeded: {body}")
-    except Exception as e:
-        logger.warning(f"Failed to notify IISA at {url}: {e}")
-
-
 def run_scoring() -> bool:
     """Run one scoring cycle. Returns True on success."""
     global _consecutive_partial, _consecutive_degraded, _consecutive_failed
@@ -140,7 +126,7 @@ def run_scoring() -> bool:
     # Set SCORING_SEED to replay a previous run's exact sampling.
     seed = int(os.environ.get("SCORING_SEED", date.today().strftime("%Y%m%d")))
     random.seed(seed)
-    logger.info(f"RNG seed: {seed}")
+    logger.info("RNG seed: %d", seed)
 
     geoip_available = validate_geoip_databases()
     if not geoip_available:
@@ -157,7 +143,7 @@ def run_scoring() -> bool:
         start_ts = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         mode_label = "full" if geoip_available else "partial (no GeoIP)"
-        logger.info(f"Attempting {mode_label} pipeline for {start_date} to {end_date}")
+        logger.info("Attempting %s pipeline for %s to %s", mode_label, start_date, end_date)
         scores_df = compute_all_scores(
             provider=provider,
             start_date=start_date,
@@ -173,7 +159,7 @@ def run_scoring() -> bool:
         else:
             mode = MODE_FULL if geoip_available else MODE_PARTIAL
     except Exception as e:
-        logger.warning(f"Pipeline failed: {e}")
+        logger.warning("Pipeline failed: %s", e)
         scores_df = None
 
     # Degraded fallback: equal quality metrics + real pricing (no Redpanda data needed)
@@ -186,15 +172,24 @@ def run_scoring() -> bool:
             else:
                 scores_df = None
         except Exception as e:
-            logger.exception(f"Degraded scoring also failed: {e}")
+            logger.exception("Degraded scoring also failed: %s", e)
             scores_df = None
 
     elapsed = time.time() - pipeline_start
     success = scores_df is not None and not scores_df.empty
 
-    if success:
-        provider.write_scores(scores_df)
-        _refresh_iisa_scores()
+    if scores_df is not None and not scores_df.empty:
+        try:
+            provider.write_scores(scores_df)
+        except IISAPushError as e:
+            # Push failure (auth, validation, or retry exhaustion) must not
+            # escape run accounting. Mark the run failed, let the mode-specific
+            # logging fire, and return False so the scheduling loop retries
+            # at the next interval — consistent with the degraded-fallback
+            # pattern above.
+            logger.error("Failed to push scores to iisa: %s", e)
+            success = False
+            mode = MODE_FAILED
 
     # Track consecutive non-full runs (under lock — health endpoint reads these)
     with _status_lock:
@@ -219,7 +214,7 @@ def run_scoring() -> bool:
             {
                 "time": datetime.now(timezone.utc).isoformat(),
                 "success": success,
-                "indexers": len(scores_df) if success else 0,
+                "indexers": len(scores_df) if scores_df is not None else 0,
                 "elapsed_seconds": round(elapsed, 1),
                 "mode": mode,
                 "consecutive_partial": _consecutive_partial,
@@ -231,27 +226,34 @@ def run_scoring() -> bool:
     # Log outside the lock
     if mode == MODE_PARTIAL:
         logger.warning(
-            f"Scoring ran without GeoIP ({_consecutive_partial} consecutive partial run(s)). "
+            "Scoring ran without GeoIP (%d consecutive partial run(s)). "
             "Latency scores are neutral (0.5). "
-            "Install MaxMind GeoLite2 databases for full scoring."
+            "Install MaxMind GeoLite2 databases for full scoring.",
+            _consecutive_partial,
         )
     elif mode == MODE_DEGRADED:
         if _consecutive_degraded >= DEGRADED_THRESHOLD:
             logger.error(
-                f"Scoring has been degraded for {_consecutive_degraded} consecutive runs. "
+                "Scoring has been degraded for %d consecutive runs. "
                 "Full pipeline is not functioning — "
-                "investigate GeoIP databases and Redpanda data availability."
+                "investigate GeoIP databases and Redpanda data availability.",
+                _consecutive_degraded,
             )
         else:
             logger.warning(
-                f"Scoring degraded ({_consecutive_degraded}/{DEGRADED_THRESHOLD} before alert)"
+                "Scoring degraded (%d/%d before alert)",
+                _consecutive_degraded,
+                DEGRADED_THRESHOLD,
             )
     elif mode == MODE_FAILED:
-        logger.error(f"Scoring failed completely for {_consecutive_failed} consecutive runs")
+        logger.error("Scoring failed completely for %d consecutive runs", _consecutive_failed)
 
     logger.info(
-        f"Scoring complete: mode={mode}, indexers={len(scores_df) if success else 0}, "
-        f"elapsed={elapsed:.1f}s, peak_memory={get_peak_memory_mb():.0f}MB"
+        "Scoring complete: mode=%s, indexers=%d, elapsed=%.1fs, peak_memory=%.0fMB",
+        mode,
+        len(scores_df) if scores_df is not None else 0,
+        elapsed,
+        get_peak_memory_mb(),
     )
 
     return success
@@ -260,12 +262,13 @@ def run_scoring() -> bool:
 class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
-            if not os.path.exists(SCORES_FILE_PATH):
-                self._json_response(503, {"status": "waiting_for_first_run"})
-                return
             with _status_lock:
+                first_run_done = bool(_last_run)
                 degraded = _consecutive_degraded
                 failed = _consecutive_failed
+            if not first_run_done:
+                self._json_response(503, {"status": "waiting_for_first_run"})
+                return
             if failed > 0:
                 self._json_response(
                     503,
@@ -324,16 +327,21 @@ def main() -> int:
     global _next_run_time
 
     logger.info(
-        f"Score computation service starting (interval={SCORING_INTERVAL}s, http_port={HTTP_PORT})"
+        "Score computation service starting (interval=%ds, http_port=%d)",
+        SCORING_INTERVAL,
+        HTTP_PORT,
     )
 
     if IISA_API_URL:
-        logger.info(f"IISA API refresh enabled: {IISA_API_URL}")
-    else:
-        logger.warning(
-            "IISA_API_URL not set -- the IISA API will not be notified after "
-            "scores are written. Set IISA_API_URL to enable immediate score refresh."
+        logger.info("IISA push target: %s", IISA_API_URL)
+
+    if IISA_REQUIRE_PUSH_TOKEN and not IISA_PUSH_TOKEN:
+        logger.critical(
+            "IISA_REQUIRE_PUSH_TOKEN is true but IISA_PUSH_TOKEN is unset; "
+            "refusing to run. Provision the iisa-push-token Secret or "
+            "set IISA_REQUIRE_PUSH_TOKEN=false for local development."
         )
+        return 2
 
     try:
         validate_configuration()
@@ -344,7 +352,7 @@ def main() -> int:
     server = HTTPServer(("0.0.0.0", HTTP_PORT), RequestHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    logger.info(f"HTTP server listening on port {HTTP_PORT}")
+    logger.info("HTTP server listening on port %d", HTTP_PORT)
 
     # Initial scoring run
     run_scoring()

@@ -1238,3 +1238,100 @@ class TestMergeAndPrepareDataframes:
 
         # Assert - extra column preserved
         assert "extra_col" in result.columns
+
+
+# ----------------------------------------------------------------------
+# main.py: run_scoring() push-failure accounting and validate_configuration()
+# ----------------------------------------------------------------------
+
+# Import main lazily so the module-level signal handlers and env reads don't
+# fire until the first test that needs them. main is in cronjobs/compute_scores
+# which jobs_path already added to sys.path at the top of this file.
+import main  # noqa: E402
+from iisa_client import IISAPushError  # noqa: E402
+
+
+@pytest.fixture
+def reset_main_state(monkeypatch):
+    """Reset main.py module-level counters and last-run state between tests."""
+    # Snapshot current values so the fixture restores them after the test.
+    original_consecutive_failed = main._consecutive_failed
+    original_consecutive_partial = main._consecutive_partial
+    original_consecutive_degraded = main._consecutive_degraded
+    original_last_run = dict(main._last_run)
+
+    main._consecutive_failed = 0
+    main._consecutive_partial = 0
+    main._consecutive_degraded = 0
+    main._last_run.clear()
+
+    yield
+
+    main._consecutive_failed = original_consecutive_failed
+    main._consecutive_partial = original_consecutive_partial
+    main._consecutive_degraded = original_consecutive_degraded
+    main._last_run.clear()
+    main._last_run.update(original_last_run)
+
+
+class TestRunScoringPushFailure:
+    """run_scoring() must mark the run failed when IISAPushError escapes write_scores."""
+
+    def test_push_failure_marks_run_as_failed(self, reset_main_state, monkeypatch):
+        # Arrange — mock the pipeline to return a non-empty DataFrame, then have
+        # provider.write_scores raise IISAPushError. Without the try/except in
+        # run_scoring(), the exception would propagate past the status-lock block
+        # and _last_run would never update.
+        from unittest.mock import MagicMock
+
+        scores_df = pd.DataFrame(
+            {
+                "indexer": ["0xAAA"],
+                "url": ["https://a.example"],
+                "lat_lin_reg_coefficient": [0.5],
+            }
+        )
+
+        mock_provider = MagicMock()
+        mock_provider.write_scores.side_effect = IISAPushError("retries exhausted")
+
+        monkeypatch.setattr(main, "RedpandaProvider", lambda: mock_provider)
+        monkeypatch.setattr(main, "validate_geoip_databases", lambda: True)
+        monkeypatch.setattr(
+            main,
+            "compute_all_scores",
+            lambda **kwargs: scores_df,
+        )
+
+        # Act
+        result = main.run_scoring()
+
+        # Assert — run is marked failed, not silently successful with stale counters
+        assert result is False
+        assert main._consecutive_failed == 1
+        assert main._last_run["mode"] == main.MODE_FAILED
+        assert main._last_run["success"] is False
+        mock_provider.write_scores.assert_called_once()
+
+
+class TestValidateConfigurationIISAURL:
+    """validate_configuration() must fail fast when IISA_API_URL is unset."""
+
+    def test_missing_iisa_api_url_raises_configuration_error(self, monkeypatch):
+        # Arrange — satisfy REDPANDA_BOOTSTRAP_SERVERS so only IISA_API_URL trips.
+        monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setattr(main, "IISA_API_URL", "")
+
+        # Act / Assert
+        with pytest.raises(main.ConfigurationError) as exc_info:
+            main.validate_configuration()
+
+        assert "configuration error" in str(exc_info.value).lower()
+
+    def test_present_iisa_api_url_passes(self, monkeypatch):
+        # Arrange — all required config set.
+        monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setattr(main, "IISA_API_URL", "http://iisa.example:8080")
+
+        # Act / Assert — should not raise
+        main.validate_configuration()

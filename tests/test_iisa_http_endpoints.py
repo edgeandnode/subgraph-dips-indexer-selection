@@ -2,6 +2,7 @@
 
 import json
 import os
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -330,19 +331,22 @@ class TestIISAState:
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
-    """Reset global state before each test."""
-    # Clear settings cache before test
+def reset_state(monkeypatch):
+    """Reset global state and clean push-token env vars before each test.
+
+    The module-level _state singleton and the lru_cache on get_settings
+    otherwise leak between tests. Env vars set via monkeypatch.setenv in
+    one test (e.g. IISA_PUSH_TOKEN) must not be visible to the next.
+    """
     from iisa import iisa_http_endpoints
 
+    monkeypatch.delenv("IISA_PUSH_TOKEN", raising=False)
+    monkeypatch.delenv("IISA_REQUIRE_PUSH_TOKEN", raising=False)
     iisa_http_endpoints.get_settings.cache_clear()
-
-    # Reset state
     iisa_http_endpoints._state = iisa_http_endpoints.IISAState()
 
     yield
 
-    # Clean up after test
     iisa_http_endpoints._state = iisa_http_endpoints.IISAState()
     iisa_http_endpoints.get_settings.cache_clear()
 
@@ -410,73 +414,283 @@ class TestHealthEndpoint:
         assert data["data_loaded"] is False
 
 
-class TestRefreshEndpoint:
-    """Tests for POST /refresh endpoint."""
+class TestPushScoresEndpoint:
+    """Tests for POST /scores endpoint (cronjob → iisa push)."""
+
+    @staticmethod
+    def _sample_payload():
+        return [
+            {
+                "indexer": "0xABC",
+                "computed_at": "2026-04-14T09:00:00+00:00",
+                "lat_normalized_score": 0.8,
+                "uptime_score": 0.95,
+                "success_rate": 0.99,
+            }
+        ]
 
     @patch("iisa.iisa_http_endpoints.DataManager")
     @patch("iisa.iisa_http_endpoints.FileScoreLoader")
-    def test_refresh_success(self, mock_loader_class, mock_dm_class, mock_history_df):
-        """Mock refresh_data()=True, verify 200 with row count."""
-        # Arrange
-        from iisa import iisa_http_endpoints
+    def test_push_scores_success(self, mock_loader_class, mock_dm_class, tmp_path, monkeypatch):
+        """Valid body + no auth required (unset token) → 200 with row count."""
+        from iisa import iisa_http_endpoints, score_loader
         from iisa.iisa_http_endpoints import Settings, app
 
+        scores_path = str(tmp_path / "scores.json")
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", scores_path)
+
         mock_dm_instance = MagicMock()
-        mock_dm_instance.load_scores.return_value = True
-        mock_dm_instance.get_data.return_value = mock_history_df
+        mock_dm_instance.scores_file_path = scores_path
+        mock_dm_instance.load_scores_from_df.return_value = True
+        mock_dm_instance.get_data.return_value = pd.DataFrame({"indexer": ["0xABC"]})
         mock_dm_class.return_value = mock_dm_instance
 
-        settings = Settings()
+        settings = Settings()  # push_token unset in test env
         iisa_http_endpoints._state.initialize(settings)
 
         client = TestClient(app, raise_server_exceptions=False)
+        response = client.post("/scores", json=self._sample_payload())
 
-        # Act
-        response = client.post("/refresh")
-
-        # Assert
         assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "success"
-        assert data["rows"] == 3
+        body = response.json()
+        assert body["status"] == "success"
+        assert body["rows"] == 1
+        # Disk was written atomically
+        assert (tmp_path / "scores.json").exists()
 
-    def test_refresh_not_initialized(self):
-        """_initialized=False, verify 503 Service Unavailable."""
-        # Arrange
-        from iisa.iisa_http_endpoints import app
-
-        client = TestClient(app, raise_server_exceptions=False)
-
-        # Act
-        response = client.post("/refresh")
-
-        # Assert
-        assert response.status_code == 503
-        assert "not initialized" in response.json()["detail"]
-
-    @patch("iisa.iisa_http_endpoints.DataManager")
-    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
-    def test_refresh_failure(self, mock_loader_class, mock_dm_class):
-        """Mock refresh_data()=False, verify 500 Internal Server Error."""
-        # Arrange
+    def test_push_scores_empty_body_rejected(self):
+        """Empty payload → 422."""
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import Settings, app
 
-        mock_dm_instance = MagicMock()
-        mock_dm_instance.load_scores.return_value = False
-        mock_dm_class.return_value = mock_dm_instance
-
-        settings = Settings()
-        iisa_http_endpoints._state.initialize(settings)
-
+        iisa_http_endpoints._state.initialize(Settings())
         client = TestClient(app, raise_server_exceptions=False)
 
-        # Act
-        response = client.post("/refresh")
+        response = client.post("/scores", json=[])
+        assert response.status_code == 422
 
-        # Assert
+    def test_push_scores_rejects_missing_token_when_required(self, monkeypatch):
+        """IISA_PUSH_TOKEN set + no header → 401."""
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post("/scores", json=self._sample_payload())
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Missing or malformed Authorization header"
+
+    def test_push_scores_rejects_wrong_token(self, monkeypatch):
+        """IISA_PUSH_TOKEN set + wrong bearer → 401."""
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/scores",
+            json=self._sample_payload(),
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert response.status_code == 401
+        assert "Invalid" in response.json()["detail"]
+
+    @patch("iisa.iisa_http_endpoints.DataManager")
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_push_scores_transform_failure_does_not_touch_disk(
+        self, mock_loader_class, mock_dm_class, tmp_path, monkeypatch
+    ):
+        """
+        Dry-run invariant: if transform_scores_df raises, the cache file
+        must NOT be written. A restart should still load the previous
+        valid payload, not a poisoned one.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
+
+        # Transform raises — simulates a schema-invalid payload.
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.scores_file_path = str(scores_path)
+        mock_dm_instance.transform_scores_df.side_effect = KeyError("missing column")
+        mock_dm_class.return_value = mock_dm_instance
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post("/scores", json=self._sample_payload())
+
+        # Handler 500s on the transform failure.
         assert response.status_code == 500
-        assert "Failed to refresh" in response.json()["detail"]
+        # Critical invariant: disk was never touched. commit_scores was also
+        # never called — memory and disk both untouched by the failed push.
+        assert not scores_path.exists()
+        mock_dm_instance.commit_scores.assert_not_called()
+
+    @patch("iisa.iisa_http_endpoints.DataManager")
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_push_scores_accepts_valid_token(
+        self, mock_loader_class, mock_dm_class, tmp_path, monkeypatch
+    ):
+        """IISA_PUSH_TOKEN set + matching bearer → 200."""
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = str(tmp_path / "scores.json")
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", scores_path)
+        iisa_http_endpoints.get_settings.cache_clear()
+
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.scores_file_path = scores_path
+        mock_dm_instance.load_scores_from_df.return_value = True
+        mock_dm_instance.get_data.return_value = pd.DataFrame({"indexer": ["0xABC"]})
+        mock_dm_class.return_value = mock_dm_instance
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/scores",
+            json=self._sample_payload(),
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert response.status_code == 200
+
+    @patch("iisa.iisa_http_endpoints.DataManager")
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_push_scores_accepts_lowercase_bearer(
+        self, mock_loader_class, mock_dm_class, tmp_path, monkeypatch
+    ):
+        """RFC 6750 §2.1: the scheme prefix is case-insensitive."""
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = str(tmp_path / "scores.json")
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", scores_path)
+        iisa_http_endpoints.get_settings.cache_clear()
+
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.scores_file_path = scores_path
+        mock_dm_instance.get_data.return_value = pd.DataFrame({"indexer": ["0xABC"]})
+        mock_dm_class.return_value = mock_dm_instance
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/scores",
+            json=self._sample_payload(),
+            headers={"Authorization": "bearer secret"},
+        )
+        assert response.status_code == 200
+
+    @patch("iisa.iisa_http_endpoints.DataManager")
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_push_scores_unparseable_computed_at_coerces_to_nat(
+        self, mock_loader_class, mock_dm_class, tmp_path, monkeypatch
+    ):
+        """
+        A payload whose computed_at is not a valid timestamp should still
+        succeed: the push path parses with errors="coerce", which turns
+        bad values into NaT, which _extract_computed_at normalises to None.
+        The computed_at on /scores/status should then be null.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = str(tmp_path / "scores.json")
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", scores_path)
+
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.scores_file_path = scores_path
+        mock_dm_instance._scores_computed_at = None
+        mock_dm_instance.get_data.return_value = pd.DataFrame({"indexer": ["0xABC"]})
+
+        def _commit(transformed_df, computed_at):
+            mock_dm_instance._scores_computed_at = computed_at
+
+        mock_dm_instance.commit_scores.side_effect = _commit
+        mock_dm_class.return_value = mock_dm_instance
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        payload = [
+            {
+                "indexer": "0xABC",
+                "computed_at": "not a real timestamp",
+                "lat_normalized_score": 0.8,
+                "uptime_score": 0.95,
+                "success_rate": 0.99,
+            }
+        ]
+
+        response = client.post("/scores", json=payload)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["rows"] == 1
+
+        # commit_scores was called with computed_at=None because the
+        # malformed timestamp was coerced to NaT and normalised to None.
+        commit_call = mock_dm_instance.commit_scores.call_args
+        assert commit_call is not None
+        assert commit_call.args[1] is None
+
+        # /scores/status reflects the None computed_at.
+        status_response = client.get("/scores/status")
+        assert status_response.status_code == 200
+        assert status_response.json()["computed_at"] is None
+
+
+class TestScoresStatusEndpoint:
+    """Tests for GET /scores/status endpoint (cronjob idempotency check)."""
+
+    def test_returns_computed_at_when_loaded(self, monkeypatch):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+
+        # Seed state with a fake DataManager that has a computed_at
+        mock_dm = MagicMock()
+        mock_dm._scores_computed_at = datetime(2026, 4, 14, 9, 0, tzinfo=timezone.utc)
+        iisa_http_endpoints._state.data_manager = mock_dm
+        iisa_http_endpoints._state._history = pd.DataFrame({"indexer": ["0xABC"]})
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get("/scores/status")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["computed_at"] is not None
+        assert "2026-04-14" in body["computed_at"]
+        assert body["rows"] == 1
+
+    def test_returns_null_when_no_scores_loaded(self):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.get("/scores/status")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["computed_at"] is None
+        assert body["rows"] == 0
 
 
 class TestGetScoreEndpoint:
@@ -991,53 +1205,136 @@ class TestSelectWithProcessor:
         assert call_kwargs["synced_indexers"] == set()
 
 
-class TestRefreshSyncStatusEndpoint:
-    """Tests for POST /refresh-sync-status endpoint."""
+class TestPushSyncStatusEndpoint:
+    """Tests for POST /sync-status endpoint (fetcher → iisa push)."""
 
-    def test_refresh_sync_status_success(self):
-        """Verify refresh returns indexer and deployment counts."""
+    @staticmethod
+    def _sample_payload():
+        return {
+            "0xAAA": {
+                "deployments": ["QmDeploy1"],
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+            }
+        }
+
+    def test_push_sync_status_success(self, tmp_path, monkeypatch):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        settings = Settings()
+        # Redirect the sync-status cache path into tmp_path
+        settings.sync_status_file_path = str(tmp_path / "sync_status.json")
+        iisa_http_endpoints._state.initialize(settings)
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post("/sync-status", json=self._sample_payload())
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "success"
+        assert body["indexers"] == 1
+        assert (tmp_path / "sync_status.json").exists()
+
+    def test_push_sync_status_empty_object_accepted(self, tmp_path, monkeypatch):
+        """Empty dict payload (no indexers synced) should be accepted."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        settings = Settings()
+        settings.sync_status_file_path = str(tmp_path / "sync_status.json")
+        iisa_http_endpoints._state.initialize(settings)
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post("/sync-status", json={})
+        assert response.status_code == 200
+        assert response.json()["indexers"] == 0
+
+    def test_push_sync_status_rejects_wrong_token(self, monkeypatch):
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/sync-status",
+            json=self._sample_payload(),
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert response.status_code == 401
+
+
+class TestRequirePushTokenStartup:
+    """Tests for the IISA_REQUIRE_PUSH_TOKEN hard-fail gate on lifespan."""
+
+    def test_startup_fails_when_required_and_token_missing(self, monkeypatch):
+        """IISA_REQUIRE_PUSH_TOKEN=true + unset token → RuntimeError at startup."""
+        monkeypatch.setenv("IISA_REQUIRE_PUSH_TOKEN", "true")
+        monkeypatch.delenv("IISA_PUSH_TOKEN", raising=False)
+
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import app
 
-        mock_sync = MagicMock()
-        mock_sync.total_indexers = 5
-        mock_sync.total_deployments = 100
-        iisa_http_endpoints._state._sync_status = mock_sync
-        iisa_http_endpoints._state.settings = MagicMock()
+        iisa_http_endpoints.get_settings.cache_clear()
 
-        with patch.object(
-            iisa_http_endpoints._state,
-            "refresh_sync_status",
-            return_value=True,
-        ):
-            client = TestClient(app, raise_server_exceptions=False)
-            response = client.post("/refresh-sync-status")
+        # TestClient's context manager runs lifespan on __enter__. The
+        # RuntimeError from the gate surfaces there.
+        with pytest.raises(RuntimeError, match="IISA_PUSH_TOKEN is required"):
+            with TestClient(app) as _client:
+                pass
 
-        assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "success"
-        assert data["indexers"] == 5
-        assert data["deployments"] == 100
+    @patch("iisa.iisa_http_endpoints.DataManager")
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_startup_succeeds_when_required_and_token_set(
+        self, mock_loader_class, mock_dm_class, monkeypatch
+    ):
+        """IISA_REQUIRE_PUSH_TOKEN=true + token set → service starts normally."""
+        monkeypatch.setenv("IISA_REQUIRE_PUSH_TOKEN", "true")
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
 
-        # Cleanup
-        iisa_http_endpoints._state._sync_status = None
-
-    def test_refresh_sync_status_no_data(self):
-        """Verify refresh returns no_data when file not found."""
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import app
 
-        with patch.object(
-            iisa_http_endpoints._state,
-            "refresh_sync_status",
-            return_value=False,
-        ):
-            client = TestClient(app, raise_server_exceptions=False)
-            response = client.post("/refresh-sync-status")
+        iisa_http_endpoints.get_settings.cache_clear()
 
-        assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "no_data"
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.load_scores.return_value = False  # empty cache is fine
+        mock_dm_class.return_value = mock_dm_instance
+
+        with TestClient(app) as client:
+            response = client.get("/health")
+            assert response.status_code == 200
+
+    @patch("iisa.iisa_http_endpoints.DataManager")
+    @patch("iisa.iisa_http_endpoints.FileScoreLoader")
+    def test_startup_warns_when_not_required_and_token_missing(
+        self, mock_loader_class, mock_dm_class, monkeypatch, caplog
+    ):
+        """No require flag, no token → startup WARNING, service accepts requests."""
+        import logging
+
+        monkeypatch.delenv("IISA_REQUIRE_PUSH_TOKEN", raising=False)
+        monkeypatch.delenv("IISA_PUSH_TOKEN", raising=False)
+
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.load_scores.return_value = False
+        mock_dm_class.return_value = mock_dm_instance
+
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            with TestClient(app) as client:
+                response = client.get("/health")
+                assert response.status_code == 200
+
+        assert any("IISA_PUSH_TOKEN is not set" in rec.message for rec in caplog.records)
 
 
 class TestExtractChainPrice:

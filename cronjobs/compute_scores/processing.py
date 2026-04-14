@@ -138,7 +138,7 @@ GEOIP_DST_COLUMN_MAPPING = _geoip_column_mapping("dst")
 GEOIP_SRC_COLUMN_MAPPING = _geoip_column_mapping("src")
 
 
-def _empty_geoip_result(ip_addr: str = None) -> dict:
+def _empty_geoip_result(ip_addr: Optional[str] = None) -> dict:
     """Return a GeoIP result dict with optional ip_addr and None for other fields."""
     return {"ip_addr": ip_addr, "org": None, "country": None, "latitude": None, "longitude": None}
 
@@ -215,7 +215,8 @@ async def _fetch_single_dips_info_async(
                         message=f"Server error {resp.status}",
                     )
                 resp.raise_for_status()
-                return await resp.json()
+                body: dict = await resp.json()
+                return body
 
     last_error: Optional[Exception] = None
     for attempt in range(DIPS_INFO_MAX_RETRIES):
@@ -566,7 +567,8 @@ def normalize_to_0_1(series: pd.Series) -> pd.Series:
     max_val = series.max()
     if max_val == min_val:
         return pd.Series([0.5] * len(series))
-    return (series - min_val) / (max_val - min_val)
+    normalized: pd.Series = (series - min_val) / (max_val - min_val)
+    return normalized
 
 
 def normalize_to_0_1_inverted(series: pd.Series) -> pd.Series:
@@ -720,7 +722,8 @@ def adjust_rows(initial_query_results: pd.DataFrame, target_rows: int) -> int:
             x = int(x * 1.01)
         df["num_rows_restricted"] = df["num_rows"].clip(upper=x)
 
-    result = df["num_rows_restricted"].max()
+    max_val = df["num_rows_restricted"].max()
+    result = 0 if pd.isna(max_val) else int(max_val)
     logger.info(f"Calculated target rows per subgraph: {result}")
     return result
 
@@ -1060,19 +1063,24 @@ def aggregate_indexer_info(df: pd.DataFrame) -> pd.DataFrame:
     def round_to_20(x):
         return x if pd.isna(x) else round(x / 20) * 20
 
-    def first_non_null(x):
+    def first_non_null(x: pd.Series):
         """Return first non-null value, or NaN if all null."""
         non_null = x.dropna()
         return non_null.iloc[0] if len(non_null) > 0 else np.nan
+
+    def first_mode(x: pd.Series):
+        """Return the most common value, or NaN if the series is empty."""
+        modes = x.mode()
+        return modes[0] if not modes.empty else np.nan
 
     agg_df = (
         df.groupby("indexer")
         .agg(
             {
                 "url": first_non_null,  # Take first non-null URL for this indexer
-                "org": lambda x: x.mode()[0] if not x.mode().empty else np.nan,
-                "dst_lat": lambda x: x.mode()[0] if not x.mode().empty else np.nan,
-                "dst_lon": lambda x: x.mode()[0] if not x.mode().empty else np.nan,
+                "org": first_mode,
+                "dst_lat": first_mode,
+                "dst_lon": first_mode,
             }
         )
         .reset_index()

@@ -33,8 +33,17 @@ class FileScoreLoader:
     reads them back.
     """
 
-    def __init__(self, scores_file_path: str = SCORES_FILE_PATH) -> None:
-        self._path = scores_file_path
+    def __init__(self, scores_file_path: Optional[str] = None) -> None:
+        # Read the module-level default at call time (not definition time) so
+        # tests can monkeypatch `score_loader.SCORES_FILE_PATH` and have new
+        # instances pick it up. Default capture at def-time would lock in
+        # whatever value was present at module import.
+        self._path = scores_file_path if scores_file_path is not None else SCORES_FILE_PATH
+
+    @property
+    def path(self) -> str:
+        """The filesystem path this loader reads from and the push handler writes to."""
+        return self._path
 
     def fetch_indexer_scores(self) -> Tuple[pd.DataFrame, Optional[datetime]]:
         """
@@ -88,6 +97,18 @@ class DataManager:
         self._data: Optional[pd.DataFrame] = None
         self._scores_computed_at: Optional[datetime] = None
 
+    @property
+    def scores_file_path(self) -> Optional[str]:
+        """
+        The on-disk path of the underlying file-backed provider, if any.
+
+        Returns None if the provider has no .path attribute — e.g. a future
+        non-FileScoreLoader provider that doesn't persist to a single file.
+        Callers in the push path must guard for None before attempting to
+        write to disk.
+        """
+        return getattr(self._provider, "path", None)
+
     def load_scores(self) -> bool:
         """
         Load pre-computed indexer scores from the configured provider.
@@ -108,6 +129,69 @@ class DataManager:
         self._data = self._transform_scores_to_perf_history(scores_df)
 
         logger.info(f"Loaded scores for {len(self._data)} indexers")
+        return True
+
+    def transform_scores_df(self, scores_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Pure transform: run the same column mapping as load_scores() and
+        return the result without touching self._data or
+        self._scores_computed_at.
+
+        Used by the push path (POST /scores) to dry-run the transform
+        before committing anything to disk or in-memory state. A transform
+        failure raised here surfaces as an HTTP error with no side effects,
+        so a malformed payload can never poison the cache.
+
+        :raises ValueError: if the input DataFrame is empty.
+        :raises Exception: if the transform fails (e.g. missing columns).
+        """
+        if scores_df.empty:
+            raise ValueError("transform_scores_df called with empty DataFrame")
+        return self._transform_scores_to_perf_history(scores_df)
+
+    def commit_scores(
+        self,
+        transformed_df: pd.DataFrame,
+        computed_at: Optional[datetime],
+    ) -> None:
+        """
+        Commit an already-transformed scores DataFrame to in-memory state.
+
+        Callers must have run transform_scores_df() on the raw input first;
+        this method only updates self._data + self._scores_computed_at and
+        logs staleness. Split out from load_scores_from_df so the push
+        handler can validate-then-write-disk-then-commit in three distinct
+        steps instead of two coupled ones.
+        """
+        self._scores_computed_at = computed_at
+        self._check_scores_staleness(computed_at)
+        self._data = transformed_df
+        logger.info("Committed %d scores to in-memory state", len(transformed_df))
+
+    def load_scores_from_df(
+        self,
+        scores_df: pd.DataFrame,
+        computed_at: Optional[datetime],
+    ) -> bool:
+        """
+        Load scores from an already-parsed DataFrame in one step.
+
+        Facade over transform_scores_df + commit_scores. Kept for the
+        non-push path and for backwards compatibility with existing
+        callers that want the transform-and-commit semantics without
+        the intermediate dry-run. The push handler uses the split
+        methods directly.
+
+        :return: True if scores were accepted, False if the DataFrame was empty.
+        """
+        if scores_df.empty:
+            logger.warning("load_scores_from_df called with empty DataFrame")
+            self._data = None
+            self._scores_computed_at = None
+            return False
+
+        transformed = self.transform_scores_df(scores_df)
+        self.commit_scores(transformed, computed_at)
         return True
 
     def _transform_scores_to_perf_history(self, scores_df: pd.DataFrame) -> pd.DataFrame:
