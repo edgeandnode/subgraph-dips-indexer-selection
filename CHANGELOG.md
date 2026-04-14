@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.0.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.0.0...v2.0.1) (2026-04-14)
+
+
+### Changed
+
+* **k8s:** update cronjob image to sha-fa79810 ([#125](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/125)) ([328fb13](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/328fb139566e9d9ecc1df3e10f3d0a0cd9835c11))
+
+
+### CI/CD
+
+* bump deprecated github actions off node 20 runtime ([#123](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/123)) ([fa79810](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/fa7981053a221742459c6609cbb4b85b1dfc931a))
+
 ## [2.0.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v1.1.1...v2.0.0) (2026-04-14)
 
 
