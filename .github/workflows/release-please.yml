@@ -49,4 +49,21 @@ jobs:
           fi
 
       - uses: google-github-actions/release-please-action@v4
+        id: release
         if: steps.check-sync.outputs.skip != 'true'
+
+      # When release-please actually cuts a release (rather than just updating
+      # the release PR), emit a repository_dispatch event so build-release-image.yml
+      # fires. GitHub suppresses workflow triggers for events initiated by
+      # GITHUB_TOKEN, with repository_dispatch as one of two documented exceptions —
+      # so this bridge is what makes the versioned image actually build on every
+      # release without a PAT or manual workflow_dispatch.
+      - name: Trigger release image build
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+        run: |
+          gh api "repos/${{ github.repository }}/dispatches" \
+            -f event_type=release-created \
+            -F "client_payload[tag]=$TAG_NAME"
