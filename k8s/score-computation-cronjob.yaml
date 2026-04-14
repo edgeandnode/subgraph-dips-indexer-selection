@@ -31,7 +31,7 @@ spec:
           - name: github-registry-secret
           containers:
           - name: compute-scores
-            image: ghcr.io/edgeandnode/subgraph-dips-indexer-selection-cronjob:latest
+            image: ghcr.io/edgeandnode/subgraph-dips-indexer-selection-cronjob:sha-57a965b
             imagePullPolicy: Always
             resources:
               requests:
