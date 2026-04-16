@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.2](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.0.1...v2.0.2) (2026-04-16)
+
+
+### Fixed
+
+* **k8s:** add imagePullSecrets to iisa Deployment ([#126](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/126)) ([5e1bc7f](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/5e1bc7fb04a0c14c90d6e3119170b34d43d4e0fc))
+
 ## [2.0.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.0.0...v2.0.1) (2026-04-14)
 
 
