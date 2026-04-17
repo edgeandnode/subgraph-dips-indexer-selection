@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import random
+import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from datetime import date, datetime, timezone
@@ -47,6 +48,13 @@ from tenacity import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Interval for partition worker progress heartbeats. Workers run in child
+# processes during pass 1 (count) and pass 2 (sample); both passes are
+# otherwise silent until complete, which makes minutes-long runs indistinguishable
+# from a stuck worker. Printing directly to stdout is intentional — Python's
+# logger config doesn't propagate to ProcessPoolExecutor children.
+PROGRESS_LOG_INTERVAL_SEC = 120
 
 # Cap parallel partition consumers to avoid unbounded thread/connection creation.
 # The CronJob runs with 8 CPUs; one consumer per core saturates throughput
@@ -102,6 +110,7 @@ def _count_partition_worker(args: tuple) -> tuple:
     total_messages = 0
     filtered_count = 0
     consecutive_empty = 0
+    last_progress_log = time.monotonic()
 
     try:
         consumer.assign([TopicPartition(topic, partition, offset)])
@@ -146,6 +155,15 @@ def _count_partition_worker(args: tuple) -> tuple:
                     if len(dep_bytes) == 32 and len(idx_bytes) == 20:
                         counts[(dep_bytes, idx_bytes)] += 1
                         fees[idx_bytes] += attempt.fee_grt
+
+            now = time.monotonic()
+            if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
+                print(
+                    f"[count p{partition}] {total_messages:,} msgs "
+                    f"({filtered_count:,} filtered), {len(counts)} pairs",
+                    flush=True,
+                )
+                last_progress_log = now
     finally:
         consumer.close()
 
@@ -170,7 +188,9 @@ def _sample_partition_worker(args: tuple) -> tuple:
     reservoirs: Dict[Tuple[bytes, bytes], List[dict]] = defaultdict(list)
     counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
     filtered_count = 0
+    total_messages = 0
     consecutive_empty = 0
+    last_progress_log = time.monotonic()
 
     try:
         consumer.assign([TopicPartition(topic, partition, offset)])
@@ -196,6 +216,8 @@ def _sample_partition_worker(args: tuple) -> tuple:
 
                 if ts_ms > end_ts_ms:
                     return (reservoirs, counts, filtered_count)
+
+                total_messages += 1
 
                 try:
                     query = ClientQueryProtobuf()
@@ -239,6 +261,15 @@ def _sample_partition_worker(args: tuple) -> tuple:
                             reservoirs[key][j] = row
 
                     counts[key] += 1
+
+            now = time.monotonic()
+            if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
+                print(
+                    f"[sample p{partition}] {total_messages:,} msgs "
+                    f"({filtered_count:,} filtered), {len(reservoirs)} pairs",
+                    flush=True,
+                )
+                last_progress_log = now
     finally:
         consumer.close()
 
