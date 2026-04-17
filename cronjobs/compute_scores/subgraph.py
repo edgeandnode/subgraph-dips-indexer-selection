@@ -7,6 +7,7 @@ handling, and page-size defaults live in one place.
 """
 
 import logging
+import time
 from typing import List
 
 import requests
@@ -43,8 +44,13 @@ def paginate_subgraph_query(
     """
     last_id = ""
     all_entities: List[dict] = []
+    page_num = 0
+
+    logger.info("Paginating subgraph query (entity=%s, page_size=%d) at %s", entity, page_size, url)
 
     while True:
+        page_num += 1
+        t0 = time.monotonic()
         response = requests.post(
             url,
             json={"query": query, "variables": {"first": page_size, "lastId": last_id}},
@@ -57,6 +63,15 @@ def paginate_subgraph_query(
             raise RuntimeError(f"GraphQL errors: {data['errors']}")
 
         page = data.get("data", {}).get(entity, [])
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "Fetched page %d: %d entities in %.2fs (cumulative=%d)",
+            page_num,
+            len(page),
+            elapsed,
+            len(all_entities) + len(page),
+        )
+
         if not page:
             break
 
@@ -65,4 +80,5 @@ def paginate_subgraph_query(
             break
         last_id = page[-1]["id"]
 
+    logger.info("Pagination complete: %d entities across %d page(s)", len(all_entities), page_num)
     return all_entities

@@ -52,9 +52,15 @@ logger = logging.getLogger(__name__)
 # Interval for partition worker progress heartbeats. Workers run in child
 # processes during pass 1 (count) and pass 2 (sample); both passes are
 # otherwise silent until complete, which makes minutes-long runs indistinguishable
-# from a stuck worker. Printing directly to stdout is intentional — Python's
-# logger config doesn't propagate to ProcessPoolExecutor children.
-PROGRESS_LOG_INTERVAL_SEC = 120
+# from a stuck worker. Override via the PROGRESS_LOG_INTERVAL_SEC env var
+# (e.g. set to a small value for debug runs).
+#
+# Printing directly to stdout with flush=True is intentional. On Linux
+# (fork-based ProcessPoolExecutor) children inherit logger handlers, but
+# `print(..., flush=True)` avoids depending on the multiprocessing start
+# method and guarantees an unbuffered line per partition regardless of how
+# the parent's logging is configured.
+PROGRESS_LOG_INTERVAL_SEC = int(os.environ.get("PROGRESS_LOG_INTERVAL_SEC", "120"))
 
 # Cap parallel partition consumers to avoid unbounded thread/connection creation.
 # The CronJob runs with 8 CPUs; one consumer per core saturates throughput
@@ -116,6 +122,16 @@ def _count_partition_worker(args: tuple) -> tuple:
         consumer.assign([TopicPartition(topic, partition, offset)])
 
         while True:
+            now = time.monotonic()
+            if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
+                ts = time.strftime("%H:%M:%SZ", time.gmtime())
+                print(
+                    f"[{ts} count p{partition}] {total_messages:,} msgs "
+                    f"({filtered_count:,} filtered), {len(counts)} pairs",
+                    flush=True,
+                )
+                last_progress_log = now
+
             messages = consumer.consume(num_messages=1000, timeout=30.0)
 
             if not messages:
@@ -155,15 +171,6 @@ def _count_partition_worker(args: tuple) -> tuple:
                     if len(dep_bytes) == 32 and len(idx_bytes) == 20:
                         counts[(dep_bytes, idx_bytes)] += 1
                         fees[idx_bytes] += attempt.fee_grt
-
-            now = time.monotonic()
-            if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
-                print(
-                    f"[count p{partition}] {total_messages:,} msgs "
-                    f"({filtered_count:,} filtered), {len(counts)} pairs",
-                    flush=True,
-                )
-                last_progress_log = now
     finally:
         consumer.close()
 
@@ -196,6 +203,16 @@ def _sample_partition_worker(args: tuple) -> tuple:
         consumer.assign([TopicPartition(topic, partition, offset)])
 
         while True:
+            now = time.monotonic()
+            if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
+                ts = time.strftime("%H:%M:%SZ", time.gmtime())
+                print(
+                    f"[{ts} sample p{partition}] {total_messages:,} msgs "
+                    f"({filtered_count:,} filtered), {len(reservoirs)} pairs",
+                    flush=True,
+                )
+                last_progress_log = now
+
             messages = consumer.consume(num_messages=1000, timeout=30.0)
 
             if not messages:
@@ -261,15 +278,6 @@ def _sample_partition_worker(args: tuple) -> tuple:
                             reservoirs[key][j] = row
 
                     counts[key] += 1
-
-            now = time.monotonic()
-            if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
-                print(
-                    f"[sample p{partition}] {total_messages:,} msgs "
-                    f"({filtered_count:,} filtered), {len(reservoirs)} pairs",
-                    flush=True,
-                )
-                last_progress_log = now
     finally:
         consumer.close()
 
@@ -545,24 +553,46 @@ class RedpandaProvider:
 
         Creates a temporary consumer for metadata and offset resolution,
         stores result in self._cached_partitions for reuse in pass 2.
+
+        Both list_topics and offsets_for_times are synchronous broker calls
+        with 30s timeouts — logging each stage makes a slow or unreachable
+        broker observable in cronjob logs rather than surfacing as a silent
+        ~60s gap before pass 1.
         """
         from confluent_kafka import Consumer, TopicPartition
 
         consumer = Consumer(self._consumer_config())
         try:
+            logger.info("Resolving partitions: list_topics(%s)...", self._topic)
+            t0 = time.monotonic()
             meta = consumer.list_topics(self._topic, timeout=30)
+            logger.info("list_topics returned in %.2fs", time.monotonic() - t0)
+
             if self._topic not in meta.topics:
                 raise RuntimeError(f"Topic '{self._topic}' not found in Redpanda")
 
             partition_ids = list(meta.topics[self._topic].partitions.keys())
             seek_tps = [TopicPartition(self._topic, pid, start_ts_ms) for pid in partition_ids]
 
+            logger.info(
+                "offsets_for_times across %d partitions (start_ts_ms=%d)...",
+                len(partition_ids),
+                start_ts_ms,
+            )
+            t0 = time.monotonic()
             resolved = consumer.offsets_for_times(seek_tps, timeout=30)
+            logger.info("offsets_for_times returned in %.2fs", time.monotonic() - t0)
+
             valid = [
                 TopicPartition(tp.topic, tp.partition, tp.offset)
                 for tp in resolved
                 if tp.offset >= 0
             ]
+            logger.info(
+                "Resolved %d partitions with valid offsets (%d partitions had no data in window)",
+                len(valid),
+                len(resolved) - len(valid),
+            )
         finally:
             consumer.close()
 
