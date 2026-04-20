@@ -98,6 +98,21 @@ def _map_result_to_status(result: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _emit_heartbeat(label: str, partition: int, total: int, filtered: int, pairs: int) -> None:
+    """Emit a worker progress heartbeat line with a full ISO-8601 UTC timestamp.
+
+    Prints directly to stdout for the reasons documented on
+    PROGRESS_LOG_INTERVAL_SEC. Used for both the startup line (so a stuck
+    worker is distinguishable from one that never entered the loop) and the
+    periodic in-loop heartbeat.
+    """
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    print(
+        f"[{ts} {label} p{partition}] {total:,} msgs ({filtered:,} filtered), {pairs} pairs",
+        flush=True,
+    )
+
+
 def _count_partition_worker(args: tuple) -> tuple:
     """
     Count pass for a single partition. Runs in a child process.
@@ -116,20 +131,20 @@ def _count_partition_worker(args: tuple) -> tuple:
     total_messages = 0
     filtered_count = 0
     consecutive_empty = 0
-    last_progress_log = time.monotonic()
 
     try:
         consumer.assign([TopicPartition(topic, partition, offset)])
 
+        # Startup heartbeat: confirms the worker entered the loop before the
+        # first 30s consume() call, so a broker connection problem can't
+        # masquerade as an unstarted worker.
+        _emit_heartbeat("count", partition, 0, 0, 0)
+        last_progress_log = time.monotonic()
+
         while True:
             now = time.monotonic()
             if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
-                ts = time.strftime("%H:%M:%SZ", time.gmtime())
-                print(
-                    f"[{ts} count p{partition}] {total_messages:,} msgs "
-                    f"({filtered_count:,} filtered), {len(counts)} pairs",
-                    flush=True,
-                )
+                _emit_heartbeat("count", partition, total_messages, filtered_count, len(counts))
                 last_progress_log = now
 
             messages = consumer.consume(num_messages=1000, timeout=30.0)
@@ -197,19 +212,19 @@ def _sample_partition_worker(args: tuple) -> tuple:
     filtered_count = 0
     total_messages = 0
     consecutive_empty = 0
-    last_progress_log = time.monotonic()
 
     try:
         consumer.assign([TopicPartition(topic, partition, offset)])
 
+        # Startup heartbeat: see _count_partition_worker.
+        _emit_heartbeat("sample", partition, 0, 0, 0)
+        last_progress_log = time.monotonic()
+
         while True:
             now = time.monotonic()
             if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
-                ts = time.strftime("%H:%M:%SZ", time.gmtime())
-                print(
-                    f"[{ts} sample p{partition}] {total_messages:,} msgs "
-                    f"({filtered_count:,} filtered), {len(reservoirs)} pairs",
-                    flush=True,
+                _emit_heartbeat(
+                    "sample", partition, total_messages, filtered_count, len(reservoirs)
                 )
                 last_progress_log = now
 

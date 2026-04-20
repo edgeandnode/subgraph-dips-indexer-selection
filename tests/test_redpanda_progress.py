@@ -56,11 +56,13 @@ def _fake_kafka_message(ts_ms: int, value: bytes):
     return msg
 
 
-# Matches "[HH:MM:SSZ <label> p<partition>] <count>,* msgs (<filtered>,* filtered), <pairs> pairs"
+# Matches a heartbeat line:
+#   "[YYYY-MM-DDTHH:MM:SSZ <label> p<partition>] <n> msgs (<n> filtered), <n> pairs"
 _HEARTBEAT_RE = re.compile(
-    r"\[(\d{2}:\d{2}:\d{2}Z) (count|sample) p(\d+)\] "
+    r"\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) (count|sample) p(\d+)\] "
     r"([\d,]+) msgs \(([\d,]+) filtered\), (\d+) pairs"
 )
+_ISO_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 
 
 class TestCountWorkerHeartbeat:
@@ -116,12 +118,12 @@ class TestCountWorkerHeartbeat:
         assert " count p0] " in out, (
             f"expected a count-worker heartbeat even with only empty batches, got: {out!r}"
         )
-        # With interval=0 and three empty-batch iterations, we expect at least
-        # one heartbeat line (one per iteration top-of-loop).
-        assert out.count("count p0]") >= 1
+        # Startup heartbeat plus three empty-iteration top-of-loop heartbeats
+        # at interval=0: at least two lines total.
+        assert out.count("count p0]") >= 2
 
-    def test_heartbeat_not_printed_when_interval_not_reached(self, capsys, monkeypatch):
-        """At the default interval, a fast run produces no heartbeat output."""
+    def test_only_startup_heartbeat_when_interval_not_reached(self, capsys, monkeypatch):
+        """At the default interval, a fast run emits only the startup heartbeat."""
         monkeypatch.setattr(redpanda, "PROGRESS_LOG_INTERVAL_SEC", 120)
 
         indexer = b"\x01" * 20
@@ -137,12 +139,19 @@ class TestCountWorkerHeartbeat:
             )
 
         out = capsys.readouterr().out
-        assert "count p0]" not in out, (
-            f"no heartbeat expected at interval=120 on a sub-second mock run, got: {out!r}"
+        matches = _HEARTBEAT_RE.findall(out)
+        assert len(matches) == 1, (
+            f"expected exactly the startup heartbeat at interval=120, got: {out!r}"
         )
+        startup_ts, startup_label, startup_partition, startup_msgs, _, startup_pairs = matches[0]
+        assert startup_label == "count"
+        assert startup_partition == "0"
+        # Startup heartbeat is emitted before the first consume(), so counts are zero.
+        assert startup_msgs == "0"
+        assert startup_pairs == "0"
 
     def test_heartbeat_format_has_timestamp_and_counts(self, capsys, monkeypatch):
-        """Heartbeat line includes HH:MM:SSZ timestamp, msg count, filtered, pairs."""
+        """Heartbeat line includes ISO-8601 UTC timestamp, msg count, filtered, pairs."""
         monkeypatch.setattr(redpanda, "PROGRESS_LOG_INTERVAL_SEC", 0)
 
         indexer = b"\x01" * 20
@@ -168,8 +177,8 @@ class TestCountWorkerHeartbeat:
         assert last_msgs == "1"
         assert last_filtered == "0"
         assert last_pairs == "1"
-        # Timestamp is HH:MM:SSZ.
-        assert re.fullmatch(r"\d{2}:\d{2}:\d{2}Z", last_ts)
+        # Timestamp is YYYY-MM-DDTHH:MM:SSZ (ISO-8601 UTC).
+        assert _ISO_TS_RE.fullmatch(last_ts)
 
 
 class TestSampleWorkerHeartbeat:
@@ -209,7 +218,7 @@ class TestSampleWorkerHeartbeat:
         last_ts, last_label, last_partition, *_ = matches[-1]
         assert last_label == "sample"
         assert last_partition == "0"
-        assert re.fullmatch(r"\d{2}:\d{2}:\d{2}Z", last_ts)
+        assert _ISO_TS_RE.fullmatch(last_ts)
 
     def test_heartbeat_fires_on_empty_batch_stretch(self, capsys, monkeypatch):
         """Regression: sample worker must also heartbeat on empty-only runs."""
