@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import random
+import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from datetime import date, datetime, timezone
@@ -47,6 +48,19 @@ from tenacity import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Interval for partition worker progress heartbeats. Workers run in child
+# processes during pass 1 (count) and pass 2 (sample); both passes are
+# otherwise silent until complete, which makes minutes-long runs indistinguishable
+# from a stuck worker. Override via the PROGRESS_LOG_INTERVAL_SEC env var
+# (e.g. set to a small value for debug runs).
+#
+# Printing directly to stdout with flush=True is intentional. On Linux
+# (fork-based ProcessPoolExecutor) children inherit logger handlers, but
+# `print(..., flush=True)` avoids depending on the multiprocessing start
+# method and guarantees an unbuffered line per partition regardless of how
+# the parent's logging is configured.
+PROGRESS_LOG_INTERVAL_SEC = int(os.environ.get("PROGRESS_LOG_INTERVAL_SEC", "120"))
 
 # Cap parallel partition consumers to avoid unbounded thread/connection creation.
 # The CronJob runs with 8 CPUs; one consumer per core saturates throughput
@@ -84,6 +98,21 @@ def _map_result_to_status(result: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _emit_heartbeat(label: str, partition: int, total: int, filtered: int, pairs: int) -> None:
+    """Emit a worker progress heartbeat line with a full ISO-8601 UTC timestamp.
+
+    Prints directly to stdout for the reasons documented on
+    PROGRESS_LOG_INTERVAL_SEC. Used for both the startup line (so a stuck
+    worker is distinguishable from one that never entered the loop) and the
+    periodic in-loop heartbeat.
+    """
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    print(
+        f"[{ts} {label} p{partition}] {total:,} msgs ({filtered:,} filtered), {pairs} pairs",
+        flush=True,
+    )
+
+
 def _count_partition_worker(args: tuple) -> tuple:
     """
     Count pass for a single partition. Runs in a child process.
@@ -106,7 +135,18 @@ def _count_partition_worker(args: tuple) -> tuple:
     try:
         consumer.assign([TopicPartition(topic, partition, offset)])
 
+        # Startup heartbeat: confirms the worker entered the loop before the
+        # first 30s consume() call, so a broker connection problem can't
+        # masquerade as an unstarted worker.
+        _emit_heartbeat("count", partition, 0, 0, 0)
+        last_progress_log = time.monotonic()
+
         while True:
+            now = time.monotonic()
+            if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
+                _emit_heartbeat("count", partition, total_messages, filtered_count, len(counts))
+                last_progress_log = now
+
             messages = consumer.consume(num_messages=1000, timeout=30.0)
 
             if not messages:
@@ -170,12 +210,24 @@ def _sample_partition_worker(args: tuple) -> tuple:
     reservoirs: Dict[Tuple[bytes, bytes], List[dict]] = defaultdict(list)
     counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
     filtered_count = 0
+    total_messages = 0
     consecutive_empty = 0
 
     try:
         consumer.assign([TopicPartition(topic, partition, offset)])
 
+        # Startup heartbeat: see _count_partition_worker.
+        _emit_heartbeat("sample", partition, 0, 0, 0)
+        last_progress_log = time.monotonic()
+
         while True:
+            now = time.monotonic()
+            if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
+                _emit_heartbeat(
+                    "sample", partition, total_messages, filtered_count, len(reservoirs)
+                )
+                last_progress_log = now
+
             messages = consumer.consume(num_messages=1000, timeout=30.0)
 
             if not messages:
@@ -196,6 +248,8 @@ def _sample_partition_worker(args: tuple) -> tuple:
 
                 if ts_ms > end_ts_ms:
                     return (reservoirs, counts, filtered_count)
+
+                total_messages += 1
 
                 try:
                     query = ClientQueryProtobuf()
@@ -514,24 +568,46 @@ class RedpandaProvider:
 
         Creates a temporary consumer for metadata and offset resolution,
         stores result in self._cached_partitions for reuse in pass 2.
+
+        Both list_topics and offsets_for_times are synchronous broker calls
+        with 30s timeouts — logging each stage makes a slow or unreachable
+        broker observable in cronjob logs rather than surfacing as a silent
+        ~60s gap before pass 1.
         """
         from confluent_kafka import Consumer, TopicPartition
 
         consumer = Consumer(self._consumer_config())
         try:
+            logger.info("Resolving partitions: list_topics(%s)...", self._topic)
+            t0 = time.monotonic()
             meta = consumer.list_topics(self._topic, timeout=30)
+            logger.info("list_topics returned in %.2fs", time.monotonic() - t0)
+
             if self._topic not in meta.topics:
                 raise RuntimeError(f"Topic '{self._topic}' not found in Redpanda")
 
             partition_ids = list(meta.topics[self._topic].partitions.keys())
             seek_tps = [TopicPartition(self._topic, pid, start_ts_ms) for pid in partition_ids]
 
+            logger.info(
+                "offsets_for_times across %d partitions (start_ts_ms=%d)...",
+                len(partition_ids),
+                start_ts_ms,
+            )
+            t0 = time.monotonic()
             resolved = consumer.offsets_for_times(seek_tps, timeout=30)
+            logger.info("offsets_for_times returned in %.2fs", time.monotonic() - t0)
+
             valid = [
                 TopicPartition(tp.topic, tp.partition, tp.offset)
                 for tp in resolved
                 if tp.offset >= 0
             ]
+            logger.info(
+                "Resolved %d partitions with valid offsets (%d partitions had no data in window)",
+                len(valid),
+                len(resolved) - len(valid),
+            )
         finally:
             consumer.close()
 
