@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.1.0...v2.1.1) (2026-04-20)
+
+
+### Changed
+
+* **k8s:** update cronjob image to sha-89cd68e ([#133](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/133)) ([bae3be3](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/bae3be37b9e4633a224221dcf5e799c49fb91b5d))
+
 ## [2.1.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.0.2...v2.1.0) (2026-04-20)
 
 
