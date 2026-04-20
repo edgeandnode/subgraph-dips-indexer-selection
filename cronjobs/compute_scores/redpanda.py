@@ -813,18 +813,15 @@ class RedpandaProvider:
         # bounded by rows_to_use from the first overflow onwards. Statistical
         # semantics are preserved: each retained row is uniformly sampled from
         # the union of all worker reservoirs, matching the old shuffle-then-head.
-        merge_rng = random.Random(
-            int(os.environ.get("SCORING_SEED", start_date.strftime("%Y%m%d")))
-        )
+        merge_rng = random.Random(seed)
         merged_reservoirs: Dict[Tuple[bytes, bytes], List[tuple]] = defaultdict(list)
         merged_absorbed: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
-        merged_counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
         total_filtered = 0
         # Pop from the list as we go so each worker's reservoir can be freed
         # once absorbed, rather than pinning all N worker results until the
         # loop completes.
         while results:
-            reservoirs, counts, filtered = results.pop()
+            reservoirs, _counts, filtered = results.pop()
             for key, rows in reservoirs.items():
                 merged = merged_reservoirs[key]
                 absorbed = merged_absorbed[key]
@@ -837,8 +834,6 @@ class RedpandaProvider:
                             merged[j] = row
                     absorbed += 1
                 merged_absorbed[key] = absorbed
-            for key, count in counts.items():
-                merged_counts[key] += count
             total_filtered += filtered
 
         total_rows = sum(len(rows) for rows in merged_reservoirs.values())
@@ -914,12 +909,17 @@ def _build_dataframe(
     them from the outer key during frame construction.
 
     Memory-conscious construction: rather than materialise a flattened list
-    of ~36M tuples at prod scale (~4 GB of transient tuple-container overhead
-    held simultaneously with the source reservoirs and the nascent DataFrame),
-    we preallocate one numpy array per column sized to total_rows and fill
-    row-by-row. Numerics use typed dtypes (float64/int64) so they stay
+    of ~20M 10-tuples at prod scale (~2 GB of transient tuple-container
+    overhead held simultaneously with the source reservoirs and the nascent
+    DataFrame), we preallocate one numpy array per column sized to total_rows
+    and fill per-pair. Numerics use typed dtypes (float64/int64) so they stay
     unboxed in the array instead of going through a list of Python int/float
     objects before pandas eventually converts them.
+
+    Fill is done per-pair with `zip(*rows)` + slice assignment so the inner
+    loop runs in C rather than Python. Per-pair transient is one `list(zip)`
+    of pointers — ~rows_to_use * 8 pointers ≈ tens of KB per pair, freed
+    before the next pair — negligible against the preallocated arrays.
 
     Performs deferred string conversions in bulk rather than per-message
     during streaming.
@@ -939,18 +939,21 @@ def _build_dataframe(
 
     i = 0
     for (dep_bytes, idx_bytes), rows in reservoirs.items():
-        for row in rows:
-            deployment_bytes_arr[i] = dep_bytes
-            indexer_bytes_arr[i] = idx_bytes
-            query_id_arr[i] = row[0]
-            fee_arr[i] = row[1]
-            ts_ms_arr[i] = row[2]
-            blocks_behind_arr[i] = row[3]
-            response_time_ms_arr[i] = row[4]
-            status_arr[i] = row[5]
-            subgraph_network_arr[i] = row[6]
-            url_arr[i] = row[7]
-            i += 1
+        n = len(rows)
+        if not n:
+            continue
+        cols = list(zip(*rows))
+        deployment_bytes_arr[i : i + n] = dep_bytes
+        indexer_bytes_arr[i : i + n] = idx_bytes
+        query_id_arr[i : i + n] = cols[0]
+        fee_arr[i : i + n] = cols[1]
+        ts_ms_arr[i : i + n] = cols[2]
+        blocks_behind_arr[i : i + n] = cols[3]
+        response_time_ms_arr[i : i + n] = cols[4]
+        status_arr[i : i + n] = cols[5]
+        subgraph_network_arr[i : i + n] = cols[6]
+        url_arr[i : i + n] = cols[7]
+        i += n
 
     df = pd.DataFrame(
         {
