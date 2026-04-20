@@ -31,6 +31,7 @@ from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Tuple, cast
 
 import base58
+import numpy as np
 import pandas as pd
 import requests
 from gateway_queries_pb2 import ClientQueryProtobuf  # type: ignore[attr-defined]
@@ -230,6 +231,17 @@ def _sample_partition_worker(args: tuple) -> tuple:
     total_messages = 0
     consecutive_empty = 0
 
+    # Worker-local intern caches. Protobuf hands us fresh str objects for every
+    # message even when the value is identical to one we've already seen, so
+    # `sys.intern` would otherwise run 3x per row (2.76B attempts in production,
+    # ~8B intern calls total). Caching the canonical form under the raw key
+    # collapses warm-path lookups to a single dict.get each. Cardinality in
+    # practice: ~O(10) distinct statuses, ~O(10) distinct chains, ~O(13k)
+    # distinct urls (one per indexer-pair).
+    url_cache: Dict[str, str] = {}
+    status_cache: Dict[str, str] = {}
+    chain_cache: Dict[str, str] = {}
+
     try:
         consumer.assign([TopicPartition(topic, partition, offset)])
 
@@ -289,23 +301,41 @@ def _sample_partition_worker(args: tuple) -> tuple:
                     key = (dep_bytes, idx_bytes)
                     n = counts[key]
 
-                    # Intern url/status/subgraph_network so repeated values across
-                    # the 28-day window share one string payload instead of
-                    # allocating a fresh copy per row. url dedups within a pair
-                    # (indexers usually keep one URL); status has ~O(10) distinct
-                    # values; indexed_chain has ~O(10) distinct values.
-                    # query_id is unique per query so interning it would waste
-                    # cycles for no dedup benefit.
-                    normalised_url = url if url.endswith("/") else url + "/"
+                    # Hoist descriptor-based protobuf attribute access — each
+                    # `attempt.<field>` lookup goes through a descriptor and
+                    # costs ~200ns. Bind once per attempt and reuse.
+                    raw_result = attempt.result
+                    raw_chain = attempt.indexed_chain
+
+                    # url/status/subgraph_network are interned via a worker-local
+                    # cache (see top of worker). First sight of a value pays
+                    # sys.intern + cache store; every subsequent row hits the
+                    # dict-lookup fast path. query_id is unique per query so
+                    # caching/interning it would burn cycles for no dedup.
+                    interned_url = url_cache.get(url)
+                    if interned_url is None:
+                        interned_url = sys.intern(url if url.endswith("/") else url + "/")
+                        url_cache[url] = interned_url
+
+                    interned_status = status_cache.get(raw_result)
+                    if interned_status is None:
+                        interned_status = sys.intern(_map_result_to_status(raw_result))
+                        status_cache[raw_result] = interned_status
+
+                    interned_chain = chain_cache.get(raw_chain)
+                    if interned_chain is None:
+                        interned_chain = sys.intern(raw_chain)
+                        chain_cache[raw_chain] = interned_chain
+
                     row = (
                         query.query_id,
                         attempt.fee_grt,
                         ts_ms,
                         attempt.blocks_behind,
                         attempt.response_time_ms,
-                        sys.intern(_map_result_to_status(attempt.result)),
-                        sys.intern(attempt.indexed_chain),
-                        sys.intern(normalised_url),
+                        interned_status,
+                        interned_chain,
+                        interned_url,
                     )
 
                     if n < rows_to_use:
@@ -881,22 +911,60 @@ def _build_dataframe(
     The worker reservoirs are keyed by (deployment_bytes, indexer_bytes) and
     each value is a list of row tuples in _ROW_COLUMNS order — deployment and
     indexer bytes are NOT stored in the row to save memory, so we broadcast
-    them from the outer key as we flatten.
+    them from the outer key during frame construction.
+
+    Memory-conscious construction: rather than materialise a flattened list
+    of ~36M tuples at prod scale (~4 GB of transient tuple-container overhead
+    held simultaneously with the source reservoirs and the nascent DataFrame),
+    we preallocate one numpy array per column sized to total_rows and fill
+    row-by-row. Numerics use typed dtypes (float64/int64) so they stay
+    unboxed in the array instead of going through a list of Python int/float
+    objects before pandas eventually converts them.
 
     Performs deferred string conversions in bulk rather than per-message
     during streaming.
     """
-    # Flatten once, broadcasting the reservoir key across its rows. Build the
-    # frame with the full column schema explicitly so pandas doesn't have to
-    # infer it from tuple positions.
-    flattened = [
-        (dep_bytes, idx_bytes, *row)
-        for (dep_bytes, idx_bytes), rows in reservoirs.items()
-        for row in rows
-    ]
+    total_rows = sum(len(rows) for rows in reservoirs.values())
+
+    deployment_bytes_arr = np.empty(total_rows, dtype=object)
+    indexer_bytes_arr = np.empty(total_rows, dtype=object)
+    query_id_arr = np.empty(total_rows, dtype=object)
+    fee_arr = np.empty(total_rows, dtype=np.float64)
+    ts_ms_arr = np.empty(total_rows, dtype=np.int64)
+    blocks_behind_arr = np.empty(total_rows, dtype=np.int64)
+    response_time_ms_arr = np.empty(total_rows, dtype=np.int64)
+    status_arr = np.empty(total_rows, dtype=object)
+    subgraph_network_arr = np.empty(total_rows, dtype=object)
+    url_arr = np.empty(total_rows, dtype=object)
+
+    i = 0
+    for (dep_bytes, idx_bytes), rows in reservoirs.items():
+        for row in rows:
+            deployment_bytes_arr[i] = dep_bytes
+            indexer_bytes_arr[i] = idx_bytes
+            query_id_arr[i] = row[0]
+            fee_arr[i] = row[1]
+            ts_ms_arr[i] = row[2]
+            blocks_behind_arr[i] = row[3]
+            response_time_ms_arr[i] = row[4]
+            status_arr[i] = row[5]
+            subgraph_network_arr[i] = row[6]
+            url_arr[i] = row[7]
+            i += 1
+
     df = pd.DataFrame(
-        flattened,
-        columns=("deployment_bytes", "indexer_bytes", *_ROW_COLUMNS),
+        {
+            "deployment_bytes": deployment_bytes_arr,
+            "indexer_bytes": indexer_bytes_arr,
+            "query_id": query_id_arr,
+            "fee": fee_arr,
+            "ts_ms": ts_ms_arr,
+            "blocks_behind": blocks_behind_arr,
+            "response_time_ms": response_time_ms_arr,
+            "status": status_arr,
+            "subgraph_network": subgraph_network_arr,
+            "url": url_arr,
+        }
     )
 
     dep_map = {b: _bytes_to_cid(b) for b in df["deployment_bytes"].unique()}

@@ -129,6 +129,132 @@ def test_sample_worker_per_row_memory_under_threshold():
     )
 
 
+def test_intern_cache_shares_string_identity_across_rows():
+    """Repeated url/status/subgraph_network values across reservoir rows must
+    share string identity (not just equality), proving the worker-local intern
+    cache is canonicalising rather than each row owning its own copy.
+
+    A regression here — cache keyed wrong, value not stored, or sys.intern
+    dropped — would still pass string equality checks but leak memory at
+    production scale. The `is` check is the only way to catch it.
+    """
+    indexer = b"\x01" * 20
+    deployment = b"\x02" * 32
+
+    # 100 messages with identical url/status/chain so every row should hit
+    # the warm-cache fast path from the second message onwards.
+    messages = [
+        _fake_kafka_message(
+            1000 + i,
+            _build_message(f"q-{i:04d}", indexer, deployment),
+        )
+        for i in range(100)
+    ]
+    mock_consumer = MagicMock()
+    mock_consumer.consume.side_effect = [messages, [], [], []]
+
+    with patch("confluent_kafka.Consumer", return_value=mock_consumer):
+        reservoirs, _, _ = _sample_partition_worker(
+            (
+                "gateway_queries",
+                0,
+                0,
+                999999999999,
+                {"bootstrap.servers": "x"},
+                None,
+                1000,
+                20260420,
+            )
+        )
+
+    all_rows = [row for rows in reservoirs.values() for row in rows]
+    assert len(all_rows) == 100, f"Expected 100 rows, got {len(all_rows)}"
+
+    first = all_rows[0]
+    _, _, _, _, _, first_status, first_chain, first_url = first
+    for row in all_rows[1:]:
+        _, _, _, _, _, status, chain, url = row
+        assert status is first_status, (
+            "status is equal but not identical — intern cache not canonicalising"
+        )
+        assert chain is first_chain, (
+            "subgraph_network is equal but not identical — intern cache not canonicalising"
+        )
+        assert url is first_url, "url is equal but not identical — intern cache not canonicalising"
+
+
+def test_intern_cache_preserves_distinct_values_under_rotation():
+    """When a pair rotates between two URLs mid-window, both URLs appear in
+    the reservoir — the cache shares identity *within* each URL group but
+    does not collapse distinct URLs into one.
+
+    Covers the production scenario where an indexer changes their registered
+    URL during the 28-day window. The prior dict-row representation carried
+    per-row URLs by construction; the tuple + cache representation must
+    preserve the same per-row semantics.
+    """
+    indexer = b"\x01" * 20
+    deployment = b"\x02" * 32
+
+    def _msg_with_url(i: int, url: str) -> bytes:
+        query = ClientQueryProtobuf()
+        query.gateway_id = "gw-1"
+        query.query_id = f"q-{i:04d}"
+        attempt = query.indexer_queries.add()
+        attempt.indexer = indexer
+        attempt.deployment = deployment
+        attempt.url = url
+        attempt.indexed_chain = "mainnet"
+        attempt.fee_grt = 0.001
+        attempt.response_time_ms = 100
+        attempt.blocks_behind = 0
+        attempt.result = "success"
+        return query.SerializeToString()
+
+    url_a = "https://indexer-a.example.com/"
+    url_b = "https://indexer-b.example.com/"
+
+    # 40 rows with url_a, then 40 rows with url_b — simulates mid-window rotation.
+    messages = []
+    for i in range(40):
+        messages.append(_fake_kafka_message(1000 + i, _msg_with_url(i, url_a)))
+    for i in range(40, 80):
+        messages.append(_fake_kafka_message(1000 + i, _msg_with_url(i, url_b)))
+
+    mock_consumer = MagicMock()
+    mock_consumer.consume.side_effect = [messages, [], [], []]
+
+    with patch("confluent_kafka.Consumer", return_value=mock_consumer):
+        reservoirs, _, _ = _sample_partition_worker(
+            (
+                "gateway_queries",
+                0,
+                0,
+                999999999999,
+                {"bootstrap.servers": "x"},
+                None,
+                1000,
+                20260420,
+            )
+        )
+
+    all_rows = [row for rows in reservoirs.values() for row in rows]
+    assert len(all_rows) == 80
+
+    urls_seen = {row[7] for row in all_rows}
+    assert len(urls_seen) == 2, (
+        f"Expected 2 distinct URLs in reservoir, got {len(urls_seen)}: {urls_seen}"
+    )
+
+    # Within each URL group, all rows must share identity.
+    rows_url_a = [row for row in all_rows if row[7] == url_a]
+    rows_url_b = [row for row in all_rows if row[7] == url_b]
+    for row in rows_url_a[1:]:
+        assert row[7] is rows_url_a[0][7], "url_a copies not canonicalised in cache"
+    for row in rows_url_b[1:]:
+        assert row[7] is rows_url_b[0][7], "url_b copies not canonicalised in cache"
+
+
 def test_reservoir_rows_are_tuples_in_expected_order():
     """Shape-level lock-in: each reservoir row is an 8-tuple in _ROW_COLUMNS order.
 
