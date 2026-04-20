@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import random
+import sys
 import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -30,6 +31,7 @@ from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Tuple, cast
 
 import base58
+import numpy as np
 import pandas as pd
 import requests
 from gateway_queries_pb2 import ClientQueryProtobuf  # type: ignore[attr-defined]
@@ -66,6 +68,22 @@ PROGRESS_LOG_INTERVAL_SEC = int(os.environ.get("PROGRESS_LOG_INTERVAL_SEC", "120
 # The CronJob runs with 8 CPUs; one consumer per core saturates throughput
 # without excessive Kafka connections on topics with many partitions.
 MAX_PARTITION_WORKERS = int(os.environ.get("REDPANDA_MAX_WORKERS", "8"))
+
+# Column order for sample-pass row tuples emitted by _sample_partition_worker.
+# Rows are stored as tuples (not dicts) to cut per-row memory footprint: a
+# populated 10-field dict is ~500B of container overhead, while an 8-tuple is
+# ~112B. indexer/deployment bytes are NOT stored in the row — they come from
+# the reservoir's outer key and are broadcast at DataFrame construction time.
+_ROW_COLUMNS: Tuple[str, ...] = (
+    "query_id",
+    "fee",
+    "ts_ms",
+    "blocks_behind",
+    "response_time_ms",
+    "status",
+    "subgraph_network",
+    "url",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -207,11 +225,22 @@ def _sample_partition_worker(args: tuple) -> tuple:
 
     rng = random.Random(seed + partition)
     consumer = Consumer(config)
-    reservoirs: Dict[Tuple[bytes, bytes], List[dict]] = defaultdict(list)
+    reservoirs: Dict[Tuple[bytes, bytes], List[tuple]] = defaultdict(list)
     counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
     filtered_count = 0
     total_messages = 0
     consecutive_empty = 0
+
+    # Worker-local intern caches. Protobuf hands us fresh str objects for every
+    # message even when the value is identical to one we've already seen, so
+    # `sys.intern` would otherwise run 3x per row (2.76B attempts in production,
+    # ~8B intern calls total). Caching the canonical form under the raw key
+    # collapses warm-path lookups to a single dict.get each. Cardinality in
+    # practice: ~O(10) distinct statuses, ~O(10) distinct chains, ~O(13k)
+    # distinct urls (one per indexer-pair).
+    url_cache: Dict[str, str] = {}
+    status_cache: Dict[str, str] = {}
+    chain_cache: Dict[str, str] = {}
 
     try:
         consumer.assign([TopicPartition(topic, partition, offset)])
@@ -272,18 +301,42 @@ def _sample_partition_worker(args: tuple) -> tuple:
                     key = (dep_bytes, idx_bytes)
                     n = counts[key]
 
-                    row = {
-                        "query_id": query.query_id,
-                        "indexer_bytes": idx_bytes,
-                        "deployment_bytes": dep_bytes,
-                        "fee": attempt.fee_grt,
-                        "ts_ms": ts_ms,
-                        "blocks_behind": attempt.blocks_behind,
-                        "response_time_ms": attempt.response_time_ms,
-                        "status": _map_result_to_status(attempt.result),
-                        "subgraph_network": attempt.indexed_chain,
-                        "url": url if url.endswith("/") else url + "/",
-                    }
+                    # Hoist descriptor-based protobuf attribute access — each
+                    # `attempt.<field>` lookup goes through a descriptor and
+                    # costs ~200ns. Bind once per attempt and reuse.
+                    raw_result = attempt.result
+                    raw_chain = attempt.indexed_chain
+
+                    # url/status/subgraph_network are interned via a worker-local
+                    # cache (see top of worker). First sight of a value pays
+                    # sys.intern + cache store; every subsequent row hits the
+                    # dict-lookup fast path. query_id is unique per query so
+                    # caching/interning it would burn cycles for no dedup.
+                    interned_url = url_cache.get(url)
+                    if interned_url is None:
+                        interned_url = sys.intern(url if url.endswith("/") else url + "/")
+                        url_cache[url] = interned_url
+
+                    interned_status = status_cache.get(raw_result)
+                    if interned_status is None:
+                        interned_status = sys.intern(_map_result_to_status(raw_result))
+                        status_cache[raw_result] = interned_status
+
+                    interned_chain = chain_cache.get(raw_chain)
+                    if interned_chain is None:
+                        interned_chain = sys.intern(raw_chain)
+                        chain_cache[raw_chain] = interned_chain
+
+                    row = (
+                        query.query_id,
+                        attempt.fee_grt,
+                        ts_ms,
+                        attempt.blocks_behind,
+                        attempt.response_time_ms,
+                        interned_status,
+                        interned_chain,
+                        interned_url,
+                    )
 
                     if n < rows_to_use:
                         reservoirs[key].append(row)
@@ -747,27 +800,45 @@ class RedpandaProvider:
         with ProcessPoolExecutor(max_workers=min(len(partitions), MAX_PARTITION_WORKERS)) as pool:
             results = list(pool.map(_sample_partition_worker, args))
 
-        # Merge per-partition reservoirs
-        merged_reservoirs: Dict[Tuple[bytes, bytes], List[dict]] = defaultdict(list)
-        merged_counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
+        # Merge per-partition reservoirs using Algorithm R streaming.
+        #
+        # The previous implementation extended every worker's rows into a single
+        # list per pair, then shuffled and truncated to rows_to_use. That held
+        # up to N_workers * rows_to_use rows per pair in the parent process
+        # before truncation — a transient ~8x spike that ran the 50Gi pod OOM
+        # for windows with heavy message volume.
+        #
+        # The streaming form below absorbs each worker's rows one at a time and
+        # applies Algorithm R at the parent, so the per-pair footprint is
+        # bounded by rows_to_use from the first overflow onwards. Statistical
+        # semantics are preserved: each retained row is uniformly sampled from
+        # the union of all worker reservoirs, matching the old shuffle-then-head.
+        merge_rng = random.Random(seed)
+        merged_reservoirs: Dict[Tuple[bytes, bytes], List[tuple]] = defaultdict(list)
+        merged_absorbed: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
         total_filtered = 0
-        for reservoirs, counts, filtered in results:
+        # Pop from the list as we go so each worker's reservoir can be freed
+        # once absorbed, rather than pinning all N worker results until the
+        # loop completes.
+        while results:
+            reservoirs, _counts, filtered = results.pop()
             for key, rows in reservoirs.items():
-                merged_reservoirs[key].extend(rows)
-            for key, count in counts.items():
-                merged_counts[key] += count
+                merged = merged_reservoirs[key]
+                absorbed = merged_absorbed[key]
+                for row in rows:
+                    if absorbed < rows_to_use:
+                        merged.append(row)
+                    else:
+                        j = merge_rng.randint(0, absorbed)
+                        if j < rows_to_use:
+                            merged[j] = row
+                    absorbed += 1
+                merged_absorbed[key] = absorbed
             total_filtered += filtered
 
-        # Truncate pairs that exceed rows_to_use after cross-partition merge
-        all_rows: List[dict] = []
-        for key, rows in merged_reservoirs.items():
-            if len(rows) > rows_to_use:
-                random.shuffle(rows)
-                rows = rows[:rows_to_use]
-            all_rows.extend(rows)
-
-        if all_rows:
-            self._row_cache_df = _build_dataframe(all_rows)
+        total_rows = sum(len(rows) for rows in merged_reservoirs.values())
+        if total_rows:
+            self._row_cache_df = _build_dataframe(merged_reservoirs)
         else:
             self._row_cache_df = _empty_combined_df()
 
@@ -778,7 +849,7 @@ class RedpandaProvider:
         logger.info(
             "Sample pass complete: %s rows buffered across %d pairs "
             "(%s messages filtered by gateway ID)",
-            f"{len(all_rows):,}",
+            f"{total_rows:,}",
             len(merged_reservoirs),
             f"{total_filtered:,}",
         )
@@ -826,14 +897,78 @@ class RedpandaProvider:
 # ---------------------------------------------------------------------------
 
 
-def _build_dataframe(rows: List[dict]) -> pd.DataFrame:
+def _build_dataframe(
+    reservoirs: Dict[Tuple[bytes, bytes], List[tuple]],
+) -> pd.DataFrame:
     """
-    Convert raw row dicts (with byte keys and ts_ms) into the final DataFrame.
+    Convert per-pair reservoirs of row tuples into the final DataFrame.
+
+    The worker reservoirs are keyed by (deployment_bytes, indexer_bytes) and
+    each value is a list of row tuples in _ROW_COLUMNS order — deployment and
+    indexer bytes are NOT stored in the row to save memory, so we broadcast
+    them from the outer key during frame construction.
+
+    Memory-conscious construction: rather than materialise a flattened list
+    of ~20M 10-tuples at prod scale (~2 GB of transient tuple-container
+    overhead held simultaneously with the source reservoirs and the nascent
+    DataFrame), we preallocate one numpy array per column sized to total_rows
+    and fill per-pair. Numerics use typed dtypes (float64/int64) so they stay
+    unboxed in the array instead of going through a list of Python int/float
+    objects before pandas eventually converts them.
+
+    Fill is done per-pair with `zip(*rows)` + slice assignment so the inner
+    loop runs in C rather than Python. Per-pair transient is one `list(zip)`
+    of pointers — ~rows_to_use * 8 pointers ≈ tens of KB per pair, freed
+    before the next pair — negligible against the preallocated arrays.
 
     Performs deferred string conversions in bulk rather than per-message
     during streaming.
     """
-    df = pd.DataFrame(rows)
+    total_rows = sum(len(rows) for rows in reservoirs.values())
+
+    deployment_bytes_arr = np.empty(total_rows, dtype=object)
+    indexer_bytes_arr = np.empty(total_rows, dtype=object)
+    query_id_arr = np.empty(total_rows, dtype=object)
+    fee_arr = np.empty(total_rows, dtype=np.float64)
+    ts_ms_arr = np.empty(total_rows, dtype=np.int64)
+    blocks_behind_arr = np.empty(total_rows, dtype=np.int64)
+    response_time_ms_arr = np.empty(total_rows, dtype=np.int64)
+    status_arr = np.empty(total_rows, dtype=object)
+    subgraph_network_arr = np.empty(total_rows, dtype=object)
+    url_arr = np.empty(total_rows, dtype=object)
+
+    i = 0
+    for (dep_bytes, idx_bytes), rows in reservoirs.items():
+        n = len(rows)
+        if not n:
+            continue
+        cols = list(zip(*rows))
+        deployment_bytes_arr[i : i + n] = dep_bytes
+        indexer_bytes_arr[i : i + n] = idx_bytes
+        query_id_arr[i : i + n] = cols[0]
+        fee_arr[i : i + n] = cols[1]
+        ts_ms_arr[i : i + n] = cols[2]
+        blocks_behind_arr[i : i + n] = cols[3]
+        response_time_ms_arr[i : i + n] = cols[4]
+        status_arr[i : i + n] = cols[5]
+        subgraph_network_arr[i : i + n] = cols[6]
+        url_arr[i : i + n] = cols[7]
+        i += n
+
+    df = pd.DataFrame(
+        {
+            "deployment_bytes": deployment_bytes_arr,
+            "indexer_bytes": indexer_bytes_arr,
+            "query_id": query_id_arr,
+            "fee": fee_arr,
+            "ts_ms": ts_ms_arr,
+            "blocks_behind": blocks_behind_arr,
+            "response_time_ms": response_time_ms_arr,
+            "status": status_arr,
+            "subgraph_network": subgraph_network_arr,
+            "url": url_arr,
+        }
+    )
 
     dep_map = {b: _bytes_to_cid(b) for b in df["deployment_bytes"].unique()}
     idx_map = {b: _bytes_to_hex(b) for b in df["indexer_bytes"].unique()}
