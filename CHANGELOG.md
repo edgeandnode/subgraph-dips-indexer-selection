@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.1.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.0.2...v2.1.0) (2026-04-20)
+
+
+### Added
+
+* **cronjob:** print 120s progress heartbeat from redpanda workers ([#128](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/128)) ([fa11e28](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/fa11e283db530e9483a644951d4da67d40eee4ff))
+
+
+### Performance
+
+* **cronjob:** cut sample-worker row memory and bound merge peak ([#130](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/130)) ([89cd68e](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/89cd68e38fc25d58572efd47f11d17bce87d8c89))
+
 ## [2.0.2](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.0.1...v2.0.2) (2026-04-16)
 
 
