@@ -1,5 +1,6 @@
 """Tests for the DataManager class."""
 
+import dataclasses
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
@@ -223,7 +224,9 @@ class TestDataManager:
         """
         data_manager = DataManager(MagicMock())
 
-        assert data_manager.snapshot == ScoresSnapshot(data=None, computed_at=None)
+        initial = data_manager.snapshot
+        assert initial.data is None
+        assert initial.computed_at is None
 
         ts1 = datetime(2024, 1, 15, 12, 0, tzinfo=timezone.utc)
         df1 = data_manager.transform_scores_df(mock_scores_df)
@@ -256,5 +259,5 @@ class TestDataManager:
         bundling is that a reader's reference cannot be tampered with after
         capture."""
         snap = ScoresSnapshot(data=None, computed_at=None)
-        with pytest.raises(Exception):  # dataclasses.FrozenInstanceError
+        with pytest.raises(dataclasses.FrozenInstanceError):
             snap.data = pd.DataFrame()  # type: ignore[misc]

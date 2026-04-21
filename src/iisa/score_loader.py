@@ -17,7 +17,7 @@ import pandas as pd
 __all__ = ["FileScoreLoader", "DataManager", "ScoresSnapshot"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ScoresSnapshot:
     """Immutable pair of (scores DataFrame, computed_at) swapped atomically.
 
@@ -27,6 +27,12 @@ class ScoresSnapshot:
     reader can land on (new computed_at, old data) or vice-versa. A single
     reference swap (`self._snapshot = ScoresSnapshot(...)`) is atomic in
     CPython, so readers always observe both fields from the same generation.
+
+    eq=False because structural equality would call DataFrame.__eq__, which
+    returns an element-wise boolean DataFrame instead of a bool and raises
+    on truth-testing. Identity comparison is the right primitive for a
+    snapshot-generation container; callers that want field comparison
+    should check `.data is x` and `.computed_at == y` explicitly.
     """
 
     data: Optional[pd.DataFrame]
