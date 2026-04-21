@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from iisa import DataManager
+from iisa.score_loader import ScoresSnapshot
 
 
 class TestDataManager:
@@ -208,4 +209,52 @@ class TestDataManager:
         assert current is not None
         # Second commit's values should be what's in memory, not the first.
         assert list(current["% up_x"]) == pytest.approx([50.0, 60.0, 70.0])
-        assert data_manager._scores_computed_at == ts2
+        assert data_manager.snapshot.computed_at == ts2
+
+    def test_snapshot_is_consistent_pair_across_commits(self, mock_scores_df):
+        """Each snapshot observation carries data and computed_at from the same
+        push. The pre-refactor code exposed a window where data and
+        computed_at could disagree; the atomic-swap design closes it.
+
+        A reader that captures a snapshot before a later commit continues to
+        see the earlier push's values — the snapshot is frozen and detached
+        from the live attribute, so in-flight readers are not affected by
+        subsequent writes.
+        """
+        data_manager = DataManager(MagicMock())
+
+        assert data_manager.snapshot == ScoresSnapshot(data=None, computed_at=None)
+
+        ts1 = datetime(2024, 1, 15, 12, 0, tzinfo=timezone.utc)
+        df1 = data_manager.transform_scores_df(mock_scores_df)
+        data_manager.commit_scores(df1, ts1)
+        snap1 = data_manager.snapshot
+
+        assert snap1.computed_at == ts1
+        assert snap1.data is not None
+        assert list(snap1.data["% up_x"]) == pytest.approx([98.0, 95.0, 99.0])
+
+        df2_raw = mock_scores_df.copy()
+        df2_raw["uptime_score"] = [0.50, 0.60, 0.70]
+        df2 = data_manager.transform_scores_df(df2_raw)
+        ts2 = datetime(2024, 1, 16, 12, 0, tzinfo=timezone.utc)
+        data_manager.commit_scores(df2, ts2)
+        snap2 = data_manager.snapshot
+
+        # Both fields advance together — never a mix.
+        assert snap2.computed_at == ts2
+        assert list(snap2.data["% up_x"]) == pytest.approx([50.0, 60.0, 70.0])
+
+        # snap1 is still the first push's consistent pair, unaffected by the
+        # second commit. Without the frozen dataclass, the second commit
+        # could have mutated what a reader was observing.
+        assert snap1.computed_at == ts1
+        assert list(snap1.data["% up_x"]) == pytest.approx([98.0, 95.0, 99.0])
+
+    def test_snapshot_is_frozen(self):
+        """ScoresSnapshot must reject field mutation — the whole point of
+        bundling is that a reader's reference cannot be tampered with after
+        capture."""
+        snap = ScoresSnapshot(data=None, computed_at=None)
+        with pytest.raises(Exception):  # dataclasses.FrozenInstanceError
+            snap.data = pd.DataFrame()  # type: ignore[misc]

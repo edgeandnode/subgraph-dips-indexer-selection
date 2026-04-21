@@ -613,13 +613,15 @@ class TestPushScoresEndpoint:
         scores_path = str(tmp_path / "scores.json")
         monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", scores_path)
 
+        from iisa.score_loader import ScoresSnapshot
+
         mock_dm_instance = MagicMock()
         mock_dm_instance.scores_file_path = scores_path
-        mock_dm_instance._scores_computed_at = None
+        mock_dm_instance.snapshot = ScoresSnapshot(data=None, computed_at=None)
         mock_dm_instance.get_data.return_value = pd.DataFrame({"indexer": ["0xABC"]})
 
         def _commit(transformed_df, computed_at):
-            mock_dm_instance._scores_computed_at = computed_at
+            mock_dm_instance.snapshot = ScoresSnapshot(data=transformed_df, computed_at=computed_at)
 
         mock_dm_instance.commit_scores.side_effect = _commit
         mock_dm_class.return_value = mock_dm_instance
@@ -660,15 +662,19 @@ class TestScoresStatusEndpoint:
     def test_returns_computed_at_when_loaded(self, monkeypatch):
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import Settings, app
+        from iisa.score_loader import ScoresSnapshot
 
         iisa_http_endpoints.get_settings.cache_clear()
         iisa_http_endpoints._state.initialize(Settings())
 
-        # Seed state with a fake DataManager that has a computed_at
+        # Seed state with a fake DataManager whose snapshot has both data
+        # and computed_at — the endpoint reads them as a single pair.
         mock_dm = MagicMock()
-        mock_dm._scores_computed_at = datetime(2026, 4, 14, 9, 0, tzinfo=timezone.utc)
+        mock_dm.snapshot = ScoresSnapshot(
+            data=pd.DataFrame({"indexer": ["0xABC"]}),
+            computed_at=datetime(2026, 4, 14, 9, 0, tzinfo=timezone.utc),
+        )
         iisa_http_endpoints._state.data_manager = mock_dm
-        iisa_http_endpoints._state._history = pd.DataFrame({"indexer": ["0xABC"]})
 
         client = TestClient(app, raise_server_exceptions=False)
         response = client.get("/scores/status")
@@ -699,25 +705,28 @@ class TestScoresSnapshotEndpoint:
     def test_returns_records_with_computed_at_when_loaded(self, monkeypatch):
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import Settings, app
+        from iisa.score_loader import ScoresSnapshot
 
         iisa_http_endpoints.get_settings.cache_clear()
         iisa_http_endpoints._state.initialize(Settings())
 
-        # Seed history with a mix of float, NaN, and string columns to make
-        # sure the to_json round-trip handles NaN → null correctly. The
-        # cronjob pushes NaN for indexers missing optional fields, so the
-        # read-back must not 500 or emit invalid JSON.
+        # Mix float, NaN, and string columns so the to_json round-trip
+        # hits the NaN → null path. The cronjob pushes NaN for indexers
+        # missing optional fields, so the read-back must not 500 or emit
+        # invalid JSON.
         mock_dm = MagicMock()
-        mock_dm._scores_computed_at = datetime(2026, 4, 21, 11, 19, tzinfo=timezone.utc)
-        iisa_http_endpoints._state.data_manager = mock_dm
-        iisa_http_endpoints._state._history = pd.DataFrame(
-            {
-                "indexer": ["0xAAA", "0xBBB"],
-                "url": ["https://a.example/", "https://b.example/"],
-                "scoring_mode": ["full", "full"],
-                "lat_normalized_score": [0.9, float("nan")],
-            }
+        mock_dm.snapshot = ScoresSnapshot(
+            data=pd.DataFrame(
+                {
+                    "indexer": ["0xAAA", "0xBBB"],
+                    "url": ["https://a.example/", "https://b.example/"],
+                    "scoring_mode": ["full", "full"],
+                    "lat_normalized_score": [0.9, float("nan")],
+                }
+            ),
+            computed_at=datetime(2026, 4, 21, 11, 19, tzinfo=timezone.utc),
         )
+        iisa_http_endpoints._state.data_manager = mock_dm
 
         client = TestClient(app, raise_server_exceptions=False)
         response = client.get("/scores")
