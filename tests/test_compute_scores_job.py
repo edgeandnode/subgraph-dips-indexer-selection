@@ -1244,44 +1244,20 @@ class TestMergeAndPrepareDataframes:
 # main.py: run_scoring() push-failure accounting and validate_configuration()
 # ----------------------------------------------------------------------
 
-# Import main lazily so the module-level signal handlers and env reads don't
-# fire until the first test that needs them. main is in cronjobs/compute_scores
-# which jobs_path already added to sys.path at the top of this file.
+# main is in cronjobs/compute_scores which jobs_path already added to sys.path
+# at the top of this file.
 import main  # noqa: E402
 from iisa_client import IISAPushError  # noqa: E402
 
 
-@pytest.fixture
-def reset_main_state(monkeypatch):
-    """Reset main.py module-level counters and last-run state between tests."""
-    # Snapshot current values so the fixture restores them after the test.
-    original_consecutive_failed = main._consecutive_failed
-    original_consecutive_partial = main._consecutive_partial
-    original_consecutive_degraded = main._consecutive_degraded
-    original_last_run = dict(main._last_run)
-
-    main._consecutive_failed = 0
-    main._consecutive_partial = 0
-    main._consecutive_degraded = 0
-    main._last_run.clear()
-
-    yield
-
-    main._consecutive_failed = original_consecutive_failed
-    main._consecutive_partial = original_consecutive_partial
-    main._consecutive_degraded = original_consecutive_degraded
-    main._last_run.clear()
-    main._last_run.update(original_last_run)
-
-
 class TestRunScoringPushFailure:
-    """run_scoring() must mark the run failed when IISAPushError escapes write_scores."""
+    """run_scoring() must return False when IISAPushError escapes write_scores."""
 
-    def test_push_failure_marks_run_as_failed(self, reset_main_state, monkeypatch):
+    def test_push_failure_marks_run_as_failed(self, monkeypatch, caplog):
         # Arrange — mock the pipeline to return a non-empty DataFrame, then have
         # provider.write_scores raise IISAPushError. Without the try/except in
-        # run_scoring(), the exception would propagate past the status-lock block
-        # and _last_run would never update.
+        # run_scoring(), the exception would propagate out of the function and
+        # the cronjob would crash rather than exit cleanly with a non-zero code.
         from unittest.mock import MagicMock
 
         scores_df = pd.DataFrame(
@@ -1304,13 +1280,14 @@ class TestRunScoringPushFailure:
         )
 
         # Act
-        result = main.run_scoring()
+        with caplog.at_level("INFO", logger=main.logger.name):
+            result = main.run_scoring()
 
-        # Assert — run is marked failed, not silently successful with stale counters
+        # Assert — run is marked failed and the summary log reports mode=failed,
+        # so the CronJob's failedJobsHistoryLimit and any log-based alerting
+        # can see the failure mode without needing in-process counters.
         assert result is False
-        assert main._consecutive_failed == 1
-        assert main._last_run["mode"] == main.MODE_FAILED
-        assert main._last_run["success"] is False
+        assert any("mode=failed" in rec.getMessage() for rec in caplog.records)
         mock_provider.write_scores.assert_called_once()
 
 
