@@ -116,17 +116,67 @@ def _map_result_to_status(result: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _emit_heartbeat(label: str, partition: int, total: int, filtered: int, pairs: int) -> None:
+def _format_eta(seconds: float) -> str:
+    """Render an ETA in seconds as a compact `<1m` / `Nm` / `NhMMm` string."""
+    if seconds < 60:
+        return "<1m"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, rem = divmod(minutes, 60)
+    return f"{hours}h{rem:02d}m"
+
+
+def _format_progress(start_off: int, cur_off: int, end_off: int, elapsed_sec: float) -> str:
+    """Render a percentage-complete and ETA suffix for a partition worker.
+
+    Returns one of:
+      - "100% (done)" when the offset span is empty (partition had no data).
+      - "N% (ETA unknown)" at startup, before any messages have been consumed.
+      - "N% (ETA <compact>)" during steady-state consumption.
+    """
+    span = end_off - start_off
+    consumed = cur_off - start_off
+    if span <= 0:
+        return "100% (done)"
+    pct = max(0, min(100, int(consumed * 100 / span)))
+    if elapsed_sec <= 0 or consumed <= 0:
+        return f"{pct}% (ETA unknown)"
+    rate = consumed / elapsed_sec
+    remaining = max(0, end_off - cur_off)
+    eta_sec = remaining / rate if rate > 0 else 0.0
+    return f"{pct}% (ETA {_format_eta(eta_sec)})"
+
+
+def _emit_heartbeat(
+    label: str,
+    partition: int,
+    total: int,
+    filtered: int,
+    pairs: int,
+    start_off: int,
+    cur_off: int,
+    end_off: int,
+    elapsed_sec: float,
+) -> None:
     """Emit a worker progress heartbeat line with a full ISO-8601 UTC timestamp.
 
     Prints directly to stdout for the reasons documented on
     PROGRESS_LOG_INTERVAL_SEC. Used for both the startup line (so a stuck
     worker is distinguishable from one that never entered the loop) and the
     periodic in-loop heartbeat.
+
+    The trailing `N% (ETA ...)` suffix is computed from the partition's
+    offset range resolved once at pass start: `start_off` is the offset at
+    the window boundary, `end_off` is the broker high watermark at that
+    moment, and `cur_off` is the offset of the last message the worker has
+    processed so far.
     """
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    progress = _format_progress(start_off, cur_off, end_off, elapsed_sec)
     print(
-        f"[{ts} {label} p{partition}] {total:,} msgs ({filtered:,} filtered), {pairs} pairs",
+        f"[{ts} {label} p{partition}] {total:,} msgs ({filtered:,} filtered), "
+        f"{pairs} pairs, {progress}",
         flush=True,
     )
 
@@ -136,10 +186,14 @@ def _count_partition_worker(args: tuple) -> tuple:
     Count pass for a single partition. Runs in a child process.
 
     Args is a tuple: (topic, partition, offset, end_ts_ms,
-                       consumer_config, gateway_id_filter)
+                       consumer_config, gateway_id_filter, end_offset)
+    `offset` is the start offset at the window boundary; `end_offset` is
+    the broker high watermark captured at pass start, used only for the
+    progress/ETA suffix in heartbeats.
+
     Returns: (counts, fees, message_count, filtered_count)
     """
-    topic, partition, offset, end_ts_ms, config, gw_filter = args
+    topic, partition, start_offset, end_ts_ms, config, gw_filter, end_offset = args
 
     from confluent_kafka import Consumer, TopicPartition
 
@@ -149,20 +203,32 @@ def _count_partition_worker(args: tuple) -> tuple:
     total_messages = 0
     filtered_count = 0
     consecutive_empty = 0
+    last_offset = start_offset
 
     try:
-        consumer.assign([TopicPartition(topic, partition, offset)])
+        consumer.assign([TopicPartition(topic, partition, start_offset)])
 
         # Startup heartbeat: confirms the worker entered the loop before the
         # first 30s consume() call, so a broker connection problem can't
         # masquerade as an unstarted worker.
-        _emit_heartbeat("count", partition, 0, 0, 0)
-        last_progress_log = time.monotonic()
+        loop_start = time.monotonic()
+        _emit_heartbeat("count", partition, 0, 0, 0, start_offset, start_offset, end_offset, 0.0)
+        last_progress_log = loop_start
 
         while True:
             now = time.monotonic()
             if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
-                _emit_heartbeat("count", partition, total_messages, filtered_count, len(counts))
+                _emit_heartbeat(
+                    "count",
+                    partition,
+                    total_messages,
+                    filtered_count,
+                    len(counts),
+                    start_offset,
+                    last_offset,
+                    end_offset,
+                    now - loop_start,
+                )
                 last_progress_log = now
 
             messages = consumer.consume(num_messages=1000, timeout=30.0)
@@ -186,6 +252,7 @@ def _count_partition_worker(args: tuple) -> tuple:
                 if ts_ms > end_ts_ms:
                     return (counts, fees, total_messages, filtered_count)
 
+                last_offset = msg.offset()
                 total_messages += 1
 
                 try:
@@ -216,10 +283,16 @@ def _sample_partition_worker(args: tuple) -> tuple:
 
     Args is a tuple: (topic, partition, offset, end_ts_ms,
                        consumer_config, gateway_id_filter, rows_to_use,
-                       seed)
+                       seed, end_offset)
+    `offset` is the start offset; `end_offset` is the broker high watermark
+    captured at pass start, used only for the progress/ETA suffix in
+    heartbeats.
+
     Returns: (reservoirs, counts, filtered_count)
     """
-    topic, partition, offset, end_ts_ms, config, gw_filter, rows_to_use, seed = args
+    topic, partition, start_offset, end_ts_ms, config, gw_filter, rows_to_use, seed, end_offset = (
+        args
+    )
 
     from confluent_kafka import Consumer, TopicPartition
 
@@ -230,6 +303,7 @@ def _sample_partition_worker(args: tuple) -> tuple:
     filtered_count = 0
     total_messages = 0
     consecutive_empty = 0
+    last_offset = start_offset
 
     # Worker-local intern caches. Protobuf hands us fresh str objects for every
     # message even when the value is identical to one we've already seen, so
@@ -243,17 +317,26 @@ def _sample_partition_worker(args: tuple) -> tuple:
     chain_cache: Dict[str, str] = {}
 
     try:
-        consumer.assign([TopicPartition(topic, partition, offset)])
+        consumer.assign([TopicPartition(topic, partition, start_offset)])
 
         # Startup heartbeat: see _count_partition_worker.
-        _emit_heartbeat("sample", partition, 0, 0, 0)
-        last_progress_log = time.monotonic()
+        loop_start = time.monotonic()
+        _emit_heartbeat("sample", partition, 0, 0, 0, start_offset, start_offset, end_offset, 0.0)
+        last_progress_log = loop_start
 
         while True:
             now = time.monotonic()
             if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
                 _emit_heartbeat(
-                    "sample", partition, total_messages, filtered_count, len(reservoirs)
+                    "sample",
+                    partition,
+                    total_messages,
+                    filtered_count,
+                    len(reservoirs),
+                    start_offset,
+                    last_offset,
+                    end_offset,
+                    now - loop_start,
                 )
                 last_progress_log = now
 
@@ -278,6 +361,7 @@ def _sample_partition_worker(args: tuple) -> tuple:
                 if ts_ms > end_ts_ms:
                     return (reservoirs, counts, filtered_count)
 
+                last_offset = msg.offset()
                 total_messages += 1
 
                 try:
@@ -406,6 +490,9 @@ class RedpandaProvider:
 
         # Partition offsets cached between passes
         self._cached_partitions: Optional[list] = None
+        # High watermark per partition at the moment _resolve_partitions ran,
+        # used only for the ETA/progress suffix in worker heartbeats.
+        self._partition_ends: Dict[int, int] = {}
 
     def _consumer_config(self) -> dict:
         """Base librdkafka config shared by all consumers."""
@@ -622,6 +709,11 @@ class RedpandaProvider:
         Creates a temporary consumer for metadata and offset resolution,
         stores result in self._cached_partitions for reuse in pass 2.
 
+        Also captures the broker high watermark per partition into
+        self._partition_ends so workers can report progress and ETA against
+        a fixed target (messages arriving after pass start aren't counted,
+        matching the window-end semantics already enforced by end_ts_ms).
+
         Both list_topics and offsets_for_times are synchronous broker calls
         with 30s timeouts — logging each stage makes a slow or unreachable
         broker observable in cronjob logs rather than surfacing as a silent
@@ -656,6 +748,24 @@ class RedpandaProvider:
                 for tp in resolved
                 if tp.offset >= 0
             ]
+
+            # High watermarks for ETA reporting. get_watermark_offsets is a
+            # cheap per-partition metadata call. If it fails for a partition
+            # we fall back to the start offset, which produces "0% (done)"
+            # in heartbeats rather than a division-by-zero.
+            partition_ends: Dict[int, int] = {}
+            for tp in valid:
+                try:
+                    _, hi = consumer.get_watermark_offsets(tp, timeout=10)
+                except Exception as e:
+                    logger.warning(
+                        "get_watermark_offsets failed for p%d: %s — ETA will be unavailable",
+                        tp.partition,
+                        e,
+                    )
+                    hi = tp.offset
+                partition_ends[tp.partition] = hi
+
             logger.info(
                 "Resolved %d partitions with valid offsets (%d partitions had no data in window)",
                 len(valid),
@@ -665,6 +775,7 @@ class RedpandaProvider:
             consumer.close()
 
         self._cached_partitions = valid
+        self._partition_ends = partition_ends
         return valid
 
     # -----------------------------------------------------------------------
@@ -707,7 +818,16 @@ class RedpandaProvider:
         config = self._consumer_config()
         gw_filter = self._gateway_id_filter
         args = [
-            (tp.topic, tp.partition, tp.offset, end_ts_ms, config, gw_filter) for tp in partitions
+            (
+                tp.topic,
+                tp.partition,
+                tp.offset,
+                end_ts_ms,
+                config,
+                gw_filter,
+                self._partition_ends.get(tp.partition, tp.offset),
+            )
+            for tp in partitions
         ]
         with ProcessPoolExecutor(max_workers=min(len(partitions), MAX_PARTITION_WORKERS)) as pool:
             results = list(pool.map(_count_partition_worker, args))
@@ -794,7 +914,17 @@ class RedpandaProvider:
         gw_filter = self._gateway_id_filter
         seed = int(os.environ.get("SCORING_SEED", start_date.strftime("%Y%m%d")))
         args = [
-            (tp.topic, tp.partition, tp.offset, end_ts_ms, config, gw_filter, rows_to_use, seed)
+            (
+                tp.topic,
+                tp.partition,
+                tp.offset,
+                end_ts_ms,
+                config,
+                gw_filter,
+                rows_to_use,
+                seed,
+                self._partition_ends.get(tp.partition, tp.offset),
+            )
             for tp in partitions
         ]
         with ProcessPoolExecutor(max_workers=min(len(partitions), MAX_PARTITION_WORKERS)) as pool:
