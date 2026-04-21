@@ -1,7 +1,7 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: iisa-allow-dipper-only
+  name: iisa-allow-dipper-and-score-computation
   labels:
     app: iisa
 spec:
@@ -15,6 +15,9 @@ spec:
         - podSelector:
             matchLabels:
               app: dipper
+        - podSelector:
+            matchLabels:
+              app: iisa-score-computation
       ports:
         - protocol: TCP
           port: 8080
