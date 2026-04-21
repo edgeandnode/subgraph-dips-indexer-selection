@@ -8,12 +8,36 @@ to a JSON file. IISA reads these scores on startup using DataManager.load_scores
 import json
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 import pandas as pd
 
-__all__ = ["FileScoreLoader", "DataManager"]
+__all__ = ["FileScoreLoader", "DataManager", "ScoresSnapshot"]
+
+
+@dataclass(frozen=True, eq=False)
+class ScoresSnapshot:
+    """Immutable pair of (scores DataFrame, computed_at) swapped atomically.
+
+    Why bundle: a reader that wants a consistent view of "what scores are
+    loaded and when were they computed" must see both fields from the same
+    push. Two separate attribute writes during a push open a window where a
+    reader can land on (new computed_at, old data) or vice-versa. A single
+    reference swap (`self._snapshot = ScoresSnapshot(...)`) is atomic in
+    CPython, so readers always observe both fields from the same generation.
+
+    eq=False because structural equality would call DataFrame.__eq__, which
+    returns an element-wise boolean DataFrame instead of a bool and raises
+    on truth-testing. Identity comparison is the right primitive for a
+    snapshot-generation container; callers that want field comparison
+    should check `.data is x` and `.computed_at == y` explicitly.
+    """
+
+    data: Optional[pd.DataFrame]
+    computed_at: Optional[datetime]
+
 
 # Staleness thresholds
 STALE_SCORES_WARNING_HOURS = 48
@@ -94,8 +118,12 @@ class DataManager:
 
     def __init__(self, provider) -> None:
         self._provider = provider
-        self._data: Optional[pd.DataFrame] = None
-        self._scores_computed_at: Optional[datetime] = None
+        self._snapshot: ScoresSnapshot = ScoresSnapshot(data=None, computed_at=None)
+
+    @property
+    def snapshot(self) -> ScoresSnapshot:
+        """Atomic snapshot of (data, computed_at) — read once, consistent pair."""
+        return self._snapshot
 
     @property
     def scores_file_path(self) -> Optional[str]:
@@ -121,21 +149,22 @@ class DataManager:
 
         if scores_df.empty:
             logger.warning("No pre-computed scores available")
-            self._data = None
+            self._snapshot = ScoresSnapshot(data=None, computed_at=None)
             return False
 
-        self._scores_computed_at = computed_at
         self._check_scores_staleness(computed_at)
-        self._data = self._transform_scores_to_perf_history(scores_df)
+        transformed = self._transform_scores_to_perf_history(scores_df)
+        # Atomic swap — a reader concurrent with this line sees either
+        # the previous snapshot or the new one, never a mix.
+        self._snapshot = ScoresSnapshot(data=transformed, computed_at=computed_at)
 
-        logger.info(f"Loaded scores for {len(self._data)} indexers")
+        logger.info(f"Loaded scores for {len(transformed)} indexers")
         return True
 
     def transform_scores_df(self, scores_df: pd.DataFrame) -> pd.DataFrame:
         """
         Pure transform: run the same column mapping as load_scores() and
-        return the result without touching self._data or
-        self._scores_computed_at.
+        return the result without touching self._snapshot.
 
         Used by the push path (POST /scores) to dry-run the transform
         before committing anything to disk or in-memory state. A transform
@@ -158,14 +187,14 @@ class DataManager:
         Commit an already-transformed scores DataFrame to in-memory state.
 
         Callers must have run transform_scores_df() on the raw input first;
-        this method only updates self._data + self._scores_computed_at and
-        logs staleness. Split out from load_scores_from_df so the push
-        handler can validate-then-write-disk-then-commit in three distinct
-        steps instead of two coupled ones.
+        this method performs the atomic snapshot swap and logs staleness.
+        Split out from load_scores_from_df so the push handler can
+        validate-then-write-disk-then-commit in three distinct steps
+        instead of two coupled ones.
         """
-        self._scores_computed_at = computed_at
         self._check_scores_staleness(computed_at)
-        self._data = transformed_df
+        # Atomic swap — see ScoresSnapshot docstring.
+        self._snapshot = ScoresSnapshot(data=transformed_df, computed_at=computed_at)
         logger.info("Committed %d scores to in-memory state", len(transformed_df))
 
     def load_scores_from_df(
@@ -186,8 +215,7 @@ class DataManager:
         """
         if scores_df.empty:
             logger.warning("load_scores_from_df called with empty DataFrame")
-            self._data = None
-            self._scores_computed_at = None
+            self._snapshot = ScoresSnapshot(data=None, computed_at=None)
             return False
 
         transformed = self.transform_scores_df(scores_df)
@@ -251,11 +279,12 @@ class DataManager:
 
     def get_scores_age(self) -> Optional[timedelta]:
         """Return the age of the current scores."""
-        if self._scores_computed_at is None:
+        snap = self._snapshot
+        if snap.computed_at is None:
             return None
 
         now = datetime.now(timezone.utc)
-        computed_at = self._scores_computed_at
+        computed_at = snap.computed_at
         if computed_at.tzinfo is None:
             computed_at = computed_at.replace(tzinfo=timezone.utc)
 
@@ -263,4 +292,4 @@ class DataManager:
 
     def get_data(self) -> Optional[pd.DataFrame]:
         """Return the loaded scores data."""
-        return self._data
+        return self._snapshot.data

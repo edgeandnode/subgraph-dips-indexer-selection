@@ -613,13 +613,15 @@ class TestPushScoresEndpoint:
         scores_path = str(tmp_path / "scores.json")
         monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", scores_path)
 
+        from iisa.score_loader import ScoresSnapshot
+
         mock_dm_instance = MagicMock()
         mock_dm_instance.scores_file_path = scores_path
-        mock_dm_instance._scores_computed_at = None
+        mock_dm_instance.snapshot = ScoresSnapshot(data=None, computed_at=None)
         mock_dm_instance.get_data.return_value = pd.DataFrame({"indexer": ["0xABC"]})
 
         def _commit(transformed_df, computed_at):
-            mock_dm_instance._scores_computed_at = computed_at
+            mock_dm_instance.snapshot = ScoresSnapshot(data=transformed_df, computed_at=computed_at)
 
         mock_dm_instance.commit_scores.side_effect = _commit
         mock_dm_class.return_value = mock_dm_instance
@@ -660,15 +662,19 @@ class TestScoresStatusEndpoint:
     def test_returns_computed_at_when_loaded(self, monkeypatch):
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import Settings, app
+        from iisa.score_loader import ScoresSnapshot
 
         iisa_http_endpoints.get_settings.cache_clear()
         iisa_http_endpoints._state.initialize(Settings())
 
-        # Seed state with a fake DataManager that has a computed_at
+        # Seed state with a fake DataManager whose snapshot has both data
+        # and computed_at — the endpoint reads them as a single pair.
         mock_dm = MagicMock()
-        mock_dm._scores_computed_at = datetime(2026, 4, 14, 9, 0, tzinfo=timezone.utc)
+        mock_dm.snapshot = ScoresSnapshot(
+            data=pd.DataFrame({"indexer": ["0xABC"]}),
+            computed_at=datetime(2026, 4, 14, 9, 0, tzinfo=timezone.utc),
+        )
         iisa_http_endpoints._state.data_manager = mock_dm
-        iisa_http_endpoints._state._history = pd.DataFrame({"indexer": ["0xABC"]})
 
         client = TestClient(app, raise_server_exceptions=False)
         response = client.get("/scores/status")
@@ -691,6 +697,85 @@ class TestScoresStatusEndpoint:
         body = response.json()
         assert body["computed_at"] is None
         assert body["rows"] == 0
+
+
+class TestScoresSnapshotEndpoint:
+    """Tests for GET /scores (full snapshot read-back)."""
+
+    def test_returns_records_with_computed_at_when_loaded(self, monkeypatch):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+        from iisa.score_loader import ScoresSnapshot
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+
+        # Mix float, NaN, and string columns so the to_json round-trip
+        # hits the NaN → null path. The cronjob pushes NaN for indexers
+        # missing optional fields, so the read-back must not 500 or emit
+        # invalid JSON.
+        mock_dm = MagicMock()
+        mock_dm.snapshot = ScoresSnapshot(
+            data=pd.DataFrame(
+                {
+                    "indexer": ["0xAAA", "0xBBB"],
+                    "url": ["https://a.example/", "https://b.example/"],
+                    "scoring_mode": ["full", "full"],
+                    "lat_normalized_score": [0.9, float("nan")],
+                }
+            ),
+            computed_at=datetime(2026, 4, 21, 11, 19, tzinfo=timezone.utc),
+        )
+        iisa_http_endpoints._state.data_manager = mock_dm
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get("/scores")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["count"] == 2
+        assert "2026-04-21" in body["computed_at"]
+        assert len(body["scores"]) == 2
+        indexers = {row["indexer"] for row in body["scores"]}
+        assert indexers == {"0xAAA", "0xBBB"}
+        # NaN must surface as JSON null, not NaN (invalid JSON) or skipped.
+        nan_row = next(r for r in body["scores"] if r["indexer"] == "0xBBB")
+        assert nan_row["lat_normalized_score"] is None
+
+    def test_returns_empty_snapshot_when_no_scores_loaded(self):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.get("/scores")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["computed_at"] is None
+        assert body["count"] == 0
+        assert body["scores"] == []
+
+    def test_requires_bearer_when_push_token_set(self, monkeypatch):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # No Authorization header → 401.
+        response = client.get("/scores")
+        assert response.status_code == 401
+
+        # Wrong token → 401.
+        response = client.get("/scores", headers={"Authorization": "Bearer wrong"})
+        assert response.status_code == 401
+
+        # Correct token → 200 (even with no history loaded).
+        response = client.get("/scores", headers={"Authorization": "Bearer secret"})
+        assert response.status_code == 200
 
 
 class TestGetScoreEndpoint:

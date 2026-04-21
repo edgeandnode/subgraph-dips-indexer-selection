@@ -7,6 +7,7 @@ contract expected by the Rust HTTP client in dipper-iisa.
 Endpoints:
 - GET /health - Health check, reports if data is loaded
 - POST /scores - Push computed indexer scores from the cronjob (bearer-auth)
+- GET /scores - Return the current scores snapshot (bearer-auth)
 - GET /scores/status - Report last computed_at for idempotency (bearer-auth)
 - POST /sync-status - Push sync-status snapshot from the fetcher (bearer-auth)
 - POST /get-score - Return weighted score and components for one indexer
@@ -60,9 +61,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     sync_status_file_path: str = "/app/scores/sync_status.json"
     sync_status_staleness_hours: float = 6.0
-    # Bearer token required on POST /scores, POST /sync-status, GET /scores/status.
-    # When unset, push endpoints accept unauthenticated requests and a WARNING
-    # is logged at startup — local development convenience only.
+    # Bearer token required on POST /scores, GET /scores, GET /scores/status,
+    # and POST /sync-status. When unset, these endpoints accept unauthenticated
+    # requests and a WARNING is logged at startup — local dev convenience only.
     push_token: Optional[str] = None
     # When true, startup fails hard if push_token is unset. Set in k8s so a
     # misconfigured Secret is caught at rollout rather than leaving production
@@ -172,6 +173,22 @@ class ScoresAcceptedResponse(BaseModel):
 
     status: str
     rows: int
+
+
+class ScoresSnapshotResponse(BaseModel):
+    """
+    Response for the GET /scores endpoint.
+
+    Full snapshot of scored indexers currently loaded in memory. Intended
+    for ops debugging ("did indexer X get scored and in what mode?"),
+    external monitoring, and local-network test harnesses. The shape
+    mirrors the POST /scores payload (list of records) so the round-trip
+    is symmetric.
+    """
+
+    computed_at: Optional[str] = None
+    count: int = 0
+    scores: list[dict[str, Any]] = []
 
 
 class SyncStatusAcceptedResponse(BaseModel):
@@ -562,18 +579,74 @@ def scores_status(
     The cronjob GETs this before running to skip redundant recomputation
     when today's scores are already pushed. Sync def for consistency with
     the other push endpoints — body contains no awaitable work.
+
+    Reads the DataManager snapshot once so computed_at and the row count
+    always describe the same push (see ScoresSnapshot).
     """
     _require_push_token(authorization)
 
+    if _state.data_manager is None:
+        return ScoresStatusResponse(computed_at=None, rows=0)
+
+    snap = _state.data_manager.snapshot
     computed_at: Optional[str] = None
-    if _state.data_manager is not None and _state.data_manager._scores_computed_at is not None:
-        ts = _state.data_manager._scores_computed_at
+    if snap.computed_at is not None:
+        ts = snap.computed_at
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         computed_at = ts.isoformat()
 
-    rows = len(_state.history) if _state.history is not None else 0
+    rows = len(snap.data) if snap.data is not None else 0
     return ScoresStatusResponse(computed_at=computed_at, rows=rows)
+
+
+@app.get("/scores", response_model=ScoresSnapshotResponse)
+def scores_snapshot(
+    authorization: Optional[str] = Header(None),
+) -> ScoresSnapshotResponse:
+    """
+    Return the currently loaded scores snapshot as a list of records.
+
+    Symmetric with POST /scores — what the cronjob pushed is what's
+    served here. Intended for ops debugging, external monitoring, and
+    local-network test harnesses; not part of the selection hot path
+    (use POST /select-indexers for that).
+
+    Reads the DataManager snapshot once so computed_at and scores
+    always describe the same push (see ScoresSnapshot). When no scores
+    are loaded yet, returns computed_at=null, count=0, scores=[]. Sync
+    def so the DataFrame→JSON conversion runs in FastAPI's threadpool
+    rather than on the event loop.
+    """
+    _require_push_token(authorization)
+
+    if _state.data_manager is None:
+        return ScoresSnapshotResponse(computed_at=None, count=0, scores=[])
+
+    snap = _state.data_manager.snapshot
+
+    computed_at: Optional[str] = None
+    if snap.computed_at is not None:
+        ts = snap.computed_at
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        computed_at = ts.isoformat()
+
+    if snap.data is None:
+        return ScoresSnapshotResponse(computed_at=computed_at, count=0, scores=[])
+
+    # Round-trip via to_json/loads so NaN/NaT serialize as null and
+    # pandas Timestamp columns serialize to ISO-8601 — same pattern the
+    # cronjob uses when pushing, keeping the round-trip symmetric.
+    payload_json = snap.data.to_json(orient="records", date_format="iso", date_unit="s")
+    assert payload_json is not None
+    scores = cast(list[dict[str, Any]], json.loads(payload_json))
+
+    return ScoresSnapshotResponse(
+        computed_at=computed_at,
+        count=len(scores),
+        scores=scores,
+    )
 
 
 @app.post("/sync-status", response_model=SyncStatusAcceptedResponse)
