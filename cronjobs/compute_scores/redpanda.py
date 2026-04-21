@@ -750,9 +750,10 @@ class RedpandaProvider:
             ]
 
             # High watermarks for ETA reporting. get_watermark_offsets is a
-            # cheap per-partition metadata call. If it fails for a partition
-            # we fall back to the start offset, which produces "0% (done)"
-            # in heartbeats rather than a division-by-zero.
+            # cheap per-partition broker call. If it fails for a partition
+            # we fall back to the start offset so span == 0, which yields
+            # "100% (done)" in heartbeats rather than a division-by-zero —
+            # the warning below is the signal that ETA data is missing.
             partition_ends: Dict[int, int] = {}
             for tp in valid:
                 try:
