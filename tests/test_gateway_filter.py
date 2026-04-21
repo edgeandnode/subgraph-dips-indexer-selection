@@ -87,7 +87,7 @@ class TestGatewayIdFilter:
             config = {"bootstrap.servers": "localhost:9092"}
             gw_filter = {"mainnet-gw"}
             counts, fees, total, filtered = _count_partition_worker(
-                ("gateway_queries", 0, 0, 999999999999, config, gw_filter)
+                ("gateway_queries", 0, 0, 999999999999, config, gw_filter, 1_000_000)
             )
 
         assert total == 1
@@ -109,7 +109,7 @@ class TestGatewayIdFilter:
             config = {"bootstrap.servers": "localhost:9092"}
             gw_filter = {"mainnet-gw"}
             counts, fees, total, filtered = _count_partition_worker(
-                ("gateway_queries", 0, 0, 999999999999, config, gw_filter)
+                ("gateway_queries", 0, 0, 999999999999, config, gw_filter, 1_000_000)
             )
 
         assert total == 1
@@ -130,7 +130,7 @@ class TestGatewayIdFilter:
         with patch("confluent_kafka.Consumer", return_value=mock_consumer):
             config = {"bootstrap.servers": "localhost:9092"}
             counts, fees, total, filtered = _count_partition_worker(
-                ("gateway_queries", 0, 0, 999999999999, config, None)
+                ("gateway_queries", 0, 0, 999999999999, config, None, 1_000_000)
             )
 
         assert total == 1

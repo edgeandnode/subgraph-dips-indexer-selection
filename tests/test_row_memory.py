@@ -110,6 +110,7 @@ def test_sample_worker_per_row_memory_under_threshold():
                 None,
                 rows_to_use,
                 20260420,
+                1_000_000,
             )
         )
 
@@ -164,6 +165,7 @@ def test_intern_cache_shares_string_identity_across_rows():
                 None,
                 1000,
                 20260420,
+                1_000_000,
             )
         )
 
@@ -235,6 +237,7 @@ def test_intern_cache_preserves_distinct_values_under_rotation():
                 None,
                 1000,
                 20260420,
+                1_000_000,
             )
         )
 
@@ -286,6 +289,7 @@ def test_reservoir_rows_are_tuples_in_expected_order():
                 None,
                 100,
                 20260420,
+                1_000_000,
             )
         )
 
