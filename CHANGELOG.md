@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.2.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.1.1...v2.2.0) (2026-04-21)
+
+
+### Added
+
+* **cronjob:** add progress % and ETA to worker heartbeat ([#135](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/135)) ([0625077](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/0625077684f90530c6222042c63c431a2c0aa0f7))
+
+
+### Changed
+
+* **k8s:** update cronjob image to sha-0625077 ([#138](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/138)) ([053bc03](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/053bc0355b7ca9cd692cfa324dae96fa7fed8741))
+
+
+### Tests
+
+* **sync-status:** stub _fetch_all_statuses, not asyncio.run ([#136](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/136)) ([af3cbaf](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/af3cbaf827a0f86722ff8a840866c5b86af3b9ca))
+
 ## [2.1.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.1.0...v2.1.1) (2026-04-20)
 
 
