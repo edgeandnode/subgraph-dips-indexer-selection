@@ -191,7 +191,8 @@ class TestRunFetchCycle:
                 return_value=indexer_urls,
             ),
             patch(
-                "sync_status_fetcher.asyncio.run",
+                "sync_status_fetcher._fetch_all_statuses",
+                new_callable=AsyncMock,
                 return_value=fetch_result,
             ),
             patch("sync_status_fetcher._push_sync_status") as mock_push,
@@ -219,7 +220,8 @@ class TestRunFetchCycle:
                 return_value=indexer_urls,
             ),
             patch(
-                "sync_status_fetcher.asyncio.run",
+                "sync_status_fetcher._fetch_all_statuses",
+                new_callable=AsyncMock,
                 return_value=fetch_result,
             ),
             patch(
