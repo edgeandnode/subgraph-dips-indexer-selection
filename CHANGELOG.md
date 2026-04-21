@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.2.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.2.0...v2.2.1) (2026-04-21)
+
+
+### Fixed
+
+* **k8s:** allow score-computation cronjob to push scores to iisa ([#139](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/139)) ([5b8f43b](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/5b8f43bcc5f39f2849da63ba87563f6f7de93ba7))
+
 ## [2.2.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.1.1...v2.2.0) (2026-04-21)
 
 
