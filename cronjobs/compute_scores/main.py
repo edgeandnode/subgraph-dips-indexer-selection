@@ -1,27 +1,26 @@
-"""Score computation service.
+"""Score computation cronjob entry point.
 
-Long-running service that periodically computes indexer quality scores.
-When the full scoring pipeline can't run (no GeoIP databases, insufficient
-Redpanda data), falls back to degraded mode: equal quality metrics with
-real pricing data from indexer /dips/info endpoints.
+One-shot: compute indexer quality scores, push the results to the iisa
+HTTP service, and exit. Scheduling is handled by the Kubernetes CronJob
+(`k8s/score-computation-cronjob.yaml`); this process must not linger
+after a run — the pod's 50 GiB memory request is billed for its full
+lifetime under GKE Autopilot, so an in-process 24h sleep would waste
+roughly 22 of every 24 hours of reserved memory.
 
-HTTP endpoints:
-  POST /run    -- trigger immediate scoring run
-  GET /health  -- healthcheck (503 until first scores written)
-  GET /status  -- last run info and next scheduled run
+Exit codes:
+  0 — scores were computed and pushed to iisa
+  1 — configuration invalid or run failed (scoring error, push error,
+      degraded fallback also failed)
+  2 — IISA_REQUIRE_PUSH_TOKEN is true but no token is provisioned
 """
 
-import json
 import logging
 import os
 import random
 import resource
-import signal
 import sys
-import threading
 import time
-from datetime import date, datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import date, timedelta
 
 from iisa_client import IISAPushError, get_push_token
 from processing import compute_all_scores, compute_degraded_scores, validate_geoip_databases
@@ -33,11 +32,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration from environment
 NUM_DAYS = int(os.environ.get("NUM_DAYS", "28"))
 TARGET_ROWS = int(os.environ.get("TARGET_ROWS", "20000000"))
-SCORING_INTERVAL = int(os.environ.get("SCORING_INTERVAL", "86400"))
-HTTP_PORT = int(os.environ.get("SCORING_HTTP_PORT", "9090"))
 GRAPH_NETWORK_SUBGRAPH_URL = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
 IISA_API_URL = os.environ.get("IISA_API_URL", "")
 IISA_REQUIRE_PUSH_TOKEN = os.environ.get("IISA_REQUIRE_PUSH_TOKEN", "").lower() == "true"
@@ -47,37 +43,11 @@ IISA_PUSH_TOKEN = get_push_token()
 class ConfigurationError(Exception):
     """Raised when required configuration is missing or invalid."""
 
-    pass
 
-
-# Scoring modes
 MODE_FULL = "full"
 MODE_PARTIAL = "partial"
 MODE_DEGRADED = "degraded"
 MODE_FAILED = "failed"
-
-# Shared state
-_status_lock = threading.Lock()
-_last_run: dict = {}
-_next_run_time: datetime | None = None
-_consecutive_partial: int = 0
-_consecutive_degraded: int = 0
-_consecutive_failed: int = 0
-_run_event = threading.Event()
-_shutdown = threading.Event()
-
-# After this many consecutive non-full runs, /health returns 503
-DEGRADED_THRESHOLD = int(os.environ.get("DEGRADED_ALERT_THRESHOLD", "3"))
-
-
-def _handle_signal(signum, frame):
-    logger.info("Received signal %d, shutting down", signum)
-    _shutdown.set()
-    _run_event.set()
-
-
-signal.signal(signal.SIGTERM, _handle_signal)
-signal.signal(signal.SIGINT, _handle_signal)
 
 
 def validate_configuration() -> None:
@@ -117,8 +87,6 @@ def get_peak_memory_mb() -> float:
 
 def run_scoring() -> bool:
     """Run one scoring cycle. Returns True on success."""
-    global _consecutive_partial, _consecutive_degraded, _consecutive_failed
-
     pipeline_start = time.time()
     logger.info("Starting score computation")
 
@@ -183,70 +151,21 @@ def run_scoring() -> bool:
             provider.write_scores(scores_df)
         except IISAPushError as e:
             # Push failure (auth, validation, or retry exhaustion) must not
-            # escape run accounting. Mark the run failed, let the mode-specific
-            # logging fire, and return False so the scheduling loop retries
-            # at the next interval — consistent with the degraded-fallback
-            # pattern above.
+            # escape run accounting. Mark the run failed and let the caller
+            # exit non-zero so the CronJob's failedJobsHistoryLimit captures it.
             logger.error("Failed to push scores to iisa: %s", e)
             success = False
             mode = MODE_FAILED
 
-    # Track consecutive non-full runs (under lock — health endpoint reads these)
-    with _status_lock:
-        if mode == MODE_FULL:
-            _consecutive_partial = 0
-            _consecutive_degraded = 0
-            _consecutive_failed = 0
-        elif mode == MODE_PARTIAL:
-            _consecutive_partial += 1
-            _consecutive_degraded = 0
-            _consecutive_failed = 0
-        elif mode == MODE_DEGRADED:
-            _consecutive_partial = 0
-            _consecutive_degraded += 1
-            _consecutive_failed = 0
-        else:
-            _consecutive_partial = 0
-            _consecutive_degraded = 0
-            _consecutive_failed += 1
-
-        _last_run.update(
-            {
-                "time": datetime.now(timezone.utc).isoformat(),
-                "success": success,
-                "indexers": len(scores_df) if scores_df is not None else 0,
-                "elapsed_seconds": round(elapsed, 1),
-                "mode": mode,
-                "consecutive_partial": _consecutive_partial,
-                "consecutive_degraded": _consecutive_degraded,
-                "consecutive_failed": _consecutive_failed,
-            }
-        )
-
-    # Log outside the lock
     if mode == MODE_PARTIAL:
         logger.warning(
-            "Scoring ran without GeoIP (%d consecutive partial run(s)). "
-            "Latency scores are neutral (0.5). "
-            "Install MaxMind GeoLite2 databases for full scoring.",
-            _consecutive_partial,
+            "Scoring ran without GeoIP — latency scores are neutral (0.5). "
+            "Install MaxMind GeoLite2 databases for full scoring."
         )
     elif mode == MODE_DEGRADED:
-        if _consecutive_degraded >= DEGRADED_THRESHOLD:
-            logger.error(
-                "Scoring has been degraded for %d consecutive runs. "
-                "Full pipeline is not functioning — "
-                "investigate GeoIP databases and Redpanda data availability.",
-                _consecutive_degraded,
-            )
-        else:
-            logger.warning(
-                "Scoring degraded (%d/%d before alert)",
-                _consecutive_degraded,
-                DEGRADED_THRESHOLD,
-            )
+        logger.warning("Scoring degraded — full pipeline unavailable, pushed real pricing only.")
     elif mode == MODE_FAILED:
-        logger.error("Scoring failed completely for %d consecutive runs", _consecutive_failed)
+        logger.error("Scoring failed")
 
     logger.info(
         "Scoring complete: mode=%s, indexers=%d, elapsed=%.1fs, peak_memory=%.0fMB",
@@ -259,78 +178,9 @@ def run_scoring() -> bool:
     return success
 
 
-class RequestHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/health":
-            with _status_lock:
-                first_run_done = bool(_last_run)
-                degraded = _consecutive_degraded
-                failed = _consecutive_failed
-            if not first_run_done:
-                self._json_response(503, {"status": "waiting_for_first_run"})
-                return
-            if failed > 0:
-                self._json_response(
-                    503,
-                    {
-                        "status": "failing",
-                        "consecutive_failed": failed,
-                    },
-                )
-            elif degraded >= DEGRADED_THRESHOLD:
-                self._json_response(
-                    200,
-                    {
-                        "status": "degraded",
-                        "consecutive_degraded": degraded,
-                        "message": "Full pipeline not functioning, serving degraded scores",
-                    },
-                )
-            else:
-                self._json_response(200, {"status": "ok"})
-        elif self.path == "/status":
-            with _status_lock:
-                status = {
-                    "last_run": dict(_last_run),
-                    "next_run_time": _next_run_time.isoformat() if _next_run_time else None,
-                    "scoring_interval_seconds": SCORING_INTERVAL,
-                    "consecutive_partial": _consecutive_partial,
-                    "consecutive_degraded": _consecutive_degraded,
-                    "consecutive_failed": _consecutive_failed,
-                    "degraded_threshold": DEGRADED_THRESHOLD,
-                }
-            self._json_response(200, status)
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def do_POST(self):
-        if self.path == "/run":
-            _run_event.set()
-            self._json_response(202, {"status": "run_triggered"})
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def _json_response(self, code: int, body: dict):
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(body).encode())
-
-    def log_message(self, format, *args):
-        pass
-
-
 def main() -> int:
-    """Main entry point for the score computation service."""
-    global _next_run_time
-
-    logger.info(
-        "Score computation service starting (interval=%ds, http_port=%d)",
-        SCORING_INTERVAL,
-        HTTP_PORT,
-    )
+    """Main entry point for the score computation cronjob."""
+    logger.info("Score computation cronjob starting")
 
     if IISA_API_URL:
         logger.info("IISA push target: %s", IISA_API_URL)
@@ -348,32 +198,8 @@ def main() -> int:
     except ConfigurationError:
         return 1
 
-    # Start HTTP server in background thread
-    server = HTTPServer(("0.0.0.0", HTTP_PORT), RequestHandler)
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
-    logger.info("HTTP server listening on port %d", HTTP_PORT)
-
-    # Initial scoring run
-    run_scoring()
-
-    # Scheduling loop — runs until shutdown signal
-    while not _shutdown.is_set():
-        _next_run_time = datetime.now(timezone.utc) + timedelta(seconds=SCORING_INTERVAL)
-        triggered = _run_event.wait(timeout=SCORING_INTERVAL)
-
-        if _shutdown.is_set():
-            break
-
-        if triggered:
-            _run_event.clear()
-            logger.info("Manual scoring run triggered via HTTP")
-
-        run_scoring()
-
-    server.shutdown()
-    logger.info("Score computation service stopped")
-    return 0
+    success = run_scoring()
+    return 0 if success else 1
 
 
 if __name__ == "__main__":
