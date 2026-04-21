@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.3.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.2.1...v2.3.0) (2026-04-21)
+
+
+### Added
+
+* **iisa:** add GET /scores endpoint for snapshot read-back ([#144](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/144)) ([7c9e85f](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/7c9e85f89731193199ab863d6baa37f60a93b808))
+
+
+### Changed
+
+* **cronjob:** make score-computation one-shot, drop HTTP+loop ([#141](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/141)) ([59fc33c](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/59fc33cbd5540c00accd090ee525e1c8f5758e73))
+* **k8s:** update cronjob image to sha-59fc33c ([#143](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/143)) ([c865c34](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/c865c34223bcbc636e776e899e63a1f6b4c125bf))
+
 ## [2.2.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.2.0...v2.2.1) (2026-04-21)
 
 
