@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.3.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.3.0...v2.3.1) (2026-05-06)
+
+
+### Changed
+
+* **deps:** bump the actions group with 2 updates ([#148](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/148)) ([b2e4b52](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/b2e4b52a4b3da050d67ad75e9fabf7239eee3aeb))
+* **k8s:** update cronjob image to sha-b2e4b52 ([#150](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/150)) ([f24ddb8](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/f24ddb82366aed62eb410e789faca78e88b3005f))
+
+
+### CI/CD
+
+* publish multi-arch (amd64+arm64) service and release images ([#146](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/146)) ([386c54f](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/386c54fcf084f34fec5dc53d386c0f97fa36271d))
+
 ## [2.3.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.2.1...v2.3.0) (2026-04-21)
 
 
