@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.4
 # Build stage - install dependencies with gcc and generate protobuf code
 FROM python:3.11-slim AS builder
 
