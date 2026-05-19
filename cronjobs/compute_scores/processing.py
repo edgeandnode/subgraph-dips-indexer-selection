@@ -305,6 +305,69 @@ def fetch_dips_info(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 
+def diagnose_geoip_failure(combined_queries: pd.DataFrame) -> str:
+    """Build a diagnostic suffix for total GeoIP resolution failure.
+
+    Inspects a small sample of the resolved ``ip_addr`` column to distinguish
+    three categories of failure, then returns a multi-line string ready to
+    append to the RuntimeError message:
+
+    - ``unresolved``: hostname didn't resolve to any IP (DNS gaierror).
+    - ``private``: hostname resolved to an RFC 1918 / loopback / Docker bridge
+      IP that legitimately has no public geolocation. This is the local-network
+      and Docker Compose case.
+    - ``public``: hostname resolved to a public IP that wasn't in the GeoLite2
+      database. Indicates a stale database or an indexed-range gap, not a
+      configuration problem.
+    """
+    sample = combined_queries[["indexer", "ip_addr"]].drop_duplicates(subset="indexer").head(5)
+    null_count = 0
+    private_count = 0
+    public_count = 0
+    for ip in sample["ip_addr"]:
+        if pd.isna(ip) or not ip:
+            null_count += 1
+        elif is_private_ip(str(ip)):
+            private_count += 1
+        else:
+            public_count += 1
+
+    sample_rows = "\n".join(
+        f"    {row.indexer[:10]}...  ->  "
+        f"{row.ip_addr if not pd.isna(row.ip_addr) else '(no IP resolved)'}"
+        for row in sample.itertuples(index=False)
+    )
+
+    if private_count >= max(null_count, public_count):
+        diagnosis = (
+            "indexer URLs resolve to private/internal IPs (Docker bridge "
+            "networks, RFC 1918, or loopback ranges) that have no public "
+            "geolocation. This is expected for local-network / Docker Compose "
+            "setups; latency scoring requires public-internet indexer URLs."
+        )
+    elif null_count >= max(private_count, public_count):
+        diagnosis = (
+            "indexer URL hostnames failed to resolve to any IP (DNS lookup "
+            "returned nothing). Check that the URLs in the network subgraph "
+            "are reachable from this environment."
+        )
+    elif public_count > 0:
+        diagnosis = (
+            "indexer URLs resolved to public IPs, but none had entries in "
+            "the GeoLite2-City database. The databases load successfully, "
+            "but the IPs fall outside indexed ranges, or the databases are "
+            "stale (older than MaxMind's 30-day refresh)."
+        )
+    else:
+        diagnosis = "no IPs in the data sample to inspect; this is unexpected."
+
+    return (
+        f"\nDiagnosis: {diagnosis}\n"
+        f"Sample (private={private_count}, public={public_count}, "
+        f"unresolved={null_count}):\n{sample_rows}"
+    )
+
+
 def compute_all_scores(
     provider,
     start_date: date,
@@ -369,9 +432,8 @@ def compute_all_scores(
 
         if dst_lat_nan_count == len(combined_queries):
             raise RuntimeError(
-                "All dst_lat values are NaN - GeoIP resolution failed for all indexers. "
-                "This typically means the GeoLite2 databases are missing or corrupt. "
-                "Check that the MaxMind .mmdb files are bundled in the Docker image."
+                "All dst_lat values are NaN - GeoIP resolution failed for all indexers."
+                + diagnose_geoip_failure(combined_queries)
             )
 
         combined_queries_filtered = filter_successful_queries(combined_queries)

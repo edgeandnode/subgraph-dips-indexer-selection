@@ -25,6 +25,7 @@ from processing import (  # noqa: E402
     aggregate_indexer_info,
     calculate_indexer_success_rate,
     calculate_indexer_uptime,
+    diagnose_geoip_failure,
     filter_successful_queries,
     hash_sampled_queries,
     haversine_vectorized,
@@ -262,6 +263,59 @@ class TestIsPrivateIp:
         assert is_private_ip("8.8.8.8") is False  # Google DNS
         assert is_private_ip("1.1.1.1") is False  # Cloudflare DNS
         assert is_private_ip("142.250.80.46") is False  # Google
+
+
+class TestDiagnoseGeoipFailure:
+    """Tests for the diagnose_geoip_failure helper.
+
+    The helper produces the diagnostic suffix appended to the RuntimeError
+    raised when GeoIP resolution returns NaN for every indexer. It picks
+    one of three diagnoses based on a sample of resolved IPs: private
+    (RFC 1918, Docker bridges, loopback), unresolved (DNS gaierror), or
+    public-but-missing-from-database.
+    """
+
+    def _build_df(self, ip_addrs):
+        return pd.DataFrame(
+            {
+                "indexer": [f"0x{i:040x}" for i in range(len(ip_addrs))],
+                "ip_addr": ip_addrs,
+            }
+        )
+
+    def test_all_private_ips_picks_local_network_diagnosis(self):
+        df = self._build_df(["172.18.0.5", "172.18.0.6", "172.18.0.7"])
+        result = diagnose_geoip_failure(df)
+        assert "private" in result.lower()
+        assert "private=3" in result
+        assert "public=0" in result
+        assert "unresolved=0" in result
+
+    def test_all_unresolved_picks_dns_diagnosis(self):
+        df = self._build_df([None, None, np.nan])
+        result = diagnose_geoip_failure(df)
+        assert "DNS" in result or "resolve" in result.lower()
+        assert "unresolved=3" in result
+
+    def test_all_public_picks_database_diagnosis(self):
+        df = self._build_df(["8.8.8.8", "1.1.1.1", "142.250.80.46"])
+        result = diagnose_geoip_failure(df)
+        assert "public IPs" in result
+        assert "GeoLite2-City" in result or "stale" in result
+        assert "public=3" in result
+
+    def test_mixed_majority_private_picks_private_diagnosis(self):
+        df = self._build_df(["172.18.0.5", "172.18.0.6", "8.8.8.8"])
+        result = diagnose_geoip_failure(df)
+        assert "private" in result.lower()
+        assert "private=2" in result
+        assert "public=1" in result
+
+    def test_sample_is_capped_at_five_rows(self):
+        df = self._build_df([f"172.18.0.{i}" for i in range(10)])
+        result = diagnose_geoip_failure(df)
+        # Counts reflect the sample (5), not the full input (10).
+        assert "private=5" in result
 
 
 class TestHaversineVectorized:
