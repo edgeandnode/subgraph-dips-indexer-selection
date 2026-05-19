@@ -48,9 +48,15 @@ jobs:
           echo "latest_tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_OUTPUT
 
       - name: Build Docker image
+        env:
+          # Exposed to the step so BuildKit can read it as a secret via env=.
+          # The value is never written to a file and never lands in any image
+          # layer; `docker history` will not show it.
+          MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
+          DOCKER_BUILDKIT: "1"
         run: |
           docker build \
-            --build-arg MAXMIND_LICENSE_KEY=${{ secrets.MAXMIND_LICENSE_KEY }} \
+            --secret id=maxmind,env=MAXMIND_LICENSE_KEY \
             -t ${{ steps.tags.outputs.latest_tag }} \
             -t ${{ steps.tags.outputs.sha_tag }} \
             -f ${{ env.DOCKERFILE_PATH }} \
