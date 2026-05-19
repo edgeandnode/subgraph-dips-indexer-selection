@@ -36,7 +36,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # (env=) or `--secret id=maxmind,src=<keyfile>` (src=). Write the literal string
 # "skip" to opt into degraded mode and skip GeoIP entirely.
 RUN --mount=type=secret,id=maxmind,required=true \
-    if [ "$(cat /run/secrets/maxmind)" = "skip" ]; then \
+    if [ ! -s /run/secrets/maxmind ]; then \
+        echo "ERROR: maxmind secret is empty. Pass a valid MaxMind license key" && \
+        echo "       (mount with --secret id=maxmind,env=VAR or src=keyfile), or" && \
+        echo "       write 'skip' to opt into degraded scoring mode (no GeoIP)." && \
+        exit 1; \
+    elif [ "$(cat /run/secrets/maxmind)" = "skip" ]; then \
         echo "WARNING: maxmind secret is 'skip', GeoIP databases skipped (degraded scoring mode)"; \
     else \
         LICENSE_KEY=$(cat /run/secrets/maxmind) && \
