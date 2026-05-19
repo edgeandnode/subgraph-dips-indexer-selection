@@ -7,13 +7,13 @@ for computing latency regression, uptime, success rate, and stake-to-fees metric
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import socket
 from datetime import date, datetime, timezone
 from pathlib import Path
-from struct import unpack
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -308,23 +308,25 @@ def fetch_dips_info(indexer_urls: Dict[str, str]) -> pd.DataFrame:
 def diagnose_geoip_failure(combined_queries: pd.DataFrame) -> str:
     """Build a diagnostic suffix for total GeoIP resolution failure.
 
-    Inspects a small sample of the resolved ``ip_addr`` column to distinguish
-    three categories of failure, then returns a multi-line string ready to
-    append to the RuntimeError message:
+    Counts failure categories across every unique indexer in the input,
+    then renders up to 5 sample rows for context. Counts always reflect
+    the full set so a sample-vs-full mismatch can't mislead the operator.
+    Returns a multi-line string ready to append to the RuntimeError:
 
     - ``unresolved``: hostname didn't resolve to any IP (DNS gaierror).
-    - ``private``: hostname resolved to an RFC 1918 / loopback / Docker bridge
-      IP that legitimately has no public geolocation. This is the local-network
-      and Docker Compose case.
-    - ``public``: hostname resolved to a public IP that wasn't in the GeoLite2
-      database. Indicates a stale database or an indexed-range gap, not a
-      configuration problem.
+    - ``private``: hostname resolved to an RFC 1918 / loopback / link-local
+      / Docker bridge IP that legitimately has no public geolocation. This
+      is the local-network and Docker Compose case.
+    - ``public``: hostname resolved to a public IP that wasn't in the
+      GeoLite2 database. Indicates a stale database or an indexed-range
+      gap, not a configuration problem.
     """
-    sample = combined_queries[["indexer", "ip_addr"]].drop_duplicates(subset="indexer").head(5)
+    deduplicated = combined_queries[["indexer", "ip_addr"]].drop_duplicates(subset="indexer")
+    sample = deduplicated.head(5)
     null_count = 0
     private_count = 0
     public_count = 0
-    for ip in sample["ip_addr"]:
+    for ip in deduplicated["ip_addr"]:
         if pd.isna(ip) or not ip:
             null_count += 1
         elif is_private_ip(str(ip)):
@@ -359,12 +361,14 @@ def diagnose_geoip_failure(combined_queries: pd.DataFrame) -> str:
             "stale (older than MaxMind's 30-day refresh)."
         )
     else:
-        diagnosis = "no IPs in the data sample to inspect; this is unexpected."
+        diagnosis = "no IPs in the data to inspect; this is unexpected."
 
+    total = len(deduplicated)
     return (
         f"\nDiagnosis: {diagnosis}\n"
-        f"Sample (private={private_count}, public={public_count}, "
-        f"unresolved={null_count}):\n{sample_rows}"
+        f"Counts across {total} unique indexer(s): "
+        f"private={private_count}, public={public_count}, unresolved={null_count}\n"
+        f"Sample (first {min(5, total)}):\n{sample_rows}"
     )
 
 
@@ -714,17 +718,17 @@ def resolve_url_geoip(url: str) -> dict:
 
 
 def is_private_ip(ip_addr: str) -> bool:
-    """Check if an IP address is private (RFC 1918/3330)."""
+    """Check if an IP address is private / loopback / link-local.
+
+    Delegates to ``ipaddress.ip_address(...).is_private``, which covers
+    IPv4 (RFC 1918, loopback 127/8, link-local 169.254/16, CGNAT 100.64/10,
+    reserved ranges) and IPv6 (ULA fc00::/7, link-local fe80::/10,
+    loopback ::1). These are the addresses that legitimately have no
+    public geolocation entry. Returns False for malformed input.
+    """
     try:
-        (ip,) = unpack("!I", socket.inet_pton(socket.AF_INET, ip_addr))
-        private_networks = (
-            (0x7F000000, 0xFF000000),  # 127.0.0.0/8
-            (0xC0A80000, 0xFFFF0000),  # 192.168.0.0/16
-            (0xAC100000, 0xFFF00000),  # 172.16.0.0/12
-            (0x0A000000, 0xFF000000),  # 10.0.0.0/8
-        )
-        return any((ip & mask) == network for network, mask in private_networks)
-    except Exception as e:
+        return ipaddress.ip_address(ip_addr).is_private
+    except ValueError as e:
         logger.debug(f"is_private_ip check failed for {ip_addr}: {e}")
         return False
 

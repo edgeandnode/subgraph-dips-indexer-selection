@@ -264,6 +264,21 @@ class TestIsPrivateIp:
         assert is_private_ip("1.1.1.1") is False  # Cloudflare DNS
         assert is_private_ip("142.250.80.46") is False  # Google
 
+    def test_ipv6_private(self):
+        assert is_private_ip("fc00::1") is True  # ULA
+        assert is_private_ip("fd00::1") is True  # ULA
+        assert is_private_ip("fe80::1") is True  # link-local
+        assert is_private_ip("::1") is True  # loopback
+
+    def test_ipv6_public(self):
+        assert is_private_ip("2001:4860:4860::8888") is False  # Google IPv6 DNS
+        assert is_private_ip("2606:4700:4700::1111") is False  # Cloudflare IPv6 DNS
+
+    def test_malformed_input(self):
+        assert is_private_ip("not an ip") is False
+        assert is_private_ip("") is False
+        assert is_private_ip("999.999.999.999") is False
+
 
 class TestDiagnoseGeoipFailure:
     """Tests for the diagnose_geoip_failure helper.
@@ -311,11 +326,25 @@ class TestDiagnoseGeoipFailure:
         assert "private=2" in result
         assert "public=1" in result
 
-    def test_sample_is_capped_at_five_rows(self):
+    def test_counts_reflect_full_set_but_sample_capped_at_five(self):
         df = self._build_df([f"172.18.0.{i}" for i in range(10)])
         result = diagnose_geoip_failure(df)
-        # Counts reflect the sample (5), not the full input (10).
-        assert "private=5" in result
+        # Counts reflect all 10 indexers, not just the 5 displayed.
+        assert "private=10" in result
+        assert "Counts across 10 unique" in result
+        # Sample line states it shows the first 5.
+        assert "Sample (first 5)" in result
+        # Confirm the rendered sample really is 5 rows.
+        indexer_rows = [line for line in result.split("\n") if "0x" in line and "->" in line]
+        assert len(indexer_rows) == 5
+
+    def test_mixed_ipv4_and_ipv6_private_addresses(self):
+        df = self._build_df(["172.18.0.5", "fc00::1", "fe80::1", "::1"])
+        result = diagnose_geoip_failure(df)
+        # All four are private (IPv4 RFC 1918 + IPv6 ULA + link-local + loopback).
+        assert "private=4" in result
+        assert "public=0" in result
+        assert "unresolved=0" in result
 
 
 class TestHaversineVectorized:
