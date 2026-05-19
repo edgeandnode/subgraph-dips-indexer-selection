@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.3.2](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.3.1...v2.3.2) (2026-05-19)
+
+
+### Fixed
+
+* protect MaxMind license key and clarify GeoIP errors ([#153](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/153)) ([06472da](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/06472dab3efba87eb5ac7fb53402823b92972309))
+
 ## [2.3.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.3.0...v2.3.1) (2026-05-06)
 
 
