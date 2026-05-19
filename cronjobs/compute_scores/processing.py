@@ -7,13 +7,13 @@ for computing latency regression, uptime, success rate, and stake-to-fees metric
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import socket
 from datetime import date, datetime, timezone
 from pathlib import Path
-from struct import unpack
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -305,6 +305,73 @@ def fetch_dips_info(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 
+def diagnose_geoip_failure(combined_queries: pd.DataFrame) -> str:
+    """Build a diagnostic suffix for total GeoIP resolution failure.
+
+    Counts failure categories across every unique indexer in the input,
+    then renders up to 5 sample rows for context. Counts always reflect
+    the full set so a sample-vs-full mismatch can't mislead the operator.
+    Returns a multi-line string ready to append to the RuntimeError:
+
+    - ``unresolved``: hostname didn't resolve to any IP (DNS gaierror).
+    - ``private``: hostname resolved to an RFC 1918 / loopback / link-local
+      / Docker bridge IP that legitimately has no public geolocation. This
+      is the local-network and Docker Compose case.
+    - ``public``: hostname resolved to a public IP that wasn't in the
+      GeoLite2 database. Indicates a stale database or an indexed-range
+      gap, not a configuration problem.
+    """
+    deduplicated = combined_queries[["indexer", "ip_addr"]].drop_duplicates(subset="indexer")
+    sample = deduplicated.head(5)
+    null_count = 0
+    private_count = 0
+    public_count = 0
+    for ip in deduplicated["ip_addr"]:
+        if pd.isna(ip) or not ip:
+            null_count += 1
+        elif is_private_ip(str(ip)):
+            private_count += 1
+        else:
+            public_count += 1
+
+    sample_rows = "\n".join(
+        f"    {str(row.indexer)[:10]}...  ->  "
+        f"{str(row.ip_addr) if not pd.isna(row.ip_addr) else '(no IP resolved)'}"
+        for row in sample.itertuples(index=False)
+    )
+
+    if private_count >= max(null_count, public_count):
+        diagnosis = (
+            "indexer URLs resolve to private/internal IPs (Docker bridge "
+            "networks, RFC 1918, or loopback ranges) that have no public "
+            "geolocation. This is expected for local-network / Docker Compose "
+            "setups; latency scoring requires public-internet indexer URLs."
+        )
+    elif null_count >= max(private_count, public_count):
+        diagnosis = (
+            "indexer URL hostnames failed to resolve to any IP (DNS lookup "
+            "returned nothing). Check that the URLs in the network subgraph "
+            "are reachable from this environment."
+        )
+    elif public_count > 0:
+        diagnosis = (
+            "indexer URLs resolved to public IPs, but none had entries in "
+            "the GeoLite2-City database. The databases load successfully, "
+            "but the IPs fall outside indexed ranges, or the databases are "
+            "stale (older than MaxMind's 30-day refresh)."
+        )
+    else:
+        diagnosis = "no IPs in the data to inspect; this is unexpected."
+
+    total = len(deduplicated)
+    return (
+        f"\nDiagnosis: {diagnosis}\n"
+        f"Counts across {total} unique indexer(s): "
+        f"private={private_count}, public={public_count}, unresolved={null_count}\n"
+        f"Sample (first {min(5, total)}):\n{sample_rows}"
+    )
+
+
 def compute_all_scores(
     provider,
     start_date: date,
@@ -369,9 +436,8 @@ def compute_all_scores(
 
         if dst_lat_nan_count == len(combined_queries):
             raise RuntimeError(
-                "All dst_lat values are NaN - GeoIP resolution failed for all indexers. "
-                "This typically means the GeoLite2 databases are missing or corrupt. "
-                "Check that the MaxMind .mmdb files are bundled in the Docker image."
+                "All dst_lat values are NaN - GeoIP resolution failed for all indexers."
+                + diagnose_geoip_failure(combined_queries)
             )
 
         combined_queries_filtered = filter_successful_queries(combined_queries)
@@ -652,17 +718,17 @@ def resolve_url_geoip(url: str) -> dict:
 
 
 def is_private_ip(ip_addr: str) -> bool:
-    """Check if an IP address is private (RFC 1918/3330)."""
+    """Check if an IP address is private / loopback / link-local.
+
+    Delegates to ``ipaddress.ip_address(...).is_private``, which covers
+    IPv4 (RFC 1918, loopback 127/8, link-local 169.254/16, CGNAT 100.64/10,
+    reserved ranges) and IPv6 (ULA fc00::/7, link-local fe80::/10,
+    loopback ::1). These are the addresses that legitimately have no
+    public geolocation entry. Returns False for malformed input.
+    """
     try:
-        (ip,) = unpack("!I", socket.inet_pton(socket.AF_INET, ip_addr))
-        private_networks = (
-            (0x7F000000, 0xFF000000),  # 127.0.0.0/8
-            (0xC0A80000, 0xFFFF0000),  # 192.168.0.0/16
-            (0xAC100000, 0xFFF00000),  # 172.16.0.0/12
-            (0x0A000000, 0xFF000000),  # 10.0.0.0/8
-        )
-        return any((ip & mask) == network for network, mask in private_networks)
-    except Exception as e:
+        return ipaddress.ip_address(ip_addr).is_private
+    except ValueError as e:
         logger.debug(f"is_private_ip check failed for {ip_addr}: {e}")
         return False
 

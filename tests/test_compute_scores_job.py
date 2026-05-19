@@ -25,6 +25,7 @@ from processing import (  # noqa: E402
     aggregate_indexer_info,
     calculate_indexer_success_rate,
     calculate_indexer_uptime,
+    diagnose_geoip_failure,
     filter_successful_queries,
     hash_sampled_queries,
     haversine_vectorized,
@@ -262,6 +263,88 @@ class TestIsPrivateIp:
         assert is_private_ip("8.8.8.8") is False  # Google DNS
         assert is_private_ip("1.1.1.1") is False  # Cloudflare DNS
         assert is_private_ip("142.250.80.46") is False  # Google
+
+    def test_ipv6_private(self):
+        assert is_private_ip("fc00::1") is True  # ULA
+        assert is_private_ip("fd00::1") is True  # ULA
+        assert is_private_ip("fe80::1") is True  # link-local
+        assert is_private_ip("::1") is True  # loopback
+
+    def test_ipv6_public(self):
+        assert is_private_ip("2001:4860:4860::8888") is False  # Google IPv6 DNS
+        assert is_private_ip("2606:4700:4700::1111") is False  # Cloudflare IPv6 DNS
+
+    def test_malformed_input(self):
+        assert is_private_ip("not an ip") is False
+        assert is_private_ip("") is False
+        assert is_private_ip("999.999.999.999") is False
+
+
+class TestDiagnoseGeoipFailure:
+    """Tests for the diagnose_geoip_failure helper.
+
+    The helper produces the diagnostic suffix appended to the RuntimeError
+    raised when GeoIP resolution returns NaN for every indexer. It picks
+    one of three diagnoses based on a sample of resolved IPs: private
+    (RFC 1918, Docker bridges, loopback), unresolved (DNS gaierror), or
+    public-but-missing-from-database.
+    """
+
+    def _build_df(self, ip_addrs):
+        return pd.DataFrame(
+            {
+                "indexer": [f"0x{i:040x}" for i in range(len(ip_addrs))],
+                "ip_addr": ip_addrs,
+            }
+        )
+
+    def test_all_private_ips_picks_local_network_diagnosis(self):
+        df = self._build_df(["172.18.0.5", "172.18.0.6", "172.18.0.7"])
+        result = diagnose_geoip_failure(df)
+        assert "private" in result.lower()
+        assert "private=3" in result
+        assert "public=0" in result
+        assert "unresolved=0" in result
+
+    def test_all_unresolved_picks_dns_diagnosis(self):
+        df = self._build_df([None, None, np.nan])
+        result = diagnose_geoip_failure(df)
+        assert "DNS" in result or "resolve" in result.lower()
+        assert "unresolved=3" in result
+
+    def test_all_public_picks_database_diagnosis(self):
+        df = self._build_df(["8.8.8.8", "1.1.1.1", "142.250.80.46"])
+        result = diagnose_geoip_failure(df)
+        assert "public IPs" in result
+        assert "GeoLite2-City" in result or "stale" in result
+        assert "public=3" in result
+
+    def test_mixed_majority_private_picks_private_diagnosis(self):
+        df = self._build_df(["172.18.0.5", "172.18.0.6", "8.8.8.8"])
+        result = diagnose_geoip_failure(df)
+        assert "private" in result.lower()
+        assert "private=2" in result
+        assert "public=1" in result
+
+    def test_counts_reflect_full_set_but_sample_capped_at_five(self):
+        df = self._build_df([f"172.18.0.{i}" for i in range(10)])
+        result = diagnose_geoip_failure(df)
+        # Counts reflect all 10 indexers, not just the 5 displayed.
+        assert "private=10" in result
+        assert "Counts across 10 unique" in result
+        # Sample line states it shows the first 5.
+        assert "Sample (first 5)" in result
+        # Confirm the rendered sample really is 5 rows.
+        indexer_rows = [line for line in result.split("\n") if "0x" in line and "->" in line]
+        assert len(indexer_rows) == 5
+
+    def test_mixed_ipv4_and_ipv6_private_addresses(self):
+        df = self._build_df(["172.18.0.5", "fc00::1", "fe80::1", "::1"])
+        result = diagnose_geoip_failure(df)
+        # All four are private (IPv4 RFC 1918 + IPv6 ULA + link-local + loopback).
+        assert "private=4" in result
+        assert "public=0" in result
+        assert "unresolved=0" in result
 
 
 class TestHaversineVectorized:

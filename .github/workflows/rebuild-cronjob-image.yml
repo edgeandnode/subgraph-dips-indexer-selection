@@ -47,19 +47,22 @@ jobs:
           echo "sha_tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-$SHA_SHORT" >> $GITHUB_OUTPUT
           echo "latest_tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_OUTPUT
 
-      - name: Build Docker image
-        run: |
-          docker build \
-            --build-arg MAXMIND_LICENSE_KEY=${{ secrets.MAXMIND_LICENSE_KEY }} \
-            -t ${{ steps.tags.outputs.latest_tag }} \
-            -t ${{ steps.tags.outputs.sha_tag }} \
-            -f ${{ env.DOCKERFILE_PATH }} \
-            cronjobs/compute_scores/
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Push Docker image
-        run: |
-          docker push ${{ steps.tags.outputs.latest_tag }}
-          docker push ${{ steps.tags.outputs.sha_tag }}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: cronjobs/compute_scores
+          file: ${{ env.DOCKERFILE_PATH }}
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.latest_tag }}
+            ${{ steps.tags.outputs.sha_tag }}
+          # Passed via BuildKit secret mount, never recorded in any
+          # image layer or in docker history output.
+          secrets: |
+            maxmind=${{ secrets.MAXMIND_LICENSE_KEY }}
 
       - name: Update CronJob image tag
         env:
