@@ -50,8 +50,7 @@ RUN --mount=type=secret,id=maxmind,required=true \
         echo "Downloaded GeoLite2-City database" && \
         curl -fsSL "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-ASN&license_key=${LICENSE_KEY}&suffix=tar.gz" | \
         tar -xzf - --strip-components=1 -C /app --wildcards "*/GeoLite2-ASN.mmdb" && \
-        echo "Downloaded GeoLite2-ASN database" \
-        || echo "WARNING: GeoIP database download failed (degraded scoring mode)"; \
+        echo "Downloaded GeoLite2-ASN database"; \
     fi
 
 # Copy installed packages from builder
