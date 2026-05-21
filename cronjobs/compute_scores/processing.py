@@ -190,6 +190,36 @@ def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[s
     return all_indexers
 
 
+def _extract_dips_prices(data: dict) -> tuple:
+    """Pull `min_grt_per_30_days` and `min_grt_per_billion_entities_per_30_days`
+    out of a `/dips/info` response, tolerating both shapes the endpoint has
+    shipped in:
+
+      * Legacy nested:
+          ``{"pricing": {"min_grt_per_30_days": {...},
+                          "min_grt_per_billion_entities_per_30_days": "..."},
+             "supported_networks": [...]}``
+      * Current flat:
+          ``{"min_grt_per_30_days": {...},
+             "min_grt_per_billion_entities_per_30_days": "...",
+             "supported_networks": [...]}``
+
+    The indexer fleet will not upgrade in lockstep, so a single scoring pass
+    may hit both shapes — keep both readable until the legacy shape is gone
+    from the deployed indexer set.
+
+    Returns ``(min_prices_dict_or_empty, min_entity_price_or_none)``.
+    """
+    pricing = data.get("pricing")
+    if isinstance(pricing, dict):
+        min_prices = pricing.get("min_grt_per_30_days", {})
+        min_entity_price = pricing.get("min_grt_per_billion_entities_per_30_days")
+    else:
+        min_prices = data.get("min_grt_per_30_days", {})
+        min_entity_price = data.get("min_grt_per_billion_entities_per_30_days")
+    return min_prices, min_entity_price
+
+
 async def _fetch_single_dips_info_async(
     session: "aiohttp.ClientSession",
     indexer: str,
@@ -222,10 +252,7 @@ async def _fetch_single_dips_info_async(
     for attempt in range(DIPS_INFO_MAX_RETRIES):
         try:
             data = await do_fetch()
-            min_prices = data.get("pricing", {}).get("min_grt_per_30_days", {})
-            min_entity_price = data.get("pricing", {}).get(
-                "min_grt_per_billion_entities_per_30_days"
-            )
+            min_prices, min_entity_price = _extract_dips_prices(data)
             supported_networks = data.get("supported_networks", [])
             # If supported_networks not explicitly provided, infer from price keys
             if not supported_networks and isinstance(min_prices, dict):
