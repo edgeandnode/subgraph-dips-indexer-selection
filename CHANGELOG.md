@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.4.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.3.3...v2.4.0) (2026-05-21)
+
+
+### Added
+
+* **dips:** tolerate both legacy and flat /dips/info shapes ([#157](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/157)) ([5a2ede2](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/5a2ede2146fd91a527419f0f7db0eec7b76eed38))
+
+
+### Changed
+
+* **k8s:** update cronjob image to sha-5a2ede2 ([#159](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/159)) ([121e3f0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/121e3f085e403a5c2b24f8f2d3cb87970a8a8873))
+
 ## [2.3.3](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.3.2...v2.3.3) (2026-05-19)
 
 
