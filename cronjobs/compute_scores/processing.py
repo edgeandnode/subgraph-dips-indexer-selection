@@ -410,7 +410,8 @@ async def _fetch_single_graph_node_version_async(
                     raise aiohttp.ClientPayloadError(
                         f"Response exceeded {GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES} bytes"
                     )
-                return json.loads(raw)
+                body: dict = json.loads(raw)
+                return body
 
     last_error: Optional[Exception] = None
     for attempt in range(GRAPH_NODE_VERSION_MAX_RETRIES):
