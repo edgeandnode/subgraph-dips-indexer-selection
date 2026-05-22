@@ -126,6 +126,36 @@ def test_filter_missing_column_skips_with_warning(caplog):
     assert list(out["indexer"]) == ["0xaaa", "0xbbb"]
 
 
+def test_filter_handles_nan_from_pandas_string_dtype():
+    # Regression: pandas with the arrow-backed string dtype represents
+    # missing values as float NaN, not Python None. NaN is truthy in
+    # Python's `not` check, so an early-version of the helper let it
+    # through to Version(), which crashed with TypeError. The filter
+    # must treat NaN the same way it treats None — drop in strict mode,
+    # keep in fail-open mode.
+    import numpy as np
+
+    df = pd.DataFrame(
+        {
+            "indexer": ["0xaaa", "0xbbb", "0xccc"],
+            "graph_node_version": ["0.39.0", np.nan, "0.40.0"],
+        }
+    )
+    out_open = filter_by_min_graph_node_version(df, "0.40.0", strict=False)
+    assert list(out_open["indexer"]) == ["0xbbb", "0xccc"]
+
+    out_strict = filter_by_min_graph_node_version(df, "0.40.0", strict=True)
+    assert list(out_strict["indexer"]) == ["0xccc"]
+
+
+def test_meets_min_version_nan_input():
+    # Direct sanity-check on the comparison helper: a NaN float (the shape
+    # pandas hands us) must short-circuit to False rather than crash.
+    import math
+
+    assert _meets_min_graph_node_version(math.nan, "0.40.0") is False
+
+
 def test_filter_resets_index_after_drop():
     # A dropped row in the middle should leave the surviving rows with a
     # clean 0..N-1 index, not a gap (which downstream pd.merge can

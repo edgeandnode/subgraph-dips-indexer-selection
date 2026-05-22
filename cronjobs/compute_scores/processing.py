@@ -466,7 +466,10 @@ def _meets_min_graph_node_version(reported: Optional[str], minimum: str) -> bool
     parsing failure (unknown version, malformed minimum) returns False so
     the caller treats it as a not-eligible indexer in strict mode.
     """
-    if not reported or not minimum:
+    # Reject anything that isn't a non-empty string up front. pandas can hand
+    # us NaN (a float, which is truthy in Python's `not` check), and that
+    # would otherwise reach Version() and explode with TypeError.
+    if not isinstance(reported, str) or not reported or not minimum:
         return False
     try:
         from packaging.version import InvalidVersion, Version
@@ -501,7 +504,15 @@ def filter_by_min_graph_node_version(
 
     before = len(scores_df)
     reported = scores_df["graph_node_version"]
-    meets = reported.map(lambda v: _meets_min_graph_node_version(v, min_version))
+    # Build the boolean mask via a plain list comprehension; the helper
+    # already handles NaN / non-string inputs by returning False, so we
+    # don't need pandas' `.map` indirection (which forces a fillna step
+    # and the deprecated object-dtype downcast).
+    meets = pd.Series(
+        [_meets_min_graph_node_version(v, min_version) for v in reported],
+        index=reported.index,
+        dtype=bool,
+    )
 
     # Two reasons a row can fall below the bar: missing version (unknown)
     # or known-and-too-old. Strict mode drops both; fail-open keeps the
