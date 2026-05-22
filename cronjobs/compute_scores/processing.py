@@ -163,6 +163,13 @@ GRAPH_NODE_VERSION_RETRY_BACKOFF_MULTIPLIER = int(
 GRAPH_NODE_VERSION_RETRY_BACKOFF_MAX = int(
     os.environ.get("GRAPH_NODE_VERSION_RETRY_BACKOFF_MAX", "5")
 )
+# Maximum bytes we'll read from an indexer's /status response before giving
+# up. The real payload is tiny (~150 bytes); the cap protects against a
+# malicious or misconfigured endpoint streaming a huge body and exhausting
+# the cron job's memory.
+GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES = int(
+    os.environ.get("GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES", str(64 * 1024))
+)
 
 # Operator policy: minimum graph-node version that an indexer must be running
 # to be eligible for DIPs indexing-agreement selection. Empty string disables
@@ -394,8 +401,16 @@ async def _fetch_single_graph_node_version_async(
                         message=f"Server error {resp.status}",
                     )
                 resp.raise_for_status()
-                body: dict = await resp.json()
-                return body
+                # Read with an explicit byte cap so a pathological indexer
+                # can't stream a huge body and exhaust the cron's memory.
+                # `read(N+1)` lets us detect an overflow by checking whether
+                # we got more than the limit.
+                raw = await resp.content.read(GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES + 1)
+                if len(raw) > GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES:
+                    raise aiohttp.ClientPayloadError(
+                        f"Response exceeded {GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES} bytes"
+                    )
+                return json.loads(raw)
 
     last_error: Optional[Exception] = None
     for attempt in range(GRAPH_NODE_VERSION_MAX_RETRIES):
@@ -409,6 +424,11 @@ async def _fetch_single_graph_node_version_async(
             }
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_error = e
+            # 4xx is deterministic: the endpoint either doesn't exist or
+            # rejects the query and won't change shape on retry. Skip the
+            # remaining attempts so we don't waste backoff time on a wall.
+            if isinstance(e, aiohttp.ClientResponseError) and 400 <= e.status < 500:
+                break
             if attempt < GRAPH_NODE_VERSION_MAX_RETRIES - 1:
                 delay = min(
                     GRAPH_NODE_VERSION_RETRY_BACKOFF_MAX,
@@ -451,10 +471,58 @@ def fetch_graph_node_versions(indexer_urls: Dict[str, str]) -> pd.DataFrame:
 
     results = asyncio.run(_fetch_all_graph_node_versions_async(indexer_urls))
 
+    # Aggregate counts so the cron log shows the breakdown at a glance.
+    # When a minimum is configured we split known versions into
+    # meeting-and-below; otherwise we only know reported-vs-unknown.
     known_count = sum(1 for r in results if r["graph_node_version"] is not None)
-    logger.info(f"Graph-node version fetched for {len(results)} indexers ({known_count} reported)")
+    unknown_count = len(results) - known_count
+    if MIN_GRAPH_NODE_VERSION:
+        meeting_count = sum(
+            1
+            for r in results
+            if _meets_min_graph_node_version(r["graph_node_version"], MIN_GRAPH_NODE_VERSION)
+        )
+        below_count = known_count - meeting_count
+        logger.info(
+            f"Graph-node version probe: {len(results)} indexers — "
+            f"{meeting_count} meet {MIN_GRAPH_NODE_VERSION}, "
+            f"{below_count} below, {unknown_count} unknown"
+        )
+    else:
+        logger.info(
+            f"Graph-node version probe: {len(results)} indexers — "
+            f"{known_count} reported, {unknown_count} unknown"
+        )
 
     return pd.DataFrame(results)
+
+
+def fetch_and_filter_graph_node_versions(
+    df: pd.DataFrame, indexer_urls: Dict[str, str]
+) -> pd.DataFrame:
+    """Attach `graph_node_version` / `graph_node_commit` columns to a scores
+    DataFrame and apply the configured minimum-version filter.
+
+    Used by both the full and degraded scoring pipelines so they treat the
+    fetch + merge + filter step identically. When `indexer_urls` is empty
+    (no indexers from the network subgraph) or the probe returned nothing,
+    the version columns are still set to None so downstream code can rely
+    on their presence.
+    """
+    if indexer_urls:
+        versions_df = fetch_graph_node_versions(indexer_urls)
+    else:
+        versions_df = pd.DataFrame()
+
+    if not versions_df.empty:
+        df = pd.merge(df, versions_df, on="indexer", how="left")
+    else:
+        df["graph_node_version"] = None
+        df["graph_node_commit"] = None
+
+    return filter_by_min_graph_node_version(
+        df, MIN_GRAPH_NODE_VERSION, MIN_GRAPH_NODE_VERSION_STRICT
+    )
 
 
 def _meets_min_graph_node_version(reported: Optional[str], minimum: str) -> bool:
@@ -776,24 +844,15 @@ def compute_all_scores(
         dips_info_df = fetch_dips_info(indexer_urls)
         merged = pd.merge(merged, dips_info_df, on="indexer", how="left")
         merged["dips_info_available"] = merged["dips_info_available"].fillna(False)
-
-        versions_df = fetch_graph_node_versions(indexer_urls)
-        merged = pd.merge(merged, versions_df, on="indexer", how="left")
     else:
         merged["dips_info_available"] = False
         merged["dips_min_grt_per_30_days"] = "{}"
         merged["dips_min_grt_per_billion_entities_per_30_days"] = None
         merged["dips_supported_networks"] = "[]"
-        merged["graph_node_version"] = None
-        merged["graph_node_commit"] = None
 
-    # Apply the operator's minimum graph-node version policy. The filter is
-    # a no-op when MIN_GRAPH_NODE_VERSION is unset; otherwise it drops
-    # indexers reporting an older version, and (in strict mode only) those
-    # whose /status was unreachable.
-    merged = filter_by_min_graph_node_version(
-        merged, MIN_GRAPH_NODE_VERSION, MIN_GRAPH_NODE_VERSION_STRICT
-    )
+    # Attach graph-node versions and drop indexers below the configured
+    # minimum (no-op when MIN_GRAPH_NODE_VERSION is unset).
+    merged = fetch_and_filter_graph_node_versions(merged, indexer_urls)
 
     # Transform to indexer_scores schema with pre-normalized values
     scores_df = transform_to_scores_schema(merged)
@@ -1451,7 +1510,6 @@ def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     dips_info_df = fetch_dips_info(indexer_urls)
-    versions_df = fetch_graph_node_versions(indexer_urls)
     now = datetime.now(timezone.utc)
 
     scores = pd.DataFrame(
@@ -1492,18 +1550,9 @@ def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
         scores["dips_min_grt_per_billion_entities_per_30_days"] = None
         scores["dips_supported_networks"] = "[]"
 
-    # Merge graph-node versions from each indexer's /status endpoint.
-    # Indexers whose /status was unreachable land with None and are dropped
-    # only in strict mode (see filter_by_min_graph_node_version).
-    if not versions_df.empty:
-        scores = pd.merge(scores, versions_df, on="indexer", how="left")
-    else:
-        scores["graph_node_version"] = None
-        scores["graph_node_commit"] = None
-
-    scores = filter_by_min_graph_node_version(
-        scores, MIN_GRAPH_NODE_VERSION, MIN_GRAPH_NODE_VERSION_STRICT
-    )
+    # Attach graph-node versions and drop indexers below the configured
+    # minimum (no-op when MIN_GRAPH_NODE_VERSION is unset).
+    scores = fetch_and_filter_graph_node_versions(scores, indexer_urls)
 
     available = (
         scores["dips_info_available"].sum() if "dips_info_available" in scores.columns else 0
