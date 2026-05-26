@@ -24,7 +24,7 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: pip-audit
-        uses: pypa/gh-action-pip-audit@v1
+        uses: pypa/gh-action-pip-audit@v1.1.0
 
   pip-audit-cronjob:
     runs-on: ubuntu-latest
@@ -36,6 +36,6 @@ jobs:
           python-version: "3.11"
 
       - name: pip-audit
-        uses: pypa/gh-action-pip-audit@v1
+        uses: pypa/gh-action-pip-audit@v1.1.0
         with:
           inputs: cronjobs/compute_scores/requirements.txt
