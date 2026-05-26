@@ -1,0 +1,22 @@
+# Cross-checks the same dependency trees against the OSV database on
+# every PR and push to main. Runs alongside the pip-audit workflow.
+name: OSV scanner
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+
+jobs:
+  scan:
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.3.8
+    with:
+      upload-sarif: false
+      scan-args: |-
+        --recursive
+        ./
