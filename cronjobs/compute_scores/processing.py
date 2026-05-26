@@ -149,6 +149,54 @@ DIPS_INFO_MAX_RETRIES = int(os.environ.get("DIPS_INFO_MAX_RETRIES", "5"))
 DIPS_INFO_RETRY_BACKOFF_MULTIPLIER = int(os.environ.get("DIPS_INFO_RETRY_BACKOFF_MULTIPLIER", "1"))
 DIPS_INFO_RETRY_BACKOFF_MAX = int(os.environ.get("DIPS_INFO_RETRY_BACKOFF_MAX", "5"))
 
+# Graph-node version fetch settings. Mirror the dips-info constants so a slow
+# fleet of /status endpoints can be tuned independently if it ever becomes a
+# bottleneck.
+GRAPH_NODE_VERSION_FETCH_TIMEOUT = int(os.environ.get("GRAPH_NODE_VERSION_FETCH_TIMEOUT", "10"))
+GRAPH_NODE_VERSION_MAX_CONCURRENCY = int(
+    os.environ.get("GRAPH_NODE_VERSION_MAX_CONCURRENCY", "100")
+)
+GRAPH_NODE_VERSION_MAX_RETRIES = int(os.environ.get("GRAPH_NODE_VERSION_MAX_RETRIES", "3"))
+GRAPH_NODE_VERSION_RETRY_BACKOFF_MULTIPLIER = int(
+    os.environ.get("GRAPH_NODE_VERSION_RETRY_BACKOFF_MULTIPLIER", "1")
+)
+GRAPH_NODE_VERSION_RETRY_BACKOFF_MAX = int(
+    os.environ.get("GRAPH_NODE_VERSION_RETRY_BACKOFF_MAX", "5")
+)
+# Maximum bytes we'll read from an indexer's /status response before giving
+# up. The real payload is tiny (~150 bytes); the cap protects against a
+# malicious or misconfigured endpoint streaming a huge body and exhausting
+# the cron job's memory.
+GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES = int(
+    os.environ.get("GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES", str(64 * 1024))
+)
+
+# Truthy values accepted for `MIN_GRAPH_NODE_VERSION_STRICT`. The set matches
+# the conventions a typical Helm/values.yaml toggle uses; we lower-and-strip
+# the env value before comparison so case and whitespace don't bite.
+_MIN_GRAPH_NODE_VERSION_STRICT_TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
+
+
+def _get_min_graph_node_version() -> str:
+    """Operator policy: minimum graph-node version an indexer must be running
+    to be eligible for DIPs selection. Empty string disables the filter.
+
+    Read at call time so tests can drive the value via `monkeypatch.setenv`.
+    """
+    return os.environ.get("MIN_GRAPH_NODE_VERSION", "").strip()
+
+
+def _get_min_graph_node_version_strict() -> bool:
+    """Whether to exclude indexers whose version is unknown (endpoint
+    unreachable, malformed response, missing field).
+
+    Defaults to fail-open so a transient `/status` blip can't silently empty
+    the scoring run during the rollout window. Flip to a truthy value once
+    the indexer fleet reliably exposes the version query.
+    """
+    raw = os.environ.get("MIN_GRAPH_NODE_VERSION_STRICT", "").strip().lower()
+    return raw in _MIN_GRAPH_NODE_VERSION_STRICT_TRUE_VALUES
+
 
 def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[str, str]:
     """Query the Graph Network subgraph for indexer addresses and service URLs.
@@ -330,6 +378,332 @@ def fetch_dips_info(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     logger.info(f"DIP info fetched for {len(results)} indexers ({available_count} available)")
 
     return pd.DataFrame(results)
+
+
+async def _fetch_single_graph_node_version_async(
+    session: "aiohttp.ClientSession",
+    indexer: str,
+    url: str,
+    semaphore: asyncio.Semaphore,
+) -> dict:
+    """POST a `{ version { version commit } }` GraphQL query to <url>/status
+    and extract graph-node's reported version.
+
+    Returns one row per indexer with `graph_node_version` and
+    `graph_node_commit` set to strings on success, or to None on any failure
+    (timeout, non-2xx, malformed response, missing field). The caller decides
+    how to treat None — see `filter_by_min_graph_node_version`.
+    """
+    import aiohttp
+
+    status_url = url.rstrip("/") + "/status"
+    payload = {"query": "{ version { version commit } }"}
+
+    async def do_fetch() -> dict:
+        async with semaphore:
+            async with session.post(
+                status_url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=GRAPH_NODE_VERSION_FETCH_TIMEOUT),
+            ) as resp:
+                if resp.status >= 500:
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info,
+                        resp.history,
+                        status=resp.status,
+                        message=f"Server error {resp.status}",
+                    )
+                resp.raise_for_status()
+                # Read with an explicit byte cap so a pathological indexer
+                # can't stream a huge body and exhaust the cron's memory.
+                # `read(N+1)` lets us detect an overflow by checking whether
+                # we got more than the limit.
+                raw = await resp.content.read(GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES + 1)
+                if len(raw) > GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES:
+                    raise aiohttp.ClientPayloadError(
+                        f"Response exceeded {GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES} bytes"
+                    )
+                body: dict = json.loads(raw)
+                return body
+
+    last_error: Optional[Exception] = None
+    for attempt in range(GRAPH_NODE_VERSION_MAX_RETRIES):
+        try:
+            data = await do_fetch()
+            # Defensive shape check: a well-formed response is
+            # `{"data": {"version": {"version": ..., "commit": ...}}}`. Some
+            # indexer forks flatten `version` to a bare string, some return
+            # a top-level array, and a misconfigured proxy can return
+            # anything at all. Validate each nesting level so we fall
+            # through to the all-None record instead of crashing the batch
+            # with AttributeError.
+            data_envelope = data.get("data") if isinstance(data, dict) else None
+            version_obj = data_envelope.get("version") if isinstance(data_envelope, dict) else None
+            if not isinstance(version_obj, dict):
+                version_obj = {}
+            return {
+                "indexer": indexer,
+                "graph_node_version": version_obj.get("version"),
+                "graph_node_commit": version_obj.get("commit"),
+            }
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            ValueError,
+            UnicodeDecodeError,
+            AttributeError,
+        ) as e:
+            # The catch tuple is intentionally broad. `ValueError` covers
+            # `json.JSONDecodeError` when an indexer returns HTML or other
+            # non-JSON content with a 2xx status; `UnicodeDecodeError`
+            # covers invalid UTF-8 in the body; `AttributeError` is a
+            # belt-and-braces guard on top of the isinstance checks above.
+            # All three would otherwise propagate through `asyncio.gather`
+            # (which has no `return_exceptions=True`) and crash the entire
+            # scoring run on a single misbehaving indexer.
+            last_error = e
+            # 4xx is deterministic: the endpoint either doesn't exist or
+            # rejects the query and won't change shape on retry. Skip the
+            # remaining attempts so we don't waste backoff time on a wall.
+            if isinstance(e, aiohttp.ClientResponseError) and 400 <= e.status < 500:
+                break
+            if attempt < GRAPH_NODE_VERSION_MAX_RETRIES - 1:
+                delay = min(
+                    GRAPH_NODE_VERSION_RETRY_BACKOFF_MAX,
+                    GRAPH_NODE_VERSION_RETRY_BACKOFF_MULTIPLIER * (2**attempt),
+                )
+                await asyncio.sleep(delay)
+
+    logger.debug(
+        f"Failed to fetch graph-node version from {url} for indexer {indexer}: {last_error}"
+    )
+    return {"indexer": indexer, "graph_node_version": None, "graph_node_commit": None}
+
+
+async def _fetch_all_graph_node_versions_async(
+    indexer_urls: Dict[str, str],
+) -> List[dict]:
+    """Fan-out graph-node version fetches across the indexer fleet."""
+    import aiohttp
+
+    semaphore = asyncio.Semaphore(GRAPH_NODE_VERSION_MAX_CONCURRENCY)
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            _fetch_single_graph_node_version_async(session, indexer, url, semaphore)
+            for indexer, url in indexer_urls.items()
+        ]
+        return await asyncio.gather(*tasks)
+
+
+def fetch_graph_node_versions(indexer_urls: Dict[str, str]) -> pd.DataFrame:
+    """Fetch graph-node version from each indexer's /status endpoint
+    concurrently using asyncio.
+
+    Returns a DataFrame with columns: indexer, graph_node_version,
+    graph_node_commit. Indexers whose /status was unreachable or malformed
+    appear with None values; the version filter decides their fate.
+    """
+    if not indexer_urls:
+        return pd.DataFrame(columns=["indexer", "graph_node_version", "graph_node_commit"])
+
+    results = asyncio.run(_fetch_all_graph_node_versions_async(indexer_urls))
+
+    # Aggregate counts so the cron log shows the breakdown at a glance.
+    # When a minimum is configured we split known versions into
+    # meets/below/unparseable; otherwise we only know reported-vs-unknown.
+    # The unparseable bucket separates indexers reporting non-PEP-440 strings
+    # (e.g. git-describe like `0.40.1-1-gabcdef`) from indexers that genuinely
+    # report a version below the bar — both have a known string but only
+    # the second is a real "too old" case worth chasing.
+    known_count = sum(1 for r in results if r["graph_node_version"] is not None)
+    unknown_count = len(results) - known_count
+    min_version = _get_min_graph_node_version()
+    if min_version:
+        counts = {"meets": 0, "below": 0, "unparseable": 0}
+        for r in results:
+            reported = r["graph_node_version"]
+            if reported is None:
+                continue
+            counts[_classify_graph_node_version(reported, min_version)] += 1
+        logger.info(
+            f"Graph-node version probe: {len(results)} indexers — "
+            f"{counts['meets']} meet {min_version}, {counts['below']} below, "
+            f"{counts['unparseable']} unparseable, {unknown_count} unknown"
+        )
+    else:
+        logger.info(
+            f"Graph-node version probe: {len(results)} indexers — "
+            f"{known_count} reported, {unknown_count} unknown"
+        )
+
+    return pd.DataFrame(results)
+
+
+def fetch_and_filter_graph_node_versions(
+    df: pd.DataFrame, indexer_urls: Dict[str, str]
+) -> pd.DataFrame:
+    """Attach `graph_node_version` / `graph_node_commit` columns to a scores
+    DataFrame and apply the configured minimum-version filter.
+
+    Used by both the full and degraded scoring pipelines so they treat the
+    fetch + merge + filter step identically. When `MIN_GRAPH_NODE_VERSION`
+    is unset, or `indexer_urls` is empty (no indexers from the network
+    subgraph), neither the HTTP probe nor the filter runs — we still attach
+    None-valued version columns so downstream schema code can rely on their
+    presence in either pipeline.
+    """
+    min_version = _get_min_graph_node_version()
+    strict = _get_min_graph_node_version_strict()
+
+    # Skip both probe and filter when there's nothing to compare against
+    # (filter disabled) or no indexers to probe (subgraph empty). Either
+    # case is a no-op on the row set; we still attach the version columns
+    # so downstream code can carry them through unconditionally.
+    if not min_version or not indexer_urls:
+        if min_version and not indexer_urls:
+            # The filter is configured but can't run because the network
+            # subgraph returned nothing. Log at INFO so the cause is visible
+            # — without this line the empty scores look identical to a
+            # deliberately-disabled filter run.
+            logger.info(
+                "Graph-node version filter skipped — no indexers from network "
+                f"subgraph to probe (would otherwise apply min={min_version}, "
+                f"strict={strict})"
+            )
+        df = df.copy()
+        df["graph_node_version"] = None
+        df["graph_node_commit"] = None
+        return df
+
+    versions_df = fetch_graph_node_versions(indexer_urls)
+
+    if not versions_df.empty:
+        # `validate="m:1"` asserts every indexer key in versions_df is unique,
+        # which is true by construction (indexer_urls is a dict). If a future
+        # change widens the upstream to allow multiple URLs per indexer, this
+        # raises rather than silently row-multiplying the scores DataFrame.
+        df = pd.merge(df, versions_df, on="indexer", how="left", validate="m:1")
+    else:
+        df = df.copy()
+        df["graph_node_version"] = None
+        df["graph_node_commit"] = None
+
+    return filter_by_min_graph_node_version(df, min_version, strict)
+
+
+def _classify_graph_node_version(reported: Optional[str], minimum: str) -> str:
+    """Classify a reported graph-node version against `minimum`.
+
+    Returns one of:
+      * ``"meets"`` — both parse as PEP 440 and reported >= minimum
+      * ``"below"`` — both parse as PEP 440 and reported < minimum
+      * ``"unparseable"`` — reported is missing, not a string, or fails PEP 440
+
+    Used by the probe-summary log to keep "indexer reported a non-PEP-440
+    string" (e.g. git-describe like ``0.40.1-1-gabcdef``) distinct from
+    "indexer reported a parseable version that's too old".
+    """
+    # Reject anything that isn't a non-empty string up front. pandas can hand
+    # us NaN (a float, which is truthy in Python's `not` check), and that
+    # would otherwise reach Version() and explode with TypeError.
+    if not isinstance(reported, str) or not reported or not minimum:
+        return "unparseable"
+    try:
+        from packaging.version import InvalidVersion, Version
+
+        return "meets" if Version(reported) >= Version(minimum) else "below"
+    except InvalidVersion:
+        return "unparseable"
+
+
+def _meets_min_graph_node_version(reported: Optional[str], minimum: str) -> bool:
+    """Decide whether a reported graph-node version meets the configured
+    minimum.
+
+    Returns True only when both versions parse as valid PEP 440 versions
+    and the reported one is greater than or equal to the minimum. Any
+    parsing failure (unknown version, malformed minimum) returns False so
+    the caller treats it as a not-eligible indexer in strict mode.
+    """
+    return _classify_graph_node_version(reported, minimum) == "meets"
+
+
+def filter_by_min_graph_node_version(
+    scores_df: pd.DataFrame,
+    min_version: str,
+    strict: bool,
+) -> pd.DataFrame:
+    """Drop indexers whose `graph_node_version` falls below `min_version`.
+
+    No-op when `min_version` is empty.
+
+    Indexers with no reported version (None / NaN) are dropped only when
+    `strict` is true. The fail-open default lets the filter ship while the
+    fleet rolls out support for the /status version query, then tightens
+    once a quorum of indexers reliably exposes the field.
+    """
+    if not min_version:
+        return scores_df
+    if "graph_node_version" not in scores_df.columns:
+        logger.warning(
+            "MIN_GRAPH_NODE_VERSION is set but graph_node_version column is missing; "
+            "skipping filter"
+        )
+        return scores_df
+
+    before = len(scores_df)
+    reported = scores_df["graph_node_version"]
+    # Build the boolean mask via a plain list comprehension; the helper
+    # already handles NaN / non-string inputs by returning False, so we
+    # don't need pandas' `.map` indirection (which forces a fillna step
+    # and the deprecated object-dtype downcast).
+    meets = pd.Series(
+        [_meets_min_graph_node_version(v, min_version) for v in reported],
+        index=reported.index,
+        dtype=bool,
+    )
+
+    # Two reasons a row can fall below the bar: missing version (unknown)
+    # or known-and-too-old. Strict mode drops both; fail-open keeps the
+    # unknowns and only drops the known-and-too-old.
+    if strict:
+        keep = meets
+    else:
+        keep = meets | reported.isna()
+
+    dropped = scores_df.loc[~keep, ["indexer", "graph_node_version"]]
+    # Per-row detail at DEBUG so a steady-state filter doesn't drown the
+    # log in WARNING noise; the aggregate WARNING below carries the
+    # signal that something was excluded.
+    for row in dropped.itertuples(index=False):
+        logger.debug(
+            "Excluding indexer below graph-node minimum: "
+            f"indexer={row.indexer} reported={row.graph_node_version} "
+            f"minimum={min_version} strict={strict}"
+        )
+
+    after = before - len(dropped)
+    if len(dropped) > 0:
+        # Split the dropped count into "known but below the bar" vs
+        # "unknown / probe didn't answer" so triage doesn't have to drop
+        # to DEBUG to tell the two apart. In fail-open mode the unknown
+        # bucket is always zero (we keep those rows); in strict mode it
+        # is the count of indexers whose /status didn't answer.
+        is_unknown = reported.isna()
+        below_count = int((~meets & ~is_unknown).sum())
+        unknown_dropped = int(is_unknown.sum()) if strict else 0
+        logger.warning(
+            f"Graph-node version filter dropped {len(dropped)} of {before} indexers "
+            f"({below_count} below, {unknown_dropped} unknown) "
+            f"(min={min_version}, strict={strict}); enable DEBUG for per-indexer detail"
+        )
+    else:
+        logger.info(
+            f"Graph-node version filter: {after}/{before} indexers retained "
+            f"(min={min_version}, strict={strict})"
+        )
+    return scores_df.loc[keep].reset_index(drop=True)
 
 
 def diagnose_geoip_failure(combined_queries: pd.DataFrame) -> str:
@@ -576,6 +950,10 @@ def compute_all_scores(
         merged["dips_min_grt_per_billion_entities_per_30_days"] = None
         merged["dips_supported_networks"] = "[]"
 
+    # Attach graph-node versions and drop indexers below the configured
+    # minimum (no-op when MIN_GRAPH_NODE_VERSION is unset).
+    merged = fetch_and_filter_graph_node_versions(merged, indexer_urls)
+
     # Transform to indexer_scores schema with pre-normalized values
     scores_df = transform_to_scores_schema(merged)
     scores_df["scoring_mode"] = "full" if geoip_available else "partial_no_geoip"
@@ -644,6 +1022,13 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
         "dips_min_grt_per_billion_entities_per_30_days"
     )
     scores["dips_supported_networks"] = merged.get("dips_supported_networks", "[]")
+
+    # Graph-node version (fetched from /status). Carried through so the
+    # published JSON has the same shape regardless of whether the filter
+    # was active — the degraded-scoring path already includes these
+    # columns, so omitting them here would create a mode-dependent schema.
+    scores["graph_node_version"] = merged.get("graph_node_version")
+    scores["graph_node_commit"] = merged.get("graph_node_commit")
 
     # Metadata
     scores["computed_at"] = datetime.now(timezone.utc)
@@ -1271,6 +1656,10 @@ def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
         scores["dips_min_grt_per_30_days"] = "{}"
         scores["dips_min_grt_per_billion_entities_per_30_days"] = None
         scores["dips_supported_networks"] = "[]"
+
+    # Attach graph-node versions and drop indexers below the configured
+    # minimum (no-op when MIN_GRAPH_NODE_VERSION is unset).
+    scores = fetch_and_filter_graph_node_versions(scores, indexer_urls)
 
     available = (
         scores["dips_info_available"].sum() if "dips_info_available" in scores.columns else 0

@@ -81,6 +81,20 @@ spec:
               value: "true"
             - name: REDPANDA_GATEWAY_IDS
               value: ""
+            # Operator policy: drop indexers whose graph-node version is
+            # below this PEP 440-formatted minimum. Empty string disables
+            # the filter entirely.
+            #
+            # Set to graph-node v0.43.0 — see
+            # https://github.com/graphprotocol/graph-node/releases/tag/v0.43.0
+            - name: MIN_GRAPH_NODE_VERSION
+              value: "0.43.0"
+            # When "true", indexers whose /status was unreachable (no
+            # reported version) are also dropped. Defaults to fail-open
+            # during the rollout window; flip after the fleet reliably
+            # exposes the version query.
+            - name: MIN_GRAPH_NODE_VERSION_STRICT
+              value: "false"
             securityContext:
               allowPrivilegeEscalation: false
               capabilities:
