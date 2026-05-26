@@ -95,7 +95,11 @@ class _FakeSession:
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # `asyncio.run` creates and tears down a fresh loop per call, which is
+    # the recommended pattern on Python 3.10+. The older
+    # `asyncio.get_event_loop().run_until_complete(...)` emits a
+    # DeprecationWarning and will fail outright on 3.14+.
+    return asyncio.run(coro)
 
 
 @pytest.fixture
@@ -309,3 +313,149 @@ def test_fetch_oversized_response_returns_unknown(semaphore, monkeypatch):
 
     # Assert — overflow triggered the failure path, all retries consumed.
     assert result["graph_node_version"] is None
+
+
+class _HtmlResponse:
+    """Stub that returns raw non-JSON bytes from `content.read`. Used to
+    cover the malformed-body branch: aiohttp itself is happy with the
+    response (2xx, valid framing), only `json.loads` rejects the body."""
+
+    def __init__(self, body_bytes: bytes = b"<html>Bad Gateway</html>", status: int = 200):
+        self.content = _FakeContent(body_bytes)
+        self.status = status
+        self.request_info = _FakeRequestInfo()
+        self.history = ()
+
+    def raise_for_status(self):
+        return None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def test_fetch_5xx_retries_then_succeeds(semaphore, monkeypatch):
+    # Arrange — a 500 response is transient by assumption, so the fetcher
+    # should NOT short-circuit the way it does for 4xx. The second attempt
+    # returns a valid version and the call succeeds.
+    async def _no_sleep(_):
+        return None
+
+    monkeypatch.setattr("processing.asyncio.sleep", _no_sleep)
+
+    session = _FakeSession(
+        [
+            _FakeResponse({"errors": [{"message": "boom"}]}, status=500),
+            _FakeResponse({"data": {"version": {"version": "0.40.0", "commit": "abc"}}}),
+        ]
+    )
+
+    # Act
+    result = _run(
+        _fetch_single_graph_node_version_async(
+            session, indexer="0x500", url="http://i.example", semaphore=semaphore
+        )
+    )
+
+    # Assert — 500 was retried, second attempt parsed cleanly.
+    assert result["graph_node_version"] == "0.40.0"
+    assert len(session.calls) == 2
+
+
+def test_fetch_handles_malformed_json_body(semaphore, monkeypatch):
+    # Arrange — an upstream proxy returns a 200 with an HTML error page in
+    # the body. `json.loads` raises JSONDecodeError (a ValueError); without
+    # the broadened catch tuple it would escape the per-task coroutine,
+    # propagate through `asyncio.gather`, and crash the whole batch.
+    async def _no_sleep(_):
+        return None
+
+    monkeypatch.setattr("processing.asyncio.sleep", _no_sleep)
+
+    session = _FakeSession([_HtmlResponse(), _HtmlResponse(), _HtmlResponse()])
+
+    # Act
+    result = _run(
+        _fetch_single_graph_node_version_async(
+            session, indexer="0xhtml", url="http://i.example", semaphore=semaphore
+        )
+    )
+
+    # Assert — JSONDecodeError was caught and treated like any transient
+    # failure: three attempts, all-None record returned.
+    assert result == {
+        "indexer": "0xhtml",
+        "graph_node_version": None,
+        "graph_node_commit": None,
+    }
+    assert len(session.calls) == 3
+
+
+def test_fetch_handles_invalid_utf8_body(semaphore, monkeypatch):
+    # Arrange — `json.loads` decodes UTF-8 internally. Raw bytes that don't
+    # form valid UTF-8 raise UnicodeDecodeError (a ValueError subclass).
+    async def _no_sleep(_):
+        return None
+
+    monkeypatch.setattr("processing.asyncio.sleep", _no_sleep)
+
+    # Provide one bad-bytes response per retry attempt; the decode error
+    # is transient-like (could in principle be a partial read), so the
+    # fetcher exhausts the retry budget before giving up.
+    session = _FakeSession([_HtmlResponse(body_bytes=b"\xc3\x28\xff\xfe") for _ in range(3)])
+
+    # Act
+    result = _run(
+        _fetch_single_graph_node_version_async(
+            session, indexer="0xutf8", url="http://i.example", semaphore=semaphore
+        )
+    )
+
+    # Assert — the decode error was caught; the record falls through to
+    # all-None and the cron run continues.
+    assert result["graph_node_version"] is None
+    assert len(session.calls) == 3
+
+
+def test_fetch_handles_non_dict_version_field(semaphore):
+    # Arrange — a graph-node fork returns `data.version` as a bare string
+    # instead of the expected `{version, commit}` object. The isinstance
+    # guards must catch the shape mismatch and fall through without
+    # raising AttributeError on `.get()`.
+    session = _FakeSession([_FakeResponse({"data": {"version": "0.40.0"}})])
+
+    # Act
+    result = _run(
+        _fetch_single_graph_node_version_async(
+            session, indexer="0xmisshape", url="http://i.example", semaphore=semaphore
+        )
+    )
+
+    # Assert — single attempt because the failure is deterministic; record
+    # is all-None.
+    assert result == {
+        "indexer": "0xmisshape",
+        "graph_node_version": None,
+        "graph_node_commit": None,
+    }
+    assert len(session.calls) == 1
+
+
+def test_fetch_handles_top_level_array_body(semaphore):
+    # Arrange — a misbehaving proxy returns a JSON array as the top-level
+    # body. `data.get(...)` would raise AttributeError without the
+    # isinstance guard.
+    session = _FakeSession([_FakeResponse([{"data": {"version": {"version": "0.40.0"}}}])])
+
+    # Act
+    result = _run(
+        _fetch_single_graph_node_version_async(
+            session, indexer="0xarray", url="http://i.example", semaphore=semaphore
+        )
+    )
+
+    # Assert — shape mismatch handled cleanly, all-None record.
+    assert result["graph_node_version"] is None
+    assert result["graph_node_commit"] is None

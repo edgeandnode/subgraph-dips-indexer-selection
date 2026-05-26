@@ -417,13 +417,37 @@ async def _fetch_single_graph_node_version_async(
     for attempt in range(GRAPH_NODE_VERSION_MAX_RETRIES):
         try:
             data = await do_fetch()
-            version_obj = (data.get("data") or {}).get("version") or {}
+            # Defensive shape check: a well-formed response is
+            # `{"data": {"version": {"version": ..., "commit": ...}}}`. Some
+            # indexer forks flatten `version` to a bare string, some return
+            # a top-level array, and a misconfigured proxy can return
+            # anything at all. Validate each nesting level so we fall
+            # through to the all-None record instead of crashing the batch
+            # with AttributeError.
+            data_envelope = data.get("data") if isinstance(data, dict) else None
+            version_obj = data_envelope.get("version") if isinstance(data_envelope, dict) else None
+            if not isinstance(version_obj, dict):
+                version_obj = {}
             return {
                 "indexer": indexer,
                 "graph_node_version": version_obj.get("version"),
                 "graph_node_commit": version_obj.get("commit"),
             }
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            ValueError,
+            UnicodeDecodeError,
+            AttributeError,
+        ) as e:
+            # The catch tuple is intentionally broad. `ValueError` covers
+            # `json.JSONDecodeError` when an indexer returns HTML or other
+            # non-JSON content with a 2xx status; `UnicodeDecodeError`
+            # covers invalid UTF-8 in the body; `AttributeError` is a
+            # belt-and-braces guard on top of the isinstance checks above.
+            # All three would otherwise propagate through `asyncio.gather`
+            # (which has no `return_exceptions=True`) and crash the entire
+            # scoring run on a single misbehaving indexer.
             last_error = e
             # 4xx is deterministic: the endpoint either doesn't exist or
             # rejects the query and won't change shape on retry. Skip the

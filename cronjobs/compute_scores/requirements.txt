@@ -30,3 +30,6 @@ base58>=2.1,<3.0
 
 # Async HTTP for /dips/info endpoint fetching
 aiohttp>=3.9,<4.0
+
+# PEP 440 version comparison for the graph-node minimum-version filter
+packaging>=21.0,<26.0
