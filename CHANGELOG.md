@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.5.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.5.0...v2.5.1) (2026-05-26)
+
+
+### Changed
+
+* **k8s:** update cronjob image to sha-e126be4 ([#166](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/166)) ([3f16736](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/3f167366969ae6e9366f17f10265d7789a44c094))
+
+
+### CI/CD
+
+* **release:** document merge order on the auto-generated PRs ([#164](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/164)) ([e126be4](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/e126be4adf603d631189c5831a733dbc2f2423ae))
+
 ## [2.5.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.4.0...v2.5.0) (2026-05-26)
 
 
