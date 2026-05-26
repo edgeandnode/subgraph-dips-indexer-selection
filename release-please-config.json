@@ -11,6 +11,7 @@
     }
   },
   "release-search-depth": 100,
+  "pull-request-header": "**Merge order:** If a `chore(k8s): update cronjob image` PR is open, land it first. After that PR lands, wait 1-2 minutes for release-please to force-push this one with the new SHA bump — otherwise you'll need to land a third PR.",
   "changelog-sections": [
     {
       "type": "feat",
