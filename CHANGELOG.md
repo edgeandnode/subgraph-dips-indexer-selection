@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.5.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.4.0...v2.5.0) (2026-05-26)
+
+
+### Added
+
+* exclude indexers below a minimum graph-node version ([#160](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/160)) ([81353da](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/81353da1c6c5daf940866eb920e8ca3d237ed141))
+
+
+### Changed
+
+* **k8s:** update cronjob image to sha-81353da ([#163](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/163)) ([94d646a](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/94d646ab1c88d6f7214010d66887a4628bcebe58))
+
 ## [2.4.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.3.3...v2.4.0) (2026-05-21)
 
 
