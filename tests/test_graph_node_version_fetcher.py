@@ -82,6 +82,27 @@ class _RaisingPost:
         return False
 
 
+class _HtmlResponse:
+    """Stub that returns raw non-JSON bytes from `content.read`. Used to
+    cover the malformed-body branch: aiohttp itself is happy with the
+    response (2xx, valid framing), only `json.loads` rejects the body."""
+
+    def __init__(self, body_bytes: bytes = b"<html>Bad Gateway</html>", status: int = 200):
+        self.content = _FakeContent(body_bytes)
+        self.status = status
+        self.request_info = _FakeRequestInfo()
+        self.history = ()
+
+    def raise_for_status(self):
+        return None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
 class _FakeSession:
     """Stub aiohttp session: returns scripted responses for each .post call."""
 
@@ -313,27 +334,6 @@ def test_fetch_oversized_response_returns_unknown(semaphore, monkeypatch):
 
     # Assert — overflow triggered the failure path, all retries consumed.
     assert result["graph_node_version"] is None
-
-
-class _HtmlResponse:
-    """Stub that returns raw non-JSON bytes from `content.read`. Used to
-    cover the malformed-body branch: aiohttp itself is happy with the
-    response (2xx, valid framing), only `json.loads` rejects the body."""
-
-    def __init__(self, body_bytes: bytes = b"<html>Bad Gateway</html>", status: int = 200):
-        self.content = _FakeContent(body_bytes)
-        self.status = status
-        self.request_info = _FakeRequestInfo()
-        self.history = ()
-
-    def raise_for_status(self):
-        return None
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *a):
-        return False
 
 
 def test_fetch_5xx_retries_then_succeeds(semaphore, monkeypatch):
