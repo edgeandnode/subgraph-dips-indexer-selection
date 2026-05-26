@@ -171,18 +171,31 @@ GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES = int(
     os.environ.get("GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES", str(64 * 1024))
 )
 
-# Operator policy: minimum graph-node version that an indexer must be running
-# to be eligible for DIPs indexing-agreement selection. Empty string disables
-# the filter entirely.
-MIN_GRAPH_NODE_VERSION = os.environ.get("MIN_GRAPH_NODE_VERSION", "").strip()
-# When true, indexers whose version is unknown (endpoint unreachable, malformed
-# response, missing field) are excluded. Defaults to fail-open during the
-# rollout window so an indexer that briefly fails the /status probe isn't
-# dropped from scoring; flip to true once the indexer fleet reliably exposes
-# the field.
-MIN_GRAPH_NODE_VERSION_STRICT = (
-    os.environ.get("MIN_GRAPH_NODE_VERSION_STRICT", "").lower() == "true"
-)
+# Truthy values accepted for `MIN_GRAPH_NODE_VERSION_STRICT`. The set matches
+# the conventions a typical Helm/values.yaml toggle uses; we lower-and-strip
+# the env value before comparison so case and whitespace don't bite.
+_MIN_GRAPH_NODE_VERSION_STRICT_TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
+
+
+def _get_min_graph_node_version() -> str:
+    """Operator policy: minimum graph-node version an indexer must be running
+    to be eligible for DIPs selection. Empty string disables the filter.
+
+    Read at call time so tests can drive the value via `monkeypatch.setenv`.
+    """
+    return os.environ.get("MIN_GRAPH_NODE_VERSION", "").strip()
+
+
+def _get_min_graph_node_version_strict() -> bool:
+    """Whether to exclude indexers whose version is unknown (endpoint
+    unreachable, malformed response, missing field).
+
+    Defaults to fail-open so a transient `/status` blip can't silently empty
+    the scoring run during the rollout window. Flip to a truthy value once
+    the indexer fleet reliably exposes the version query.
+    """
+    raw = os.environ.get("MIN_GRAPH_NODE_VERSION_STRICT", "").strip().lower()
+    return raw in _MIN_GRAPH_NODE_VERSION_STRICT_TRUE_VALUES
 
 
 def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[str, str]:
@@ -501,16 +514,17 @@ def fetch_graph_node_versions(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     # meeting-and-below; otherwise we only know reported-vs-unknown.
     known_count = sum(1 for r in results if r["graph_node_version"] is not None)
     unknown_count = len(results) - known_count
-    if MIN_GRAPH_NODE_VERSION:
+    min_version = _get_min_graph_node_version()
+    if min_version:
         meeting_count = sum(
             1
             for r in results
-            if _meets_min_graph_node_version(r["graph_node_version"], MIN_GRAPH_NODE_VERSION)
+            if _meets_min_graph_node_version(r["graph_node_version"], min_version)
         )
         below_count = known_count - meeting_count
         logger.info(
             f"Graph-node version probe: {len(results)} indexers — "
-            f"{meeting_count} meet {MIN_GRAPH_NODE_VERSION}, "
+            f"{meeting_count} meet {min_version}, "
             f"{below_count} below, {unknown_count} unknown"
         )
     else:
@@ -529,25 +543,39 @@ def fetch_and_filter_graph_node_versions(
     DataFrame and apply the configured minimum-version filter.
 
     Used by both the full and degraded scoring pipelines so they treat the
-    fetch + merge + filter step identically. When `indexer_urls` is empty
-    (no indexers from the network subgraph) or the probe returned nothing,
-    the version columns are still set to None so downstream code can rely
-    on their presence.
+    fetch + merge + filter step identically. When `MIN_GRAPH_NODE_VERSION`
+    is unset, or `indexer_urls` is empty (no indexers from the network
+    subgraph), neither the HTTP probe nor the filter runs — we still attach
+    None-valued version columns so downstream schema code can rely on their
+    presence in either pipeline.
     """
-    if indexer_urls:
-        versions_df = fetch_graph_node_versions(indexer_urls)
-    else:
-        versions_df = pd.DataFrame()
+    min_version = _get_min_graph_node_version()
+    strict = _get_min_graph_node_version_strict()
+
+    # Skip both probe and filter when there's nothing to compare against
+    # (filter disabled) or no indexers to probe (subgraph empty). Either
+    # case is a no-op on the row set; we still attach the version columns
+    # so downstream code can carry them through unconditionally.
+    if not min_version or not indexer_urls:
+        df = df.copy()
+        df["graph_node_version"] = None
+        df["graph_node_commit"] = None
+        return df
+
+    versions_df = fetch_graph_node_versions(indexer_urls)
 
     if not versions_df.empty:
-        df = pd.merge(df, versions_df, on="indexer", how="left")
+        # `validate="m:1"` asserts every indexer key in versions_df is unique,
+        # which is true by construction (indexer_urls is a dict). If a future
+        # change widens the upstream to allow multiple URLs per indexer, this
+        # raises rather than silently row-multiplying the scores DataFrame.
+        df = pd.merge(df, versions_df, on="indexer", how="left", validate="m:1")
     else:
+        df = df.copy()
         df["graph_node_version"] = None
         df["graph_node_commit"] = None
 
-    return filter_by_min_graph_node_version(
-        df, MIN_GRAPH_NODE_VERSION, MIN_GRAPH_NODE_VERSION_STRICT
-    )
+    return filter_by_min_graph_node_version(df, min_version, strict)
 
 
 def _meets_min_graph_node_version(reported: Optional[str], minimum: str) -> bool:
