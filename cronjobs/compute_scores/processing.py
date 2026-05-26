@@ -511,21 +511,25 @@ def fetch_graph_node_versions(indexer_urls: Dict[str, str]) -> pd.DataFrame:
 
     # Aggregate counts so the cron log shows the breakdown at a glance.
     # When a minimum is configured we split known versions into
-    # meeting-and-below; otherwise we only know reported-vs-unknown.
+    # meets/below/unparseable; otherwise we only know reported-vs-unknown.
+    # The unparseable bucket separates indexers reporting non-PEP-440 strings
+    # (e.g. git-describe like `0.40.1-1-gabcdef`) from indexers that genuinely
+    # report a version below the bar — both have a known string but only
+    # the second is a real "too old" case worth chasing.
     known_count = sum(1 for r in results if r["graph_node_version"] is not None)
     unknown_count = len(results) - known_count
     min_version = _get_min_graph_node_version()
     if min_version:
-        meeting_count = sum(
-            1
-            for r in results
-            if _meets_min_graph_node_version(r["graph_node_version"], min_version)
-        )
-        below_count = known_count - meeting_count
+        counts = {"meets": 0, "below": 0, "unparseable": 0}
+        for r in results:
+            reported = r["graph_node_version"]
+            if reported is None:
+                continue
+            counts[_classify_graph_node_version(reported, min_version)] += 1
         logger.info(
             f"Graph-node version probe: {len(results)} indexers — "
-            f"{meeting_count} meet {min_version}, "
-            f"{below_count} below, {unknown_count} unknown"
+            f"{counts['meets']} meet {min_version}, {counts['below']} below, "
+            f"{counts['unparseable']} unparseable, {unknown_count} unknown"
         )
     else:
         logger.info(
@@ -578,6 +582,31 @@ def fetch_and_filter_graph_node_versions(
     return filter_by_min_graph_node_version(df, min_version, strict)
 
 
+def _classify_graph_node_version(reported: Optional[str], minimum: str) -> str:
+    """Classify a reported graph-node version against `minimum`.
+
+    Returns one of:
+      * ``"meets"`` — both parse as PEP 440 and reported >= minimum
+      * ``"below"`` — both parse as PEP 440 and reported < minimum
+      * ``"unparseable"`` — reported is missing, not a string, or fails PEP 440
+
+    Used by the probe-summary log to keep "indexer reported a non-PEP-440
+    string" (e.g. git-describe like ``0.40.1-1-gabcdef``) distinct from
+    "indexer reported a parseable version that's too old".
+    """
+    # Reject anything that isn't a non-empty string up front. pandas can hand
+    # us NaN (a float, which is truthy in Python's `not` check), and that
+    # would otherwise reach Version() and explode with TypeError.
+    if not isinstance(reported, str) or not reported or not minimum:
+        return "unparseable"
+    try:
+        from packaging.version import InvalidVersion, Version
+
+        return "meets" if Version(reported) >= Version(minimum) else "below"
+    except InvalidVersion:
+        return "unparseable"
+
+
 def _meets_min_graph_node_version(reported: Optional[str], minimum: str) -> bool:
     """Decide whether a reported graph-node version meets the configured
     minimum.
@@ -587,17 +616,7 @@ def _meets_min_graph_node_version(reported: Optional[str], minimum: str) -> bool
     parsing failure (unknown version, malformed minimum) returns False so
     the caller treats it as a not-eligible indexer in strict mode.
     """
-    # Reject anything that isn't a non-empty string up front. pandas can hand
-    # us NaN (a float, which is truthy in Python's `not` check), and that
-    # would otherwise reach Version() and explode with TypeError.
-    if not isinstance(reported, str) or not reported or not minimum:
-        return False
-    try:
-        from packaging.version import InvalidVersion, Version
-
-        return Version(reported) >= Version(minimum)
-    except InvalidVersion:
-        return False
+    return _classify_graph_node_version(reported, minimum) == "meets"
 
 
 def filter_by_min_graph_node_version(
@@ -644,18 +663,27 @@ def filter_by_min_graph_node_version(
         keep = meets | reported.isna()
 
     dropped = scores_df.loc[~keep, ["indexer", "graph_node_version"]]
+    # Per-row detail at DEBUG so a steady-state filter doesn't drown the
+    # log in WARNING noise; the aggregate WARNING below carries the
+    # signal that something was excluded.
     for row in dropped.itertuples(index=False):
-        logger.warning(
+        logger.debug(
             "Excluding indexer below graph-node minimum: "
             f"indexer={row.indexer} reported={row.graph_node_version} "
             f"minimum={min_version} strict={strict}"
         )
 
     after = before - len(dropped)
-    logger.info(
-        f"Graph-node version filter: {after}/{before} indexers retained "
-        f"(min={min_version}, strict={strict})"
-    )
+    if len(dropped) > 0:
+        logger.warning(
+            f"Graph-node version filter dropped {len(dropped)} of {before} indexers "
+            f"(min={min_version}, strict={strict}); enable DEBUG for per-indexer detail"
+        )
+    else:
+        logger.info(
+            f"Graph-node version filter: {after}/{before} indexers retained "
+            f"(min={min_version}, strict={strict})"
+        )
     return scores_df.loc[keep].reset_index(drop=True)
 
 
@@ -975,6 +1003,13 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
         "dips_min_grt_per_billion_entities_per_30_days"
     )
     scores["dips_supported_networks"] = merged.get("dips_supported_networks", "[]")
+
+    # Graph-node version (fetched from /status). Carried through so the
+    # published JSON has the same shape regardless of whether the filter
+    # was active — the degraded-scoring path already includes these
+    # columns, so omitting them here would create a mode-dependent schema.
+    scores["graph_node_version"] = merged.get("graph_node_version")
+    scores["graph_node_commit"] = merged.get("graph_node_commit")
 
     # Metadata
     scores["computed_at"] = datetime.now(timezone.utc)
