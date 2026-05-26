@@ -561,6 +561,16 @@ def fetch_and_filter_graph_node_versions(
     # case is a no-op on the row set; we still attach the version columns
     # so downstream code can carry them through unconditionally.
     if not min_version or not indexer_urls:
+        if min_version and not indexer_urls:
+            # The filter is configured but can't run because the network
+            # subgraph returned nothing. Log at INFO so the cause is visible
+            # — without this line the empty scores look identical to a
+            # deliberately-disabled filter run.
+            logger.info(
+                "Graph-node version filter skipped — no indexers from network "
+                f"subgraph to probe (would otherwise apply min={min_version}, "
+                f"strict={strict})"
+            )
         df = df.copy()
         df["graph_node_version"] = None
         df["graph_node_commit"] = None
@@ -675,8 +685,17 @@ def filter_by_min_graph_node_version(
 
     after = before - len(dropped)
     if len(dropped) > 0:
+        # Split the dropped count into "known but below the bar" vs
+        # "unknown / probe didn't answer" so triage doesn't have to drop
+        # to DEBUG to tell the two apart. In fail-open mode the unknown
+        # bucket is always zero (we keep those rows); in strict mode it
+        # is the count of indexers whose /status didn't answer.
+        is_unknown = reported.isna()
+        below_count = int((~meets & ~is_unknown).sum())
+        unknown_dropped = int(is_unknown.sum()) if strict else 0
         logger.warning(
             f"Graph-node version filter dropped {len(dropped)} of {before} indexers "
+            f"({below_count} below, {unknown_dropped} unknown) "
             f"(min={min_version}, strict={strict}); enable DEBUG for per-indexer detail"
         )
     else:
