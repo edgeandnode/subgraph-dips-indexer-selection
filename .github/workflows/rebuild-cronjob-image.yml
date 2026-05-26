@@ -88,6 +88,8 @@ jobs:
             --title "chore(k8s): update cronjob image to sha-${{ steps.tags.outputs.sha_short }}" \
             --body "Updates the CronJob to use image \`${{ steps.tags.outputs.sha_tag }}\`
 
+          **Merge order:** Land this **before** any open \`chore(main): release\` PR. After this lands, wait 1-2 minutes for release-please to force-push the release PR with the new SHA bump — otherwise you'll need to land a third PR.
+
           After merging, run:
           \`\`\`bash
           kubectl apply -f k8s/score-computation-cronjob.yaml
