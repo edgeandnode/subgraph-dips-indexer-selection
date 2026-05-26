@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.5.2](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.5.1...v2.5.2) (2026-05-26)
+
+
+### Changed
+
+* **k8s:** add a kustomization for the workload manifests ([#167](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/167)) ([7b498ca](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/7b498ca09736d3a31eddfb4a9c87a674bf0329e5))
+* **k8s:** update cronjob image to sha-d928692 ([#170](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/170)) ([cecc571](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/cecc57165d4375b2855d680591cd9dc4d6511fdd))
+
+
+### CI/CD
+
+* scan dependencies for known vulnerabilities on every PR ([#169](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/169)) ([d928692](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/d9286929d0aa6941e30d1538a7cd2c43a14c64ea))
+
 ## [2.5.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.5.0...v2.5.1) (2026-05-26)
 
 
