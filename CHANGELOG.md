@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.6.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.5.2...v2.6.0) (2026-05-27)
+
+
+### Added
+
+* **scoring:** default the graph-node version filter to strict mode ([#171](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/171)) ([df256a8](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/df256a86d5cb9a179c5bf09df378f8a413f0c9ba))
+
+
+### Changed
+
+* **k8s:** update cronjob image to sha-df256a8 ([#173](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/173)) ([11eb9c5](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/11eb9c5c074887413ceb4873a3e1d7ce25e26670))
+
 ## [2.5.2](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.5.1...v2.5.2) (2026-05-26)
 
 
