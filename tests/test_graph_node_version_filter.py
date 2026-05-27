@@ -1,10 +1,8 @@
-"""
-Tests for the graph-node minimum-version filter applied during scoring.
+"""Tests for the graph-node minimum-version filter applied during scoring.
 
-Covers the semver comparison helper, the DataFrame filter (strict + fail-open
-modes), and the parser that pulls `version`/`commit` out of a /status
-response. Network fetches are not exercised here — those are integration
-shape and live behind aiohttp.
+Covers the semver comparison helper, the DataFrame filter (strict +
+fail-open modes), and the env-var getter. Network fetches against /status
+live in test_graph_node_version_fetcher.py.
 """
 
 import sys
@@ -16,6 +14,7 @@ jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
 from processing import (  # noqa: E402
+    _get_min_graph_node_version_strict,
     _meets_min_graph_node_version,
     filter_by_min_graph_node_version,
 )
@@ -60,10 +59,9 @@ def test_meets_min_version_unparseable_reported():
 
 
 def test_meets_min_version_empty_minimum_returns_false():
-    # The helper is a pure comparison; the caller is responsible for
-    # turning the filter off when MIN_GRAPH_NODE_VERSION is unset. The
-    # helper returns False so an accidental call with an empty minimum
-    # doesn't silently let everything through.
+    # The helper is a pure comparison; the caller turns the filter off
+    # when MIN_GRAPH_NODE_VERSION is unset. Returning False on empty
+    # minimum prevents an accidental call from silently fail-opening.
     assert _meets_min_graph_node_version("0.40.0", "") is False
 
 
@@ -127,12 +125,9 @@ def test_filter_missing_column_skips_with_warning(caplog):
 
 
 def test_filter_handles_nan_from_pandas_string_dtype():
-    # Regression: pandas with the arrow-backed string dtype represents
-    # missing values as float NaN, not Python None. NaN is truthy in
-    # Python's `not` check, so an early-version of the helper let it
-    # through to Version(), which crashed with TypeError. The filter
-    # must treat NaN the same way it treats None — drop in strict mode,
-    # keep in fail-open mode.
+    # Regression: pandas's arrow-backed string dtype renders missing values
+    # as float NaN (truthy), which once slipped past the helper into
+    # Version() and crashed. Filter must treat NaN the same as None.
     import numpy as np
 
     df = pd.DataFrame(
@@ -170,3 +165,46 @@ def test_filter_resets_index_after_drop():
     out = filter_by_min_graph_node_version(df, "0.40.0", strict=False)
     assert list(out.index) == [0, 1]
     assert list(out["indexer"]) == ["0xaaa", "0xccc"]
+
+
+def test_strict_default_is_true_when_env_unset(monkeypatch):
+    monkeypatch.delenv("MIN_GRAPH_NODE_VERSION_STRICT", raising=False)
+    assert _get_min_graph_node_version_strict() is True
+
+
+def test_strict_false_disables(monkeypatch):
+    monkeypatch.setenv("MIN_GRAPH_NODE_VERSION_STRICT", "false")
+    assert _get_min_graph_node_version_strict() is False
+
+
+def test_strict_accepts_other_falsy_spellings(monkeypatch):
+    for value in ("0", "no", "off", "False", "OFF"):
+        monkeypatch.setenv("MIN_GRAPH_NODE_VERSION_STRICT", value)
+        assert _get_min_graph_node_version_strict() is False, f"falsy={value!r}"
+
+
+def test_strict_truthy_values_stay_strict(monkeypatch):
+    for value in ("true", "1", "yes", "on", "TRUE"):
+        monkeypatch.setenv("MIN_GRAPH_NODE_VERSION_STRICT", value)
+        assert _get_min_graph_node_version_strict() is True, f"truthy={value!r}"
+
+
+def test_strict_fails_safe_on_typo(monkeypatch):
+    # Operator types "fasle" instead of "false" — the getter must default
+    # to strict rather than silently fail-open.
+    monkeypatch.setenv("MIN_GRAPH_NODE_VERSION_STRICT", "fasle")
+    assert _get_min_graph_node_version_strict() is True
+
+
+def test_strict_whitespace_only_value_defaults_strict(monkeypatch):
+    # Some k8s tooling renders an unset value as whitespace. `.strip()`
+    # collapses it to empty, which must take the same default-strict path.
+    monkeypatch.setenv("MIN_GRAPH_NODE_VERSION_STRICT", "   ")
+    assert _get_min_graph_node_version_strict() is True
+
+
+def test_strict_explicit_empty_string_defaults_strict(monkeypatch):
+    # Explicit empty string (vs unset) should also default to strict — the
+    # falsy-allowlist only excludes "false"/"0"/"no"/"off".
+    monkeypatch.setenv("MIN_GRAPH_NODE_VERSION_STRICT", "")
+    assert _get_min_graph_node_version_strict() is True
