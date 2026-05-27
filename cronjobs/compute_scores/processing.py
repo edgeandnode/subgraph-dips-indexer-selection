@@ -171,31 +171,28 @@ GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES = int(
     os.environ.get("GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES", str(64 * 1024))
 )
 
-# Truthy values accepted for `MIN_GRAPH_NODE_VERSION_STRICT`. The set matches
-# the conventions a typical Helm/values.yaml toggle uses; we lower-and-strip
+# Falsy values that disable strict mode; anything else defaults to strict.
+# Matches typical Helm/values.yaml toggle conventions; we lower-and-strip
 # the env value before comparison so case and whitespace don't bite.
-_MIN_GRAPH_NODE_VERSION_STRICT_TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
+_MIN_GRAPH_NODE_VERSION_STRICT_FALSE_VALUES = frozenset({"false", "0", "no", "off"})
 
 
 def _get_min_graph_node_version() -> str:
     """Operator policy: minimum graph-node version an indexer must be running
     to be eligible for DIPs selection. Empty string disables the filter.
-
     Read at call time so tests can drive the value via `monkeypatch.setenv`.
     """
     return os.environ.get("MIN_GRAPH_NODE_VERSION", "").strip()
 
 
 def _get_min_graph_node_version_strict() -> bool:
-    """Whether to exclude indexers whose version is unknown (endpoint
-    unreachable, malformed response, missing field).
-
-    Defaults to fail-open so a transient `/status` blip can't silently empty
-    the scoring run during the rollout window. Flip to a truthy value once
-    the indexer fleet reliably exposes the version query.
+    """Exclude indexers whose version is unknown — endpoint unreachable,
+    malformed response, or missing the version field. Defaults to strict;
+    set the env var to "false"/"0"/"no"/"off" to keep unknowns in the
+    pool (the rollout-window posture).
     """
     raw = os.environ.get("MIN_GRAPH_NODE_VERSION_STRICT", "").strip().lower()
-    return raw in _MIN_GRAPH_NODE_VERSION_STRICT_TRUE_VALUES
+    return raw not in _MIN_GRAPH_NODE_VERSION_STRICT_FALSE_VALUES
 
 
 def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[str, str]:
