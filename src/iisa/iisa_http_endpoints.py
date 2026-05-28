@@ -8,7 +8,7 @@ Endpoints:
 - GET /health - Health check, reports if data is loaded
 - POST /scores - Push computed indexer scores from the cronjob (bearer-auth)
 - GET /scores - Return the current scores snapshot (bearer-auth)
-- GET /scores/status - Report last computed_at for idempotency (bearer-auth)
+- GET /scores/status - Return last computed_at; lets the cronjob skip a redundant run (bearer-auth)
 - POST /sync-status - Push sync-status snapshot from the fetcher (bearer-auth)
 - POST /get-score - Return weighted score and components for one indexer
 - POST /select-indexers - Select optimal indexers for a deployment
@@ -113,12 +113,11 @@ class SelectedIndexer(BaseModel):
 
 
 class SelectionResponse(BaseModel):
-    """
-    Response for the /select-indexers endpoint.
+    """Response for /select-indexers: the SHOULD-be-assigned indexer set.
 
-    Returns the optimal set of indexers that SHOULD be assigned to the deployment.
-    This is idempotent - replaying the same request yields the same response.
-    The caller diffs against its actual current state to determine adds/cancels.
+    Determined entirely by the currently loaded scores plus the request
+    inputs, so a new /scores push between calls can change the response.
+    Callers diff against their actual current state to compute adds/cancels.
     """
 
     deployment_id: str
@@ -176,14 +175,11 @@ class ScoresAcceptedResponse(BaseModel):
 
 
 class ScoresSnapshotResponse(BaseModel):
-    """
-    Response for the GET /scores endpoint.
+    """Response for GET /scores: full snapshot of loaded scored indexers.
 
-    Full snapshot of scored indexers currently loaded in memory. Intended
-    for ops debugging ("did indexer X get scored and in what mode?"),
-    external monitoring, and local-network test harnesses. The shape
-    mirrors the POST /scores payload (list of records) so the round-trip
-    is symmetric.
+    Intended for ops debugging, external monitoring, and local-network test
+    harnesses. The shape mirrors the POST /scores payload (list of records)
+    so the round-trip is symmetric.
     """
 
     computed_at: Optional[str] = None
@@ -250,13 +246,11 @@ class IISAState:
             return False
 
     def refresh_data(self) -> bool:
-        """
-        Load pre-computed indexer scores from the cache file on disk.
+        """Load pre-computed indexer scores from the cache file on disk.
 
-        Called on startup to recover the last successful push. Graceful empty
-        fallback is already handled by FileScoreLoader on a cache miss.
-
-        Returns True if scores were loaded successfully, False otherwise.
+        Called on startup to recover the last successful push. FileScoreLoader
+        handles graceful empty fallback on a cache miss. Returns True on
+        success, False otherwise.
         """
         if not self._initialized or self.data_manager is None:
             logger.warning("Cannot refresh data: DataManager not initialized")
@@ -280,23 +274,11 @@ class IISAState:
             return False
 
     def load_scores_from_records(self, records: list[dict[str, Any]]) -> int:
-        """
-        Accept a pushed scores payload from the cronjob.
+        """Accept a pushed scores payload from the cronjob; return row count.
 
-        Dry-run-then-commit ordering: parse the DataFrame, run the
-        transform against a local copy to prove it produces a usable
-        result, THEN write the payload to the cache file, THEN commit
-        the transformed result to in-memory state. A transform failure
-        raises before any disk I/O, so the cache file is always either
-        the previous valid payload or the new one — never a payload
-        that a restart would choke on.
-
-        Returns the number of loaded rows. Raises on parse, transform,
-        or write failure. An empty records list propagates to
-        transform_scores_df which raises ValueError — the push endpoint
-        already 422s on empty bodies, so the direct-call path is the
-        only caller that hits that branch and we want it to fail loudly
-        rather than silently zero out the cache.
+        Dry-run-then-commit: parse, transform a local copy, then write cache,
+        then commit in-memory. Transform failures raise before any disk I/O,
+        keeping the cache file valid. Raises on parse/transform/write failure.
         """
         if self.data_manager is None:
             raise RuntimeError("DataManager not initialized")
@@ -337,14 +319,11 @@ class IISAState:
         return False
 
     def load_sync_status_from_dict(self, raw: dict[str, Any]) -> int:
-        """
-        Accept a pushed sync-status payload.
+        """Accept a pushed sync-status payload.
 
-        Parse-first ordering: constructs a SyncStatusData in memory
-        before touching disk. Once parsing succeeds, the raw payload
-        is written atomically to the configured cache path and the
-        in-memory snapshot is assigned. Returns the number of indexers
-        that passed the staleness filter.
+        Parse-first ordering: SyncStatusData is constructed in memory before
+        touching disk; once parsing succeeds, the raw payload is written
+        atomically. Returns the indexer count that passed staleness filter.
         """
         if self.settings is None:
             raise RuntimeError("Settings not initialized")
@@ -406,10 +385,9 @@ def _extract_computed_at(scores_df: pd.DataFrame) -> Optional[datetime]:
 def _require_push_token(authorization: Optional[str]) -> None:
     """Validate the bearer token against IISA_PUSH_TOKEN.
 
-    When IISA_PUSH_TOKEN is unset, authentication is disabled (local dev
-    convenience). Token comparison uses hmac.compare_digest to avoid
-    timing oracles. The "Bearer" scheme prefix is matched case-insensitively
-    per RFC 6750 §2.1, but the token itself keeps its original case.
+    When IISA_PUSH_TOKEN is unset, auth is off (local dev convenience). Uses
+    hmac.compare_digest to dodge timing oracles. "Bearer" prefix matched
+    case-insensitively per RFC 6750 §2.1; the token itself is case-sensitive.
     """
     expected = get_settings().push_token
     if not expected:
@@ -432,18 +410,11 @@ _state = IISAState()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    FastAPI lifespan handler for startup and shutdown.
+    """FastAPI lifespan: load settings, init loader + DataManager, recover the
+    last cached scores and sync-status from disk, warn if IISA_PUSH_TOKEN is unset.
 
-    On startup:
-    1. Load settings from environment
-    2. Initialize FileScoreLoader and DataManager (cache-backed, RWO PVC)
-    3. Recover the last cached scores + sync-status from disk if present
-    4. Warn if IISA_PUSH_TOKEN is unset (auth disabled; acceptable in local dev)
-
-    Under the push model the cronjob POSTs new data directly to this service;
-    there is no background polling of the scores file. Restarts recover state
-    from the cache mount written by previous successful POSTs.
+    The cronjob POSTs new data directly — no background polling. Restarts
+    recover state from the cache mount written by previous successful POSTs.
     """
     global _state
 
@@ -531,19 +502,11 @@ def push_scores(
     payload: list[dict[str, Any]],
     authorization: Optional[str] = Header(None),
 ) -> ScoresAcceptedResponse:
-    """
-    Accept a pushed scores snapshot from the cronjob.
+    """Accept a pushed scores snapshot from the cronjob.
 
-    Handler order: validate token → validate body → parse DataFrame →
-    atomic write to the cache PVC → update in-memory DataFrame → return
-    row count. Parsing before touching disk means a malformed payload
-    422s cleanly without mutating on-disk state; the cache is only
-    updated once the DataFrame is known to be well-formed.
-
-    Declared as sync def (not async) so FastAPI runs the body in a
-    threadpool — the _atomic_write_json call does blocking disk I/O
-    (~50-200ms on a 10 MiB payload) which would stall the event loop
-    if this were async.
+    Order: token → body → DataFrame → atomic write to cache PVC → in-memory
+    update → row count. Parse-before-disk means a malformed payload 422s
+    without mutating disk. Sync def so the blocking write hits the threadpool.
     """
     _require_push_token(authorization)
 
@@ -573,15 +536,11 @@ def push_scores(
 def scores_status(
     authorization: Optional[str] = Header(None),
 ) -> ScoresStatusResponse:
-    """
-    Report the computed_at of the currently loaded scores.
+    """Report computed_at of the currently loaded scores.
 
-    The cronjob GETs this before running to skip redundant recomputation
-    when today's scores are already pushed. Sync def for consistency with
-    the other push endpoints — body contains no awaitable work.
-
-    Reads the DataManager snapshot once so computed_at and the row count
-    always describe the same push (see ScoresSnapshot).
+    The cronjob GETs this before running so it can skip recomputation when
+    today's scores are already pushed. Sync def for consistency with the
+    other push endpoints — no awaitable work in the body.
     """
     _require_push_token(authorization)
 
@@ -604,19 +563,11 @@ def scores_status(
 def scores_snapshot(
     authorization: Optional[str] = Header(None),
 ) -> ScoresSnapshotResponse:
-    """
-    Return the currently loaded scores snapshot as a list of records.
+    """Return the loaded scores snapshot as a list of records.
 
-    Symmetric with POST /scores — what the cronjob pushed is what's
-    served here. Intended for ops debugging, external monitoring, and
-    local-network test harnesses; not part of the selection hot path
-    (use POST /select-indexers for that).
-
-    Reads the DataManager snapshot once so computed_at and scores
-    always describe the same push (see ScoresSnapshot). When no scores
-    are loaded yet, returns computed_at=null, count=0, scores=[]. Sync
-    def so the DataFrame→JSON conversion runs in FastAPI's threadpool
-    rather than on the event loop.
+    Symmetric with POST /scores — what the cronjob pushed is what's served
+    here. For ops debugging and external monitoring, not the selection hot
+    path. Sync def so the DataFrame→JSON conversion runs on the threadpool.
     """
     _require_push_token(authorization)
 
@@ -654,13 +605,11 @@ def push_sync_status(
     payload: dict[str, Any],
     authorization: Optional[str] = Header(None),
 ) -> SyncStatusAcceptedResponse:
-    """
-    Accept a pushed sync-status snapshot from the sync_status_fetcher.
+    """Accept a pushed sync-status snapshot from sync_status_fetcher.
 
-    Same parse-first ordering as POST /scores. Empty payloads are
-    accepted (means "no indexers currently synced"). Sync def so the
-    blocking _atomic_write_json runs in FastAPI's threadpool rather
-    than on the event loop.
+    Empty payloads mean "no indexers currently synced" — accepted. Sync def
+    so the blocking _atomic_write_json runs on the threadpool rather than
+    the event loop.
     """
     _require_push_token(authorization)
 
@@ -682,12 +631,10 @@ def push_sync_status(
 
 @app.post("/get-score", response_model=ScoreResponse)
 async def get_score(request: ScoreRequest) -> ScoreResponse:
-    """
-    Get the weighted score and component scores for an indexer.
+    """Return one indexer's weighted score plus the component scores feeding it.
 
-    Returns the indexer's current weighted score along with the individual
-    component scores that contribute to it. Useful for debugging selection
-    decisions and monitoring indexer performance.
+    Useful for debugging selection decisions and monitoring per-indexer
+    performance without running a full selection request.
     """
     if not _state.is_ready or _state.history is None:
         raise HTTPException(status_code=503, detail="IISA data not loaded")
@@ -739,21 +686,11 @@ async def get_score(request: ScoreRequest) -> ScoreResponse:
 
 @app.post("/select-indexers", response_model=SelectionResponse)
 async def select_indexers(request: SelectionRequest) -> SelectionResponse:
-    """
-    Select optimal indexers for a deployment using weighted scoring algorithm.
+    """Select N indexers for a deployment via weighted scoring.
 
-    Returns the target state - the set of indexers that SHOULD be assigned.
-    This is idempotent: replaying the same request yields the same response.
-    The caller diffs against its actual current state to determine adds/cancels.
-
-    The num_candidates field specifies the target group size - how many indexers
-    should be assigned to this deployment. IISA selects the top N indexers by
-    weighted aggregate score, preferring groups with >1 unique org and >1 unique
-    location when N > 1. These decentralization constraints are best-effort.
-
-    Note on existing_indexers: This tells IndexerSelector which indexers are currently
-    assigned, allowing it to decide whether to add, remove, or replace indexers.
-    To get a fresh selection ignoring current assignments, pass existing_indexers: [].
+    Returns the SHOULD-be-assigned set; caller diffs against current state.
+    Picks the top N by weighted aggregate, preferring >1 unique org / location
+    when N > 1 (best-effort). Pass existing_indexers=[] for a fresh selection.
     """
     if not _state.is_ready or _state.history is None:
         raise HTTPException(status_code=503, detail="IISA data not loaded")
@@ -802,19 +739,11 @@ def _filter_by_price(
     chain_id: Optional[str],
     max_grt_per_30_days: Optional[float],
 ) -> tuple[pd.DataFrame, str]:
-    """
-    Filter indexers by DIP pricing constraints.
+    """Drop indexers that lack DIP info, don't support the chain, lack a
+    chain price, or exceed max_grt_per_30_days for the chain.
 
-    Excludes indexers that:
-    - Have dips_info_available = False
-    - Don't support the requested chain_id
-    - Don't have pricing configured for the requested chain_id
-    - Have a base price exceeding max_grt_per_30_days for the chain
-
-    Returns:
-        Tuple of (filtered DataFrame, filter_reason) where filter_reason is empty
-        string if no filtering removed all candidates, otherwise describes why
-        all candidates were filtered out.
+    Returns (filtered_df, reason). ``reason`` is empty unless filtering left
+    no candidates, in which case it explains why.
     """
     if chain_id is None:
         return history, ""
@@ -973,18 +902,11 @@ def _build_selected_indexers(
 
 
 def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
-    """
-    Use IndexerSelector for intelligent indexer selection.
+    """Run IndexerSelector and return a SelectionResponse for the deployment.
 
-    The IndexerSelector uses weighted scoring based on:
-    - Stake to fees ratio (economic security)
-    - Base price per epoch (cheaper is better)
-    - Latency linear regression coefficient
-    - Uptime score
-    - Success rate
-    - Price per entity (cheaper is better)
-
-    Returns a SelectionResponse with the optimal set of indexers for the deployment.
+    The selector weights stake-to-fees, base price, latency, uptime,
+    success rate, and price-per-entity; lower is better for prices and
+    latency, higher for the rest.
     """
     if _state.history is None:
         return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
