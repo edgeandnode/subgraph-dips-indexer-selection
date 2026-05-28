@@ -777,6 +777,170 @@ class TestScoresSnapshotEndpoint:
         assert response.status_code == 200
 
 
+class TestScoresWeightedEndpoint:
+    """Tests for GET /scores/weighted (bulk weighted scores)."""
+
+    def test_returns_weighted_scores_for_each_indexer(self, monkeypatch):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+        from iisa.score_loader import ScoresSnapshot
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+
+        mock_dm = MagicMock()
+        mock_dm.snapshot = ScoresSnapshot(
+            data=pd.DataFrame(
+                {
+                    "indexer": ["0xabc", "0xxyz"],
+                    "url": ["https://a.example/", "https://b.example/"],
+                    "norm_lat_lin_reg_coefficient": [0.8, 0.6],
+                    "norm_uptime_score": [0.9, 0.95],
+                    "norm_success_rate": [0.85, 0.9],
+                    "norm_stake_to_fees": [0.5, 0.65],
+                    "norm_base_price_per_epoch": [0.7, 0.9],
+                    "norm_price_per_entity": [0.6, 0.8],
+                }
+            ),
+            computed_at=datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc),
+        )
+        iisa_http_endpoints._state.data_manager = mock_dm
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get("/scores/weighted")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["count"] == 2
+        assert "2026-05-28" in body["computed_at"]
+        assert len(body["scores"]) == 2
+
+        entries_by_id = {e["indexer"]: e for e in body["scores"]}
+        assert set(entries_by_id) == {"0xabc", "0xxyz"}
+
+        abc = entries_by_id["0xabc"]
+        assert isinstance(abc["weighted_score"], float)
+        assert 0.0 <= abc["weighted_score"] <= 1.0
+        assert abc["components"]["latency"] == 0.8
+        assert abc["components"]["uptime"] == 0.9
+        assert abc["components"]["success_rate"] == 0.85
+        assert abc["components"]["stake_to_fees"] == 0.5
+        assert abc["components"]["base_price"] == 0.7
+        assert abc["components"]["price_per_entity"] == 0.6
+
+        xyz = entries_by_id["0xxyz"]
+        assert xyz["components"]["latency"] == 0.6
+        assert xyz["components"]["uptime"] == 0.95
+        assert xyz["components"]["success_rate"] == 0.9
+        assert xyz["components"]["stake_to_fees"] == 0.65
+        assert xyz["components"]["base_price"] == 0.9
+        assert xyz["components"]["price_per_entity"] == 0.8
+
+    def test_nan_component_normalised_to_zero(self):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+        from iisa.score_loader import ScoresSnapshot
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+
+        mock_dm = MagicMock()
+        mock_dm.snapshot = ScoresSnapshot(
+            data=pd.DataFrame(
+                {
+                    "indexer": ["0xabc"],
+                    "url": ["https://a.example/"],
+                    "norm_lat_lin_reg_coefficient": [float("nan")],
+                    "norm_uptime_score": [0.9],
+                    "norm_success_rate": [0.85],
+                    "norm_stake_to_fees": [0.5],
+                    "norm_base_price_per_epoch": [0.7],
+                    "norm_price_per_entity": [0.6],
+                }
+            ),
+            computed_at=datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc),
+        )
+        iisa_http_endpoints._state.data_manager = mock_dm
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get("/scores/weighted")
+        assert response.status_code == 200
+        body = response.json()
+        components = body["scores"][0]["components"]
+        # _normalize_metrics fills NaN with 0 across every norm_* column, so a
+        # NaN latency input lands as a 0.0 latency in the response — not skipped.
+        assert components["latency"] == 0.0
+        assert components["uptime"] == 0.9
+
+    def test_weighted_score_none_when_calculation_raises(self, monkeypatch):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+        from iisa.score_loader import ScoresSnapshot
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+
+        mock_dm = MagicMock()
+        mock_dm.snapshot = ScoresSnapshot(
+            data=pd.DataFrame(
+                {
+                    "indexer": ["0xabc"],
+                    "url": ["https://a.example/"],
+                    "norm_uptime_score": [0.9],
+                }
+            ),
+            computed_at=datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc),
+        )
+        iisa_http_endpoints._state.data_manager = mock_dm
+
+        from iisa import indexer_selection
+
+        def raises(row, weights):
+            raise ValueError("forced failure")
+
+        monkeypatch.setattr(indexer_selection, "_calculate_weighted_score", raises)
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get("/scores/weighted")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["scores"][0]["indexer"] == "0xabc"
+        assert body["scores"][0]["weighted_score"] is None
+        assert body["scores"][0]["components"]["uptime"] == 0.9
+
+    def test_returns_empty_snapshot_when_no_scores_loaded(self):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.get("/scores/weighted")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["computed_at"] is None
+        assert body["count"] == 0
+        assert body["scores"] == []
+
+    def test_requires_bearer_when_push_token_set(self, monkeypatch):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.get("/scores/weighted")
+        assert response.status_code == 401
+
+        response = client.get("/scores/weighted", headers={"Authorization": "Bearer wrong"})
+        assert response.status_code == 401
+
+        response = client.get("/scores/weighted", headers={"Authorization": "Bearer secret"})
+        assert response.status_code == 200
+
+
 class TestGetScoreEndpoint:
     """Tests for POST /get-score endpoint."""
 
@@ -855,6 +1019,33 @@ class TestGetScoreEndpoint:
 
         # Assert
         assert response.status_code == 503
+
+    def test_requires_bearer_when_push_token_set(self, monkeypatch, mock_history_df):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        iisa_http_endpoints._state._history = mock_history_df
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post("/get-score", json={"indexer_id": "0xabc"})
+        assert response.status_code == 401
+
+        response = client.post(
+            "/get-score",
+            json={"indexer_id": "0xabc"},
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert response.status_code == 401
+
+        response = client.post(
+            "/get-score",
+            json={"indexer_id": "0xabc"},
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert response.status_code == 200
 
 
 class TestSelectIndexersEndpoint:

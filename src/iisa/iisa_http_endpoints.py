@@ -9,8 +9,9 @@ Endpoints:
 - POST /scores - Push computed indexer scores from the cronjob (bearer-auth)
 - GET /scores - Return the current scores snapshot (bearer-auth)
 - GET /scores/status - Return last computed_at; lets the cronjob skip a redundant run (bearer-auth)
+- GET /scores/weighted - Bulk weighted scores for every loaded indexer (bearer-auth)
 - POST /sync-status - Push sync-status snapshot from the fetcher (bearer-auth)
-- POST /get-score - Return weighted score and components for one indexer
+- POST /get-score - Return weighted score and components for one indexer (bearer-auth)
 - POST /select-indexers - Select optimal indexers for a deployment
 """
 
@@ -61,9 +62,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     sync_status_file_path: str = "/app/scores/sync_status.json"
     sync_status_staleness_hours: float = 6.0
-    # Bearer token required on POST /scores, GET /scores, GET /scores/status,
-    # and POST /sync-status. When unset, these endpoints accept unauthenticated
-    # requests and a WARNING is logged at startup — local dev convenience only.
+    # Bearer token required on every endpoint except /health and /select-indexers.
+    # When unset, those endpoints accept unauthenticated requests and a WARNING
+    # is logged at startup — local dev convenience only.
     push_token: Optional[str] = None
     # When true, startup fails hard if push_token is unset. Set in k8s so a
     # misconfigured Secret is caught at rollout rather than leaving production
@@ -185,6 +186,27 @@ class ScoresSnapshotResponse(BaseModel):
     computed_at: Optional[str] = None
     count: int = 0
     scores: list[dict[str, Any]] = []
+
+
+class WeightedScoreEntry(BaseModel):
+    """One indexer's weighted aggregate plus the component scores feeding it."""
+
+    indexer: str
+    weighted_score: Optional[float] = None
+    components: dict[str, float] = {}
+
+
+class WeightedScoresResponse(BaseModel):
+    """Response for GET /scores/weighted: bulk weighted-scores snapshot.
+
+    Same per-row shape as POST /get-score but for every loaded indexer in
+    a single call. `computed_at` mirrors the underlying push so callers
+    can detect stale data without a second round-trip.
+    """
+
+    computed_at: Optional[str] = None
+    count: int = 0
+    scores: list[WeightedScoreEntry] = []
 
 
 class SyncStatusAcceptedResponse(BaseModel):
@@ -600,6 +622,84 @@ def scores_snapshot(
     )
 
 
+@app.get("/scores/weighted", response_model=WeightedScoresResponse)
+def scores_weighted(
+    authorization: Optional[str] = Header(None),
+) -> WeightedScoresResponse:
+    """Bulk weighted-score snapshot — same shape as /get-score, every indexer.
+
+    Single pass across the loaded snapshot — saves N round-trips to /get-score.
+    Selection can pass `max_grt_per_30_days` as a `price_ceiling`; this endpoint
+    cannot, so prices are normalised against the observed max instead.
+    """
+    _require_push_token(authorization)
+
+    if _state.data_manager is None:
+        return WeightedScoresResponse(computed_at=None, count=0, scores=[])
+
+    snap = _state.data_manager.snapshot
+
+    computed_at: Optional[str] = None
+    if snap.computed_at is not None:
+        ts = snap.computed_at
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        computed_at = ts.isoformat()
+
+    if snap.data is None or snap.data.empty:
+        return WeightedScoresResponse(computed_at=computed_at, count=0, scores=[])
+
+    from .indexer_selection import (
+        DEFAULT_WEIGHTS,
+        _calculate_weighted_score,
+        _normalize_metrics,
+    )
+
+    normalized = _normalize_metrics(snap.data.copy())
+
+    component_keys = [
+        ("norm_lat_lin_reg_coefficient", "latency"),
+        ("norm_uptime_score", "uptime"),
+        ("norm_success_rate", "success_rate"),
+        ("norm_stake_to_fees", "stake_to_fees"),
+        ("norm_base_price_per_epoch", "base_price"),
+        ("norm_price_per_entity", "price_per_entity"),
+    ]
+
+    entries: list[WeightedScoreEntry] = []
+    for _, row in normalized.iterrows():
+        indexer_id = row.get("indexer")
+        if indexer_id is None or (isinstance(indexer_id, float) and pd.isna(indexer_id)):
+            logger.debug("skipping row with missing indexer field")
+            continue
+
+        weighted: Optional[float]
+        try:
+            weighted = float(_calculate_weighted_score(row, DEFAULT_WEIGHTS))
+        except ValueError as e:
+            logger.warning("weighted score failed for %s: %s", indexer_id, e)
+            weighted = None
+
+        components = {
+            name: float(row[col])
+            for col, name in component_keys
+            if col in row.index and pd.notna(row[col])
+        }
+        entries.append(
+            WeightedScoreEntry(
+                indexer=str(indexer_id),
+                weighted_score=weighted,
+                components=components,
+            )
+        )
+
+    return WeightedScoresResponse(
+        computed_at=computed_at,
+        count=len(entries),
+        scores=entries,
+    )
+
+
 @app.post("/sync-status", response_model=SyncStatusAcceptedResponse)
 def push_sync_status(
     payload: dict[str, Any],
@@ -630,12 +730,17 @@ def push_sync_status(
 
 
 @app.post("/get-score", response_model=ScoreResponse)
-async def get_score(request: ScoreRequest) -> ScoreResponse:
+async def get_score(
+    request: ScoreRequest,
+    authorization: Optional[str] = Header(None),
+) -> ScoreResponse:
     """Return one indexer's weighted score plus the component scores feeding it.
 
     Useful for debugging selection decisions and monitoring per-indexer
     performance without running a full selection request.
     """
+    _require_push_token(authorization)
+
     if not _state.is_ready or _state.history is None:
         raise HTTPException(status_code=503, detail="IISA data not loaded")
 
