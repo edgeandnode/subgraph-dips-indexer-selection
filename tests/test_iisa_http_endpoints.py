@@ -778,6 +778,85 @@ class TestScoresSnapshotEndpoint:
         assert response.status_code == 200
 
 
+class TestScoresWeightedEndpoint:
+    """Tests for GET /scores/weighted (bulk weighted scores)."""
+
+    def test_returns_weighted_scores_for_each_indexer(self, monkeypatch):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+        from iisa.score_loader import ScoresSnapshot
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+
+        mock_dm = MagicMock()
+        mock_dm.snapshot = ScoresSnapshot(
+            data=pd.DataFrame(
+                {
+                    "indexer": ["0xabc", "0xxyz"],
+                    "url": ["https://a.example/", "https://b.example/"],
+                    "norm_lat_lin_reg_coefficient": [0.8, 0.6],
+                    "norm_uptime_score": [0.9, 0.95],
+                    "norm_success_rate": [0.85, 0.9],
+                    "norm_stake_to_fees": [0.5, 0.65],
+                    "norm_base_price_per_epoch": [0.7, 0.9],
+                    "norm_price_per_entity": [0.6, 0.8],
+                }
+            ),
+            computed_at=datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc),
+        )
+        iisa_http_endpoints._state.data_manager = mock_dm
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get("/scores/weighted")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["count"] == 2
+        assert "2026-05-28" in body["computed_at"]
+        assert len(body["scores"]) == 2
+
+        entries_by_id = {e["indexer"]: e for e in body["scores"]}
+        for indexer_id in ("0xabc", "0xxyz"):
+            entry = entries_by_id[indexer_id]
+            assert isinstance(entry["weighted_score"], float)
+            assert 0.0 <= entry["weighted_score"] <= 1.0
+            assert entry["components"]["latency"] in (0.8, 0.6)
+            assert entry["components"]["uptime"] in (0.9, 0.95)
+
+    def test_returns_empty_snapshot_when_no_scores_loaded(self):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.get("/scores/weighted")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["computed_at"] is None
+        assert body["count"] == 0
+        assert body["scores"] == []
+
+    def test_requires_bearer_when_push_token_set(self, monkeypatch):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.get("/scores/weighted")
+        assert response.status_code == 401
+
+        response = client.get("/scores/weighted", headers={"Authorization": "Bearer wrong"})
+        assert response.status_code == 401
+
+        response = client.get("/scores/weighted", headers={"Authorization": "Bearer secret"})
+        assert response.status_code == 200
+
+
 class TestGetScoreEndpoint:
     """Tests for POST /get-score endpoint."""
 
