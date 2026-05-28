@@ -163,10 +163,9 @@ GRAPH_NODE_VERSION_RETRY_BACKOFF_MULTIPLIER = int(
 GRAPH_NODE_VERSION_RETRY_BACKOFF_MAX = int(
     os.environ.get("GRAPH_NODE_VERSION_RETRY_BACKOFF_MAX", "5")
 )
-# Maximum bytes we'll read from an indexer's /status response before giving
-# up. The real payload is tiny (~150 bytes); the cap protects against a
-# malicious or misconfigured endpoint streaming a huge body and exhausting
-# the cron job's memory.
+# Byte cap on the /status response: real payload is ~150 bytes, the cap
+# protects against a malicious or misconfigured endpoint streaming a huge
+# body and exhausting cron memory.
 GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES = int(
     os.environ.get("GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES", str(64 * 1024))
 )
@@ -198,14 +197,9 @@ def _get_min_graph_node_version_strict() -> bool:
 def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[str, str]:
     """Query the Graph Network subgraph for indexer addresses and service URLs.
 
-    The network subgraph is the source of truth for which indexers exist on the
-    network. Redpanda only contains data about indexers that the gateway has
-    already routed queries to, so newly registered indexers with no query history
-    would be invisible to a Redpanda-only discovery path.
-
-    Returns a dict mapping indexer address to service URL for indexers that have
-    a registered URL. Returns an empty dict on any failure so callers can
-    degrade gracefully.
+    The subgraph is the source of truth — Redpanda only sees indexers the gateway
+    has routed to, so newly registered ones are invisible without this lookup.
+    Returns {address: url} for indexers with a URL, or {} on any failure.
     """
     if not network_subgraph_url:
         logger.warning("GRAPH_NETWORK_SUBGRAPH_URL not set, cannot discover indexers from subgraph")
@@ -236,24 +230,11 @@ def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[s
 
 
 def _extract_dips_prices(data: dict) -> tuple:
-    """Pull `min_grt_per_30_days` and `min_grt_per_billion_entities_per_30_days`
-    out of a `/dips/info` response, tolerating both shapes the endpoint has
-    shipped in:
+    """Pull the two min-price fields out of a /dips/info response.
 
-      * Legacy nested:
-          ``{"pricing": {"min_grt_per_30_days": {...},
-                          "min_grt_per_billion_entities_per_30_days": "..."},
-             "supported_networks": [...]}``
-      * Current flat:
-          ``{"min_grt_per_30_days": {...},
-             "min_grt_per_billion_entities_per_30_days": "...",
-             "supported_networks": [...]}``
-
-    The indexer fleet will not upgrade in lockstep, so a single scoring pass
-    may hit both shapes — keep both readable until the legacy shape is gone
-    from the deployed indexer set.
-
-    Returns ``(min_prices_dict_or_empty, min_entity_price_or_none)``.
+    Handles legacy nested-under-``pricing`` and current flat-at-top shapes
+    (the indexer fleet doesn't upgrade in lockstep, so a single pass hits
+    both). Returns ``(min_prices_dict_or_empty, min_entity_price_or_none)``.
     """
     pricing = data.get("pricing")
     if isinstance(pricing, dict):
@@ -347,16 +328,11 @@ async def _fetch_all_dips_info_async(indexer_urls: Dict[str, str]) -> List[dict]
 
 
 def fetch_dips_info(indexer_urls: Dict[str, str]) -> pd.DataFrame:
-    """
-    Fetch /dips/info from each indexer concurrently using asyncio.
+    """Concurrently fetch /dips/info from each indexer (asyncio).
 
-    Args:
-        indexer_urls: dict mapping indexer address -> URL
-
-    Returns:
-        DataFrame with columns: indexer, dips_info_available,
-        dips_min_grt_per_30_days, dips_min_grt_per_billion_entities_per_30_days,
-        dips_supported_networks
+    `indexer_urls` maps indexer address -> URL. Returns columns: indexer,
+    dips_info_available, dips_min_grt_per_30_days,
+    dips_min_grt_per_billion_entities_per_30_days, dips_supported_networks.
     """
     if not indexer_urls:
         return pd.DataFrame(
@@ -383,13 +359,11 @@ async def _fetch_single_graph_node_version_async(
     url: str,
     semaphore: asyncio.Semaphore,
 ) -> dict:
-    """POST a `{ version { version commit } }` GraphQL query to <url>/status
-    and extract graph-node's reported version.
+    """POST `{ version { version commit } }` to <url>/status and extract the result.
 
-    Returns one row per indexer with `graph_node_version` and
-    `graph_node_commit` set to strings on success, or to None on any failure
-    (timeout, non-2xx, malformed response, missing field). The caller decides
-    how to treat None — see `filter_by_min_graph_node_version`.
+    Returns strings on success, None on any failure (timeout, non-2xx,
+    malformed, missing field). The caller decides how to treat None — see
+    `filter_by_min_graph_node_version`.
     """
     import aiohttp
 
@@ -411,10 +385,9 @@ async def _fetch_single_graph_node_version_async(
                         message=f"Server error {resp.status}",
                     )
                 resp.raise_for_status()
-                # Read with an explicit byte cap so a pathological indexer
-                # can't stream a huge body and exhaust the cron's memory.
-                # `read(N+1)` lets us detect an overflow by checking whether
-                # we got more than the limit.
+                # Explicit byte cap so a pathological indexer can't stream a
+                # huge body and exhaust cron memory; reading N+1 lets us
+                # detect overflow by comparing the returned length to N.
                 raw = await resp.content.read(GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES + 1)
                 if len(raw) > GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES:
                     raise aiohttp.ClientPayloadError(
@@ -427,13 +400,9 @@ async def _fetch_single_graph_node_version_async(
     for attempt in range(GRAPH_NODE_VERSION_MAX_RETRIES):
         try:
             data = await do_fetch()
-            # Defensive shape check: a well-formed response is
-            # `{"data": {"version": {"version": ..., "commit": ...}}}`. Some
-            # indexer forks flatten `version` to a bare string, some return
-            # a top-level array, and a misconfigured proxy can return
-            # anything at all. Validate each nesting level so we fall
-            # through to the all-None record instead of crashing the batch
-            # with AttributeError.
+            # Defensive shape check around `{"data": {"version": {...}}}`:
+            # forks may flatten `version`, proxies may return arrays or HTML.
+            # Validating each level lets us return all-None instead of crashing.
             data_envelope = data.get("data") if isinstance(data, dict) else None
             version_obj = data_envelope.get("version") if isinstance(data_envelope, dict) else None
             if not isinstance(version_obj, dict):
@@ -450,14 +419,9 @@ async def _fetch_single_graph_node_version_async(
             UnicodeDecodeError,
             AttributeError,
         ) as e:
-            # The catch tuple is intentionally broad. `ValueError` covers
-            # `json.JSONDecodeError` when an indexer returns HTML or other
-            # non-JSON content with a 2xx status; `UnicodeDecodeError`
-            # covers invalid UTF-8 in the body; `AttributeError` is a
-            # belt-and-braces guard on top of the isinstance checks above.
-            # All three would otherwise propagate through `asyncio.gather`
-            # (which has no `return_exceptions=True`) and crash the entire
-            # scoring run on a single misbehaving indexer.
+            # Catch tuple deliberately broad: a single misbehaving indexer
+            # returning HTML / invalid UTF-8 / a malformed shape would
+            # otherwise propagate through gather() and crash the whole run.
             last_error = e
             # 4xx is deterministic: the endpoint either doesn't exist or
             # rejects the query and won't change shape on retry. Skip the
@@ -494,12 +458,11 @@ async def _fetch_all_graph_node_versions_async(
 
 
 def fetch_graph_node_versions(indexer_urls: Dict[str, str]) -> pd.DataFrame:
-    """Fetch graph-node version from each indexer's /status endpoint
-    concurrently using asyncio.
+    """Concurrently fetch /status graph-node version from each indexer (asyncio).
 
-    Returns a DataFrame with columns: indexer, graph_node_version,
-    graph_node_commit. Indexers whose /status was unreachable or malformed
-    appear with None values; the version filter decides their fate.
+    Returns columns: indexer, graph_node_version, graph_node_commit. Indexers
+    whose /status was unreachable or malformed appear with None values; the
+    version filter decides their fate.
     """
     if not indexer_urls:
         return pd.DataFrame(columns=["indexer", "graph_node_version", "graph_node_commit"])
@@ -507,12 +470,8 @@ def fetch_graph_node_versions(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     results = asyncio.run(_fetch_all_graph_node_versions_async(indexer_urls))
 
     # Aggregate counts so the cron log shows the breakdown at a glance.
-    # When a minimum is configured we split known versions into
-    # meets/below/unparseable; otherwise we only know reported-vs-unknown.
-    # The unparseable bucket separates indexers reporting non-PEP-440 strings
-    # (e.g. git-describe like `0.40.1-1-gabcdef`) from indexers that genuinely
-    # report a version below the bar — both have a known string but only
-    # the second is a real "too old" case worth chasing.
+    # The unparseable bucket separates git-describe-style strings
+    # (e.g. `0.40.1-1-gabcdef`) from genuine "version below the bar".
     known_count = sum(1 for r in results if r["graph_node_version"] is not None)
     unknown_count = len(results) - known_count
     min_version = _get_min_graph_node_version()
@@ -540,29 +499,23 @@ def fetch_graph_node_versions(indexer_urls: Dict[str, str]) -> pd.DataFrame:
 def fetch_and_filter_graph_node_versions(
     df: pd.DataFrame, indexer_urls: Dict[str, str]
 ) -> pd.DataFrame:
-    """Attach `graph_node_version` / `graph_node_commit` columns to a scores
-    DataFrame and apply the configured minimum-version filter.
+    """Attach version + commit columns and apply the configured minimum filter.
 
-    Used by both the full and degraded scoring pipelines so they treat the
-    fetch + merge + filter step identically. When `MIN_GRAPH_NODE_VERSION`
-    is unset, or `indexer_urls` is empty (no indexers from the network
-    subgraph), neither the HTTP probe nor the filter runs — we still attach
-    None-valued version columns so downstream schema code can rely on their
-    presence in either pipeline.
+    Shared between full and degraded pipelines. With no MIN_GRAPH_NODE_VERSION
+    or no indexers, neither probe nor filter runs but None-valued columns are
+    still attached so downstream schema code can rely on their presence.
     """
     min_version = _get_min_graph_node_version()
     strict = _get_min_graph_node_version_strict()
 
-    # Skip both probe and filter when there's nothing to compare against
-    # (filter disabled) or no indexers to probe (subgraph empty). Either
-    # case is a no-op on the row set; we still attach the version columns
-    # so downstream code can carry them through unconditionally.
+    # Skip probe and filter when there's nothing to compare against (filter
+    # disabled) or no indexers to probe (subgraph empty). Still attach the
+    # version columns so downstream code carries them through unconditionally.
     if not min_version or not indexer_urls:
         if min_version and not indexer_urls:
-            # The filter is configured but can't run because the network
-            # subgraph returned nothing. Log at INFO so the cause is visible
-            # — without this line the empty scores look identical to a
-            # deliberately-disabled filter run.
+            # Filter configured but the network subgraph returned no indexers
+            # to probe. Logged at INFO so this case is distinguishable from a
+            # deliberately-disabled run (which would emit nothing).
             logger.info(
                 "Graph-node version filter skipped — no indexers from network "
                 f"subgraph to probe (would otherwise apply min={min_version}, "
@@ -576,10 +529,9 @@ def fetch_and_filter_graph_node_versions(
     versions_df = fetch_graph_node_versions(indexer_urls)
 
     if not versions_df.empty:
-        # `validate="m:1"` asserts every indexer key in versions_df is unique,
-        # which is true by construction (indexer_urls is a dict). If a future
-        # change widens the upstream to allow multiple URLs per indexer, this
-        # raises rather than silently row-multiplying the scores DataFrame.
+        # `validate="m:1"` enforces unique indexer keys in versions_df (true
+        # by construction). If upstream ever widens to multiple URLs per
+        # indexer, this raises rather than silently row-multiplying scores.
         df = pd.merge(df, versions_df, on="indexer", how="left", validate="m:1")
     else:
         df = df.copy()
@@ -590,16 +542,11 @@ def fetch_and_filter_graph_node_versions(
 
 
 def _classify_graph_node_version(reported: Optional[str], minimum: str) -> str:
-    """Classify a reported graph-node version against `minimum`.
+    """Classify reported graph-node version: ``meets`` / ``below`` / ``unparseable``.
 
-    Returns one of:
-      * ``"meets"`` — both parse as PEP 440 and reported >= minimum
-      * ``"below"`` — both parse as PEP 440 and reported < minimum
-      * ``"unparseable"`` — reported is missing, not a string, or fails PEP 440
-
-    Used by the probe-summary log to keep "indexer reported a non-PEP-440
-    string" (e.g. git-describe like ``0.40.1-1-gabcdef``) distinct from
-    "indexer reported a parseable version that's too old".
+    ``unparseable`` covers missing / non-string / non-PEP-440 (e.g. git-describe
+    like ``0.40.1-1-gabcdef``). The probe-summary log uses this to keep
+    "non-PEP-440 string" distinct from "parseable but too old".
     """
     # Reject anything that isn't a non-empty string up front. pandas can hand
     # us NaN (a float, which is truthy in Python's `not` check), and that
@@ -615,13 +562,10 @@ def _classify_graph_node_version(reported: Optional[str], minimum: str) -> str:
 
 
 def _meets_min_graph_node_version(reported: Optional[str], minimum: str) -> bool:
-    """Decide whether a reported graph-node version meets the configured
-    minimum.
+    """True iff both versions parse as PEP 440 and `reported` >= `minimum`.
 
-    Returns True only when both versions parse as valid PEP 440 versions
-    and the reported one is greater than or equal to the minimum. Any
-    parsing failure (unknown version, malformed minimum) returns False so
-    the caller treats it as a not-eligible indexer in strict mode.
+    Any parsing failure (unknown / malformed) returns False so the caller
+    treats the indexer as not-eligible in strict mode.
     """
     return _classify_graph_node_version(reported, minimum) == "meets"
 
@@ -633,12 +577,9 @@ def filter_by_min_graph_node_version(
 ) -> pd.DataFrame:
     """Drop indexers whose `graph_node_version` falls below `min_version`.
 
-    No-op when `min_version` is empty.
-
-    Indexers with no reported version (None / NaN) are dropped only when
-    `strict` is true. The fail-open default lets the filter ship while the
-    fleet rolls out support for the /status version query, then tightens
-    once a quorum of indexers reliably exposes the field.
+    No-op when `min_version` is empty. Indexers with no reported version
+    (None / NaN) are dropped only when `strict` is true — fail-open lets
+    the filter ship while the fleet rolls out /status version support.
     """
     if not min_version:
         return scores_df
@@ -651,10 +592,9 @@ def filter_by_min_graph_node_version(
 
     before = len(scores_df)
     reported = scores_df["graph_node_version"]
-    # Build the boolean mask via a plain list comprehension; the helper
-    # already handles NaN / non-string inputs by returning False, so we
-    # don't need pandas' `.map` indirection (which forces a fillna step
-    # and the deprecated object-dtype downcast).
+    # List comprehension instead of pandas `.map`: the helper already
+    # returns False for NaN / non-string, so `.map` would only add a
+    # fillna step and trigger the deprecated object-dtype downcast.
     meets = pd.Series(
         [_meets_min_graph_node_version(v, min_version) for v in reported],
         index=reported.index,
@@ -682,11 +622,9 @@ def filter_by_min_graph_node_version(
 
     after = before - len(dropped)
     if len(dropped) > 0:
-        # Split the dropped count into "known but below the bar" vs
-        # "unknown / probe didn't answer" so triage doesn't have to drop
-        # to DEBUG to tell the two apart. In fail-open mode the unknown
-        # bucket is always zero (we keep those rows); in strict mode it
-        # is the count of indexers whose /status didn't answer.
+        # Split dropped into "known but below the bar" vs "unknown / probe
+        # didn't answer" so triage doesn't need DEBUG. Unknown is always
+        # zero in fail-open mode (kept); in strict it's missing /status.
         is_unknown = reported.isna()
         below_count = int((~meets & ~is_unknown).sum())
         unknown_dropped = int(is_unknown.sum()) if strict else 0
@@ -704,20 +642,11 @@ def filter_by_min_graph_node_version(
 
 
 def diagnose_geoip_failure(combined_queries: pd.DataFrame) -> str:
-    """Build a diagnostic suffix for total GeoIP resolution failure.
+    """Diagnostic suffix categorising why GeoIP failed for every indexer.
 
-    Counts failure categories across every unique indexer in the input,
-    then renders up to 5 sample rows for context. Counts always reflect
-    the full set so a sample-vs-full mismatch can't mislead the operator.
-    Returns a multi-line string ready to append to the RuntimeError:
-
-    - ``unresolved``: hostname didn't resolve to any IP (DNS gaierror).
-    - ``private``: hostname resolved to an RFC 1918 / loopback / link-local
-      / Docker bridge IP that legitimately has no public geolocation. This
-      is the local-network and Docker Compose case.
-    - ``public``: hostname resolved to a public IP that wasn't in the
-      GeoLite2 database. Indicates a stale database or an indexed-range
-      gap, not a configuration problem.
+    Categories: ``unresolved`` (DNS gaierror), ``private`` (RFC 1918 / loopback
+    / Docker bridge — the local-network case), ``public`` (resolved but missing
+    from GeoLite2, i.e. stale database). Sample capped at 5 rows.
     """
     deduplicated = combined_queries[["indexer", "ip_addr"]].drop_duplicates(subset="indexer")
     sample = deduplicated.head(5)
@@ -779,19 +708,10 @@ def compute_all_scores(
     geoip_available: bool = True,
     seed: Optional[int] = None,
 ) -> pd.DataFrame:
-    """
-    Compute all indexer scores and return as a DataFrame.
+    """Orchestrate full / partial scoring; return an indexer_scores DataFrame.
 
-    This is the main orchestration function that:
-    1. Fetches raw data from the configured provider
-    2. Resolves GeoIP for indexers (when available)
-    3. Runs latency linear regression (when GeoIP available)
-    4. Computes uptime, success rate, stake-to-fees
-    5. Pre-normalizes static metrics
-    6. Returns a DataFrame matching the indexer_scores schema
-
-    When geoip_available=False, latency scores are set to neutral (0.5) while
-    uptime, success rate, and stake-to-fees are computed from real Redpanda data.
+    Full (geoip_available=True): GeoIP + latency regression + uptime + success + stake.
+    Partial: latency neutral (0.5), other metrics from real Redpanda data.
     """
     # Fetch initial query results to determine sampling
     initial_query_results = provider.fetch_initial_query_results(start_date, num_days)
@@ -932,10 +852,9 @@ def compute_all_scores(
         drop_missing_latency=geoip_available,
     )
 
-    # Fetch DIP pricing info from indexers.
-    # The network subgraph is the source of truth for which indexers exist.
-    # Redpanda only contains indexers that the gateway has routed queries to,
-    # so newly registered indexers would be missed without this lookup.
+    # DIP pricing fetched directly from indexers; the indexer list comes from
+    # the network subgraph (Redpanda only has indexers the gateway has queried,
+    # so newly registered ones would be invisible without this lookup).
     indexer_urls = discover_indexers_from_network_subgraph(provider.graph_network_url)
     if indexer_urls:
         dips_info_df = fetch_dips_info(indexer_urls)
@@ -1020,10 +939,9 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     )
     scores["dips_supported_networks"] = merged.get("dips_supported_networks", "[]")
 
-    # Graph-node version (fetched from /status). Carried through so the
-    # published JSON has the same shape regardless of whether the filter
-    # was active — the degraded-scoring path already includes these
-    # columns, so omitting them here would create a mode-dependent schema.
+    # Graph-node version (from /status). Carried through so the published
+    # JSON shape stays the same whether the filter ran or not — degraded
+    # also writes these, so omitting them would split the schema by mode.
     scores["graph_node_version"] = merged.get("graph_node_version")
     scores["graph_node_commit"] = merged.get("graph_node_commit")
 
@@ -1127,13 +1045,11 @@ def resolve_url_geoip(url: str) -> dict:
 
 
 def is_private_ip(ip_addr: str) -> bool:
-    """Check if an IP address is private / loopback / link-local.
+    """True for any address that legitimately has no public geolocation.
 
-    Delegates to ``ipaddress.ip_address(...).is_private``, which covers
-    IPv4 (RFC 1918, loopback 127/8, link-local 169.254/16, CGNAT 100.64/10,
-    reserved ranges) and IPv6 (ULA fc00::/7, link-local fe80::/10,
-    loopback ::1). These are the addresses that legitimately have no
-    public geolocation entry. Returns False for malformed input.
+    Delegates to ``ipaddress.ip_address(...).is_private`` (covers RFC 1918,
+    loopback, link-local, CGNAT, IPv6 ULA / link-local / loopback).
+    Returns False for malformed input.
     """
     try:
         return ipaddress.ip_address(ip_addr).is_private
@@ -1602,12 +1518,10 @@ def merge_and_prepare_dataframes(
 
 
 def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
-    """Produce scores with equal quality metrics and real pricing from /dips/info.
+    """Equal quality metrics for every indexer, real per-indexer pricing from /dips/info.
 
-    Used when the full scoring pipeline can't run (no GeoIP databases,
-    insufficient Redpanda data). Discovers indexers from the network subgraph,
-    fetches pricing from each indexer's /dips/info endpoint, and returns a
-    scores DataFrame with uniform quality metrics and real per-indexer pricing.
+    Last-resort fallback when the full pipeline can't run. Indexer list comes
+    from the network subgraph; per-indexer pricing from /dips/info.
     """
     indexer_urls = discover_indexers_from_network_subgraph(graph_network_subgraph_url)
     if not indexer_urls:
