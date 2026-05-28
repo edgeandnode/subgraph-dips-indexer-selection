@@ -710,10 +710,9 @@ class TestScoresSnapshotEndpoint:
         iisa_http_endpoints.get_settings.cache_clear()
         iisa_http_endpoints._state.initialize(Settings())
 
-        # Mix float, NaN, and string columns so the to_json round-trip
-        # hits the NaN → null path. The cronjob pushes NaN for indexers
-        # missing optional fields, so the read-back must not 500 or emit
-        # invalid JSON.
+        # Mix float, NaN, and string columns so the to_json round-trip hits the
+        # NaN → null path. The cronjob pushes NaN for missing optional fields,
+        # so the read-back must not 500 or emit invalid JSON.
         mock_dm = MagicMock()
         mock_dm.snapshot = ScoresSnapshot(
             data=pd.DataFrame(
@@ -1707,10 +1706,8 @@ class TestSelectIndexersEndToEndPricing:
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import app
 
-        # 3 indexers:
-        #   0xa - has DIP info and pricing for "arb" (should be selected)
-        #   0xb - has DIP info but pricing only for "mainnet" (wrong chain)
-        #   0xc - dips_info_available = False (no DIP info at all)
+        # 3 indexers: 0xa has DIP info + "arb" pricing (eligible); 0xb has DIP
+        # info but only "mainnet" pricing (wrong chain); 0xc has no DIP info.
         history = pd.DataFrame(
             [
                 {
