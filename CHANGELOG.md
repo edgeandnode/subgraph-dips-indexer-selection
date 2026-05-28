@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.6.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.6.0...v2.6.1) (2026-05-28)
+
+
+### Fixed
+
+* **scoring:** fall back to partial when no indexer has a public IP ([#174](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/174)) ([6f5a1d2](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/6f5a1d29a5d2c6ec1a430430b963d2a7a0352af6))
+
+
+### Changed
+
+* **k8s:** update cronjob image to sha-6f5a1d2 ([#178](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/178)) ([51869c5](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/51869c5589eaf896a950b02579fa0d1e33d3c449))
+* **k8s:** update cronjob image to sha-e282a73 ([#177](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/177)) ([06a3482](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/06a3482f1e121305610d20c6a4b62935867b0b47))
+
+
+### Documentation
+
+* **scoring:** trim long docstrings and comment blocks ([#175](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/175)) ([e282a73](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/e282a730fd934f572437a635cbd0e79d433af241))
+
 ## [2.6.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.5.2...v2.6.0) (2026-05-27)
 
 
