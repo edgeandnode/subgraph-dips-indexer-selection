@@ -1560,3 +1560,59 @@ class TestComputeAllScoresGeoipDemotion:
         assert not any("demoting to partial mode" in r.getMessage() for r in caplog.records), (
             "demotion warning should not fire when any indexer has a public IP"
         )
+
+
+class TestRunScoringModeReporting:
+    """The summary log must reflect the published scoring_mode, not the input flag.
+
+    Before this was fixed, when compute_all_scores demoted to partial internally
+    the summary line still said `mode=full`, misleading operators reading the log.
+    """
+
+    def _df(self, mode_value):
+        return pd.DataFrame(
+            {
+                "indexer": ["0xAAA"],
+                "url": ["https://a.example"],
+                "scoring_mode": [mode_value],
+            }
+        )
+
+    def test_summary_reports_partial_when_compute_demoted(self, monkeypatch, caplog):
+        from unittest.mock import MagicMock
+
+        mock_provider = MagicMock()
+        scores_df = self._df("partial_no_geoip")
+
+        monkeypatch.setattr(main, "RedpandaProvider", lambda: mock_provider)
+        monkeypatch.setattr(main, "validate_geoip_databases", lambda: True)
+        monkeypatch.setattr(main, "compute_all_scores", lambda **kwargs: scores_df)
+
+        with caplog.at_level("INFO", logger=main.logger.name):
+            result = main.run_scoring()
+
+        assert result is True
+        assert any("mode=partial" in r.getMessage() for r in caplog.records), (
+            "summary must report mode=partial when compute_all_scores demoted"
+        )
+        assert not any("mode=full" in r.getMessage() for r in caplog.records), (
+            "must not report mode=full when partial_no_geoip was published"
+        )
+
+    def test_summary_reports_full_when_compute_stayed_full(self, monkeypatch, caplog):
+        from unittest.mock import MagicMock
+
+        mock_provider = MagicMock()
+        scores_df = self._df("full")
+
+        monkeypatch.setattr(main, "RedpandaProvider", lambda: mock_provider)
+        monkeypatch.setattr(main, "validate_geoip_databases", lambda: True)
+        monkeypatch.setattr(main, "compute_all_scores", lambda **kwargs: scores_df)
+
+        with caplog.at_level("INFO", logger=main.logger.name):
+            result = main.run_scoring()
+
+        assert result is True
+        assert any("mode=full" in r.getMessage() for r in caplog.records), (
+            "summary must report mode=full when scoring_mode is full"
+        )
