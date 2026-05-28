@@ -106,8 +106,9 @@ class SelectedIndexer(BaseModel):
 class SelectionResponse(BaseModel):
     """Response for /select-indexers: the SHOULD-be-assigned indexer set.
 
-    Idempotent — replaying the same request yields the same response. The
-    caller diffs against actual current state to determine adds/cancels.
+    Determined entirely by the currently loaded scores plus the request
+    inputs, so a new /scores push between calls can change the response.
+    Callers diff against their actual current state to compute adds/cancels.
     """
 
     deployment_id: str
@@ -676,7 +677,7 @@ async def get_score(request: ScoreRequest) -> ScoreResponse:
 
 @app.post("/select-indexers", response_model=SelectionResponse)
 async def select_indexers(request: SelectionRequest) -> SelectionResponse:
-    """Select N indexers for a deployment via weighted scoring; idempotent.
+    """Select N indexers for a deployment via weighted scoring.
 
     Returns the SHOULD-be-assigned set; caller diffs against current state.
     Picks the top N by weighted aggregate, preferring >1 unique org / location
