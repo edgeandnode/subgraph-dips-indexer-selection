@@ -61,9 +61,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     sync_status_file_path: str = "/app/scores/sync_status.json"
     sync_status_staleness_hours: float = 6.0
-    # Bearer token required on POST /scores, GET /scores, GET /scores/status,
-    # and POST /sync-status. When unset, these endpoints accept unauthenticated
-    # requests and a WARNING is logged at startup — local dev convenience only.
+    # Bearer token required on every endpoint except /health and /select-indexers.
+    # When unset, those endpoints accept unauthenticated requests and a WARNING
+    # is logged at startup — local dev convenience only.
     push_token: Optional[str] = None
     # When true, startup fails hard if push_token is unset. Set in k8s so a
     # misconfigured Secret is caught at rollout rather than leaving production
@@ -676,9 +676,9 @@ def scores_weighted(
 ) -> WeightedScoresResponse:
     """Bulk weighted-score snapshot — same shape as /get-score, every indexer.
 
-    Applies the same normalisation + weighting that the selection path
-    uses, in a single pass across the loaded snapshot. Saves N round-trips
-    to POST /get-score when callers want every indexer's score.
+    Single pass across the loaded snapshot — saves N round-trips to /get-score.
+    Selection can pass `max_grt_per_30_days` as a `price_ceiling`; this endpoint
+    cannot, so prices are normalised against the observed max instead.
     """
     _require_push_token(authorization)
 
@@ -716,10 +716,16 @@ def scores_weighted(
 
     entries: list[WeightedScoreEntry] = []
     for _, row in normalized.iterrows():
+        indexer_id = row.get("indexer")
+        if indexer_id is None or (isinstance(indexer_id, float) and pd.isna(indexer_id)):
+            logger.debug("skipping row with missing indexer field")
+            continue
+
+        weighted: Optional[float]
         try:
-            weighted: Optional[float] = float(_calculate_weighted_score(row, DEFAULT_WEIGHTS))
-        except Exception as e:
-            logger.warning("weighted score failed for %s: %s", row.get("indexer", "?"), e)
+            weighted = float(_calculate_weighted_score(row, DEFAULT_WEIGHTS))
+        except ValueError as e:
+            logger.warning("weighted score failed for %s: %s", indexer_id, e)
             weighted = None
 
         components = {
@@ -729,7 +735,7 @@ def scores_weighted(
         }
         entries.append(
             WeightedScoreEntry(
-                indexer=str(row.get("indexer", "")),
+                indexer=str(indexer_id),
                 weighted_score=weighted,
                 components=components,
             )
@@ -774,7 +780,10 @@ def push_sync_status(
 
 
 @app.post("/get-score", response_model=ScoreResponse)
-async def get_score(request: ScoreRequest) -> ScoreResponse:
+async def get_score(
+    request: ScoreRequest,
+    authorization: Optional[str] = Header(None),
+) -> ScoreResponse:
     """
     Get the weighted score and component scores for an indexer.
 
@@ -782,6 +791,8 @@ async def get_score(request: ScoreRequest) -> ScoreResponse:
     component scores that contribute to it. Useful for debugging selection
     decisions and monitoring indexer performance.
     """
+    _require_push_token(authorization)
+
     if not _state.is_ready or _state.history is None:
         raise HTTPException(status_code=503, detail="IISA data not loaded")
 
