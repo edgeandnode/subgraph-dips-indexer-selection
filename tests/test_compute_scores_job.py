@@ -20,11 +20,13 @@ import pytest
 jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
+import processing  # noqa: E402
 from processing import (  # noqa: E402
     adjust_rows,
     aggregate_indexer_info,
     calculate_indexer_success_rate,
     calculate_indexer_uptime,
+    compute_all_scores,
     diagnose_geoip_failure,
     filter_successful_queries,
     hash_sampled_queries,
@@ -1395,3 +1397,175 @@ class TestValidateConfigurationIISAURL:
 
         # Act / Assert — should not raise
         main.validate_configuration()
+
+
+class TestComputeAllScoresGeoipDemotion:
+    """Demote full to partial when all indexers resolve to private IPs.
+
+    Without this path, the pipeline raised at all-dst_lat-NaN and the
+    cronjob fell to degraded mode (every quality score flattened to 0.5).
+    Demoted runs keep neutral latency but real success / uptime / stake.
+    """
+
+    def _build_combined_queries(self, indexer_ids, rows_per_indexer=20):
+        from datetime import datetime
+
+        rows = []
+        base = datetime(2026, 5, 1)
+        for idx_id in indexer_ids:
+            short = idx_id[2:8]
+            for i in range(rows_per_indexer):
+                rows.append(
+                    {
+                        "query_id": f"q-{short}-{i:03d}-LAX",
+                        "deployment_hash": "QmTestDeployment",
+                        "fee": 1.0,
+                        "timestamp": base + pd.Timedelta(minutes=i),
+                        "blocks_behind": 0,
+                        "response_time_ms": 100.0,
+                        "indexer": idx_id,
+                        "status": 200,
+                        "day_partition": "2026-05-01",
+                        "subgraph_network": "arbitrum",
+                        "url": f"http://{short}-svc:7601",
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    def test_demotes_to_partial_when_all_indexers_have_private_ips(self, monkeypatch, caplog):
+        from datetime import date
+        from unittest.mock import MagicMock
+
+        indexer_ids = ["0x" + c * 40 for c in "abc"]
+        combined_queries = self._build_combined_queries(indexer_ids)
+
+        mock_provider = MagicMock()
+        mock_provider.fetch_initial_query_results.return_value = pd.DataFrame(
+            {
+                "deployment_hash": ["QmTestDeployment"] * 3,
+                "indexer": indexer_ids,
+                "num_rows": [20, 20, 20],
+            }
+        )
+        mock_provider.fetch_combined_query_results.return_value = combined_queries
+        mock_provider.fetch_stake_to_fees.return_value = pd.DataFrame(
+            {
+                "indexer": indexer_ids,
+                "stake_to_fees": [1.0, 2.0, 3.0],
+                "total_query_fees": [10.0, 20.0, 30.0],
+                "last_known_slashable_stake": [100.0, 200.0, 300.0],
+            }
+        )
+        mock_provider.graph_network_url = "http://graph-network:8000"
+
+        def fake_resolve_geoip(_combined_queries):
+            # Simulate the local-network case: every URL resolves to a
+            # private IP and the GeoLite2 lookup returns no coordinates.
+            return pd.DataFrame(
+                {
+                    "indexer": indexer_ids,
+                    "url": [f"http://{i[2:8]}-svc:7601" for i in indexer_ids],
+                    "ip_addr": ["172.18.0.5", "172.18.0.6", "172.18.0.7"],
+                    "org": [None] * 3,
+                    "dst_country": [None] * 3,
+                    "dst_lat": [np.nan] * 3,
+                    "dst_lon": [np.nan] * 3,
+                    "indexer_network": ["arbitrum"] * 3,
+                }
+            )
+
+        monkeypatch.setattr(processing, "resolve_indexer_geoip", fake_resolve_geoip)
+        monkeypatch.setattr(processing, "discover_indexers_from_network_subgraph", lambda url: {})
+        monkeypatch.setattr(
+            processing,
+            "fetch_and_filter_graph_node_versions",
+            lambda merged, urls: merged,
+        )
+
+        with caplog.at_level("WARNING", logger="processing"):
+            result = compute_all_scores(
+                provider=mock_provider,
+                start_date=date(2026, 5, 1),
+                start_ts="2026-05-01T00:00:00Z",
+                num_days=28,
+                target_rows=20_000_000,
+                geoip_available=True,
+            )
+
+        assert any("demoting to partial mode" in r.getMessage() for r in caplog.records), (
+            "expected the demotion warning to be logged"
+        )
+        assert "scoring_mode" in result.columns
+        assert (result["scoring_mode"] == "partial_no_geoip").all(), (
+            "every row should reflect partial mode after demotion"
+        )
+        assert len(result) == 3, "all three indexers should appear in the output"
+
+    def test_stays_in_full_mode_when_at_least_one_indexer_has_public_ip(self, monkeypatch, caplog):
+        from datetime import date
+        from unittest.mock import MagicMock
+
+        indexer_ids = ["0x" + c * 40 for c in "abc"]
+        combined_queries = self._build_combined_queries(indexer_ids)
+
+        mock_provider = MagicMock()
+        mock_provider.fetch_initial_query_results.return_value = pd.DataFrame(
+            {
+                "deployment_hash": ["QmTestDeployment"] * 3,
+                "indexer": indexer_ids,
+                "num_rows": [20, 20, 20],
+            }
+        )
+        mock_provider.fetch_combined_query_results.return_value = combined_queries
+        mock_provider.fetch_stake_to_fees.return_value = pd.DataFrame(
+            {
+                "indexer": indexer_ids,
+                "stake_to_fees": [1.0, 2.0, 3.0],
+                "total_query_fees": [10.0, 20.0, 30.0],
+                "last_known_slashable_stake": [100.0, 200.0, 300.0],
+            }
+        )
+        mock_provider.graph_network_url = "http://graph-network:8000"
+
+        def fake_resolve_geoip(_combined_queries):
+            # One public resolution → full mode must stay engaged.
+            return pd.DataFrame(
+                {
+                    "indexer": indexer_ids,
+                    "url": [f"http://{i[2:8]}-svc:7601" for i in indexer_ids],
+                    "ip_addr": ["172.18.0.5", "8.8.8.8", "172.18.0.7"],
+                    "org": [None, "Google LLC", None],
+                    "dst_country": [None, "US", None],
+                    "dst_lat": [np.nan, 37.751, np.nan],
+                    "dst_lon": [np.nan, -97.822, np.nan],
+                    "indexer_network": ["arbitrum"] * 3,
+                }
+            )
+
+        monkeypatch.setattr(processing, "resolve_indexer_geoip", fake_resolve_geoip)
+        monkeypatch.setattr(processing, "discover_indexers_from_network_subgraph", lambda url: {})
+        monkeypatch.setattr(
+            processing,
+            "fetch_and_filter_graph_node_versions",
+            lambda merged, urls: merged,
+        )
+
+        with caplog.at_level("WARNING", logger="processing"):
+            try:
+                compute_all_scores(
+                    provider=mock_provider,
+                    start_date=date(2026, 5, 1),
+                    start_ts="2026-05-01T00:00:00Z",
+                    num_days=28,
+                    target_rows=20_000_000,
+                    geoip_available=True,
+                )
+            except Exception:
+                # Full mode may still raise downstream (e.g. iterative
+                # filter wipes everything) — we only assert that the
+                # demotion path was *not* taken.
+                pass
+
+        assert not any("demoting to partial mode" in r.getMessage() for r in caplog.records), (
+            "demotion warning should not fire when any indexer has a public IP"
+        )
