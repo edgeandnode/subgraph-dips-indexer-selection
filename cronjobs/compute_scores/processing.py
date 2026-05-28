@@ -725,10 +725,27 @@ def compute_all_scores(
     if geoip_available:
         # Full path: resolve GeoIP and merge into queries
         indexers_df = resolve_indexer_geoip(combined_queries)
-        combined_queries = merge_in_indexers_info(combined_queries, indexers_df)
-        combined_queries = merge_in_query_geolocation_info(combined_queries)
-    else:
-        # No GeoIP: add expected columns as NaN so downstream functions don't crash
+
+        # Demote to partial when no indexer resolved publicly: this is the
+        # normal local-network / Docker case (bridge-network IPs). Catching
+        # it here skips the distance + filter pipeline that would throw anyway.
+        if indexers_df["dst_lat"].notna().sum() == 0:
+            combined_queries_with_indexers = merge_in_indexers_info(combined_queries, indexers_df)
+            logger.warning(
+                "GeoIP resolution succeeded for 0/%d indexers; demoting to "
+                "partial mode (latency scores neutral, all other metrics "
+                "from real query data).%s",
+                len(indexers_df),
+                diagnose_geoip_failure(combined_queries_with_indexers),
+            )
+            geoip_available = False
+        else:
+            combined_queries = merge_in_indexers_info(combined_queries, indexers_df)
+            combined_queries = merge_in_query_geolocation_info(combined_queries)
+
+    if not geoip_available:
+        # No GeoIP (configured off, or demoted from full mode above): add
+        # expected columns as NaN so downstream functions don't crash.
         logger.warning(
             "GeoIP unavailable, skipping geo resolution. Latency scores will be neutral."
         )
