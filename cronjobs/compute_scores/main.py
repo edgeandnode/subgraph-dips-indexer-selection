@@ -1,17 +1,8 @@
 """Score computation cronjob entry point.
 
-One-shot: compute indexer quality scores, push the results to the iisa
-HTTP service, and exit. Scheduling is handled by the Kubernetes CronJob
-(`k8s/score-computation-cronjob.yaml`); this process must not linger
-after a run — the pod's 50 GiB memory request is billed for its full
-lifetime under GKE Autopilot, so an in-process 24h sleep would waste
-roughly 22 of every 24 hours of reserved memory.
-
-Exit codes:
-  0 — scores were computed and pushed to iisa
-  1 — configuration invalid or run failed (scoring error, push error,
-      degraded fallback also failed)
-  2 — IISA_REQUIRE_PUSH_TOKEN is true but no token is provisioned
+One-shot: compute scores, push to iisa, exit. Must not linger because
+GKE Autopilot bills the pod's 50 GiB memory request for its full lifetime.
+Exit codes: 0 ok; 1 config/run failure; 2 IISA_REQUIRE_PUSH_TOKEN unprovisioned.
 """
 
 import logging
@@ -125,7 +116,14 @@ def run_scoring() -> bool:
             logger.warning("Pipeline returned empty results")
             scores_df = None
         else:
-            mode = MODE_FULL if geoip_available else MODE_PARTIAL
+            # compute_all_scores may demote internally to partial when every
+            # GeoIP lookup failed; read the actual mode from the result so
+            # the summary reflects what was published, not what was requested.
+            if "scoring_mode" in scores_df.columns:
+                actual = scores_df["scoring_mode"].iloc[0]
+                mode = MODE_PARTIAL if actual == "partial_no_geoip" else MODE_FULL
+            else:
+                mode = MODE_FULL if geoip_available else MODE_PARTIAL
     except Exception as e:
         logger.warning("Pipeline failed: %s", e)
         scores_df = None
