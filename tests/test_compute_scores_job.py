@@ -1,10 +1,7 @@
-"""
-Test suite for the score computation CronJob.
+"""Test suite for the score computation CronJob.
 
-Tests the new functions introduced for the CronJob, particularly:
-- Normalization functions
-- Schema transformation
-- GeoIP utilities
+Covers the new functions: normalization, schema transformation,
+GeoIP utilities, and other helpers introduced for the CronJob.
 """
 
 # Import from the jobs package - we need to add it to the path
@@ -283,11 +280,9 @@ class TestIsPrivateIp:
 class TestDiagnoseGeoipFailure:
     """Tests for the diagnose_geoip_failure helper.
 
-    The helper produces the diagnostic suffix appended to the RuntimeError
-    raised when GeoIP resolution returns NaN for every indexer. It picks
-    one of three diagnoses based on a sample of resolved IPs: private
-    (RFC 1918, Docker bridges, loopback), unresolved (DNS gaierror), or
-    public-but-missing-from-database.
+    The helper categorises why every indexer's GeoIP resolution returned
+    NaN: ``private`` (RFC 1918 / loopback / Docker bridge), ``unresolved``
+    (DNS gaierror), or ``public`` (resolved but missing from GeoLite2).
     """
 
     def _build_df(self, ip_addrs):
@@ -510,11 +505,8 @@ class TestIterativeFilter:
         assert len(result) == 0
 
 
-# =============================================================================
-# PORTED TESTS FROM test_data_manager.py
-# These tests cover the critical processing functions that will be deleted
-# from IISA after the CronJob migration is complete.
-# =============================================================================
+# Ported from test_data_manager.py: cover the processing functions
+# that will be deleted from IISA once the CronJob migration completes.
 
 
 class TestAdjustRows:
@@ -1337,10 +1329,9 @@ class TestRunScoringPushFailure:
     """run_scoring() must return False when IISAPushError escapes write_scores."""
 
     def test_push_failure_marks_run_as_failed(self, monkeypatch, caplog):
-        # Arrange — mock the pipeline to return a non-empty DataFrame, then have
-        # provider.write_scores raise IISAPushError. Without the try/except in
-        # run_scoring(), the exception would propagate out of the function and
-        # the cronjob would crash rather than exit cleanly with a non-zero code.
+        # Arrange — pipeline returns a non-empty df, but provider.write_scores raises
+        # IISAPushError. Without the try/except in run_scoring(), the exception would
+        # propagate and crash the cronjob instead of exiting with a non-zero code.
         from unittest.mock import MagicMock
 
         scores_df = pd.DataFrame(
