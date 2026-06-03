@@ -180,17 +180,34 @@ class TestDataManager:
         assert data_manager.get_data() is None
 
     def test_transform_scores_df_empty_raises(self):
-        """transform_scores_df is pure and must raise loudly on empty input.
+        """transform_scores_df must raise loudly on empty input.
 
-        The push handler relies on this: a direct call with an empty
-        DataFrame should fail fast rather than silently zero out the
-        cache. The endpoint's own 422 on empty bodies is a separate
-        guard; this test covers the method invariant itself.
+        The push handler relies on this: an empty frame fails fast rather than
+        silently zeroing the cache. The endpoint's 422 on empty bodies is a
+        separate guard; this covers the method invariant itself.
         """
         data_manager = DataManager(MagicMock())
 
         with pytest.raises(ValueError, match="empty DataFrame"):
             data_manager.transform_scores_df(pd.DataFrame())
+
+    def test_transform_scores_df_missing_required_column_raises(self, mock_scores_df):
+        """A frame missing a required column raises ScoresPayloadError, naming it."""
+        from iisa.score_loader import ScoresPayloadError
+
+        data_manager = DataManager(MagicMock())
+        incomplete = mock_scores_df.drop(columns=["success_rate"])
+
+        with pytest.raises(ScoresPayloadError, match="success_rate"):
+            data_manager.transform_scores_df(incomplete)
+
+    def test_missing_required_columns_lists_only_absent(self, mock_scores_df):
+        """missing_required_columns reports absent columns and nothing else."""
+        from iisa.score_loader import missing_required_columns
+
+        assert missing_required_columns(mock_scores_df) == []
+        dropped = mock_scores_df.drop(columns=["indexer", "stake_to_fees"])
+        assert sorted(missing_required_columns(dropped)) == ["indexer", "stake_to_fees"]
 
     def test_commit_scores_twice_keeps_most_recent(self, mock_scores_df):
         """Back-to-back commits must leave the most recent frame in memory."""
@@ -213,14 +230,11 @@ class TestDataManager:
         assert data_manager.snapshot.computed_at == ts2
 
     def test_snapshot_is_consistent_pair_across_commits(self, mock_scores_df):
-        """Each snapshot observation carries data and computed_at from the same
-        push. The pre-refactor code exposed a window where data and
-        computed_at could disagree; the atomic-swap design closes it.
+        """Each snapshot observation carries data and computed_at from one push.
 
-        A reader that captures a snapshot before a later commit continues to
-        see the earlier push's values — the snapshot is frozen and detached
-        from the live attribute, so in-flight readers are not affected by
-        subsequent writes.
+        The atomic-swap design closes the window where the two could disagree.
+        A reader that captured a snapshot before a later commit keeps seeing
+        the earlier push's values, detached from subsequent writes.
         """
         data_manager = DataManager(MagicMock())
 

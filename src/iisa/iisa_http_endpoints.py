@@ -30,7 +30,7 @@ from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
-from .score_loader import DataManager, FileScoreLoader
+from .score_loader import DataManager, FileScoreLoader, ScoresPayloadError
 from .sync_status_loader import SyncStatusData
 
 __all__ = ["app", "Settings", "get_settings"]
@@ -546,6 +546,10 @@ def push_scores(
 
     try:
         rows = _state.load_scores_from_records(payload)
+    except ScoresPayloadError as e:
+        # Wrong-shape body: the caller's problem, so 422 not 500.
+        logger.warning("Rejected pushed scores: %s", e)
+        raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception:
         logger.exception("Failed to accept pushed scores")
         raise HTTPException(status_code=500, detail="Failed to accept scores")
