@@ -76,21 +76,15 @@ DEFAULT_WEIGHTS = cast(
 
 
 class IndexerSelector:
-    """
-    IndexerSelector is responsible for processing the data from the DataManager class,
-    including score calculations, normalization of scores, using custom weightings
-    to get an overall weighted score, and selecting the best indexers for subgraphs.
-    It also handles indexers that are blocked, replacing under-performing indexers,
-    and periodically optimizing indexer groups based on quality of service.
+    """Score and pick the best indexers for one subgraph deployment.
 
-    This class has a job lifetime, meaning it is instantiated and used for the specific
-    task of adding or replacing an indexer from being assigned to a subgraph_id, then it dies.
-    After death the class can be re-instantiated again immediately to add or replace another
-    indexer from being assigned to another subgraph_id. This class will figure out weather to
-    add or replace an indexer depending on the number of existing
-    indexers serving data on the subgraph in question and the quality
-    of the existing indexers serving data on a subgraph compared to
-    the best alternative.
+    Takes the DataManager's metrics, normalises them, combines them into a
+    weighted score, and assigns or replaces indexers, honouring the denylist
+    and decentralisation floor.
+
+    One job lifetime: built for a single add-or-replace then discarded; whether
+    it adds or replaces depends on how many indexers already serve the subgraph
+    and how their quality compares to the best alternative.
     """
 
     def __init__(
@@ -107,25 +101,11 @@ class IndexerSelector:
         price_ceiling: Optional[float] = None,
         synced_indexers: Optional[set[IndexerId]] = None,
     ):
-        """
-        Initialize the IndexerSelector class with data, deployment ID,
-        existing agreements, and an indexer denylist.
-
-        Args:
-            target_size: The target number of indexers to assign.
-            optimistic_dips_fees: Per-indexer expected DIPs fees in
-                GRT per 30 days, keyed by checksummed hex address.
-                Used to adjust stake_to_fees at request time so
-                indexers with accepted agreements get deprioritised.
-            price_ceiling: Maximum GRT per 30 days the payer will
-                accept. Used as the normalisation ceiling for pricing
-                scores so outlier prices cannot compress legitimate
-                price differentiation.
-            synced_indexers: Set of indexer addresses that are already
-                synced and healthy for this deployment. When provided,
-                the add and replace paths prefer these candidates so
-                queries can be served immediately after on-chain
-                acceptance.
+        """Initialize the selector and run scoring for one deployment.
+        Non-obvious args: optimistic_dips_fees lowers stake_to_fees for indexers
+        that already hold agreements (load-balancing), price_ceiling caps pricing
+        normalisation so one outlier can't compress the rest, and synced_indexers
+        are preferred so queries serve right after acceptance.
         """
         self.data = pd.DataFrame(history)
         self.deployment_id = deployment_id
@@ -152,21 +132,11 @@ class IndexerSelector:
         )
 
     def update_indexer_denylist_cancel_indexing_agreements(self, indexer_denylist):
-        """
-        Cancels all outstanding indexing agreements for indexers on the denylist.
+        """Cancel outstanding agreements for indexers on the denylist.
 
-        Note:
-        - Does not reassign indexers after cancellation. The
-          periodic process_subgraph loop detects under-staffed
-          subgraphs and reassigns.
-          TODO: if all indexers on a subgraph get denied at once
-          there may be extra latency before reassignment.
-        - New indexers still need time to accept and sync, so
-          the loop latency may not matter much in practice.
-
-        :param indexer_denylist: A list of indexers that have been denied.
-        :return: A dictionary where keys are denied indexers and values are lists of subgraphs
-                 from which they were removed.
+        Does not reassign; the periodic process_subgraph loop picks up the
+        resulting under-staffed subgraphs. Returns a map of denied indexer to
+        the subgraphs it was removed from.
         """
         #
         self.indexer_denylist = indexer_denylist
@@ -185,17 +155,9 @@ class IndexerSelector:
         return cancelled_agreements
 
     def get_indexer_selections(self):
-        """
-        Returns the indexers that have recently been assigned to or removed from the subgraph.
+        """Return (added, removed) indexers as the diff of initial vs current group.
 
-        This method compares the initial and current groups of indexers to determine
-        which indexers have been added or removed.
-        Note:
-            If no indexers were added or removed, the respective dictionary will be empty.
-
-        :return: A tuple of two dictionaries:
-                - added_dict: subgraph_id -> list of added indexers
-                - cancelled_dict: subgraph_id -> list of removed indexers
+        Each is a {deployment_id: [indexers]} dict, empty when nothing changed.
         """
         # Compare initial and current groups to determine changes
         added = set(self.current_group) - set(self.initial_group)
@@ -212,10 +174,9 @@ class IndexerSelector:
         """
         Process data by normalizing metrics and calculating weighted scores.
         """
-        # Apply optimistic DIPs fees to adjust stake_to_fees before normalisation.
-        # When dipper reports expected fees from accepted agreements, we add them
-        # to the Redpanda-derived query fees so stake_to_fees can differentiate
-        # indexers even before on-chain payment claims appear.
+        # Add dipper's expected fees from accepted agreements to the query fees
+        # before normalisation, so stake_to_fees can tell indexers apart even
+        # before on-chain payment claims appear.
         if self.optimistic_dips_fees and "total_query_fees" in self.data.columns:
             dips_adjustment = self.data["indexer"].map(self.optimistic_dips_fees).fillna(0.0)
             effective_fees = self.data["total_query_fees"].fillna(0.0) + dips_adjustment
@@ -276,12 +237,10 @@ class IndexerSelector:
         return self.existing_agreements.get(self.deployment_id, [])
 
     def _normalize_and_score(self):
-        """
-        Normalize metrics assessing indexer quality and calculate weighted scores.
+        """Normalise quality metrics and compute the weighted score per indexer.
 
-        This method attempts to normalize the data and calculate weighted scores.
-
-        :return: The processed DataFrame.
+        Returns the processed DataFrame; on a normalisation or scoring error it
+        falls back to raw data / NaN scores rather than raising.
         """
         try:
             normalized_data = _normalize_metrics(self.data, price_ceiling=self.price_ceiling)
@@ -372,22 +331,11 @@ class IndexerSelector:
     def _meets_decentralization_requirements(
         self, new_indexer: IndexerId, replacing_indexer: Optional[IndexerId] = None
     ) -> bool:
-        """
-        Check if adding/replacing an indexer meets decentralisation requirements.
+        """Check the resulting group keeps >=2 unique orgs and >=2 locations.
 
-        When adding: checks if current_group + [new_indexer] meets requirements.
-        When replacing: checks if (current_group - replacing_indexer)
-        + [new_indexer] meets requirements.
-
-        The resulting group must have at least 2 unique organizations and 2 unique locations.
-        This check applies when the resulting group would have 2+ indexers.
-
-        Args:
-            new_indexer: The indexer being added or used as replacement.
-            replacing_indexer: If provided, the indexer being replaced (for swap scenarios).
-
-        Returns:
-            True if decentralization requirements are met, False otherwise.
+        Builds the group as current + new (or, when replacing_indexer is set,
+        current - replacing + new). Groups of fewer than 2 indexers always pass.
+        Returns True when the decentralisation floor is met.
         """
         # Build the resulting group
         if replacing_indexer:
@@ -474,21 +422,11 @@ class IndexerSelector:
         return False
 
     def _replace_underperforming_indexers(self):
-        """
-        Replace indexers scoring below MIN_INDEXER_SCORE when a significantly better
-        candidate is available.
-
-        Only considers indexers with weighted_score < MIN_INDEXER_SCORE for replacement.
-        A replacement occurs only if the candidate scores at least REPLACEMENT_MARGIN
-        higher than the current indexer (e.g., current=0.10, candidate must be >0.60).
-
-        This approach:
-        - Keeps indexers performing adequately (>= MIN_INDEXER_SCORE) stable
-        - Only replaces poor performers when there's a meaningfully better option
-        - Avoids churn from marginal improvements
-        - Never leaves gaps (keeps bad indexer if no good replacement exists)
-
-        Iterates until no more beneficial replacements are found.
+        """Replace indexers below MIN_INDEXER_SCORE with much better candidates.
+        Only a poor performer (< MIN_INDEXER_SCORE) is swapped, and only for a
+        candidate scoring at least REPLACEMENT_MARGIN higher, so adequate indexers
+        stay put and marginal churn is avoided. A bad indexer with no good
+        replacement is kept. Loops until no beneficial swap remains.
         """
         # Track indexers added in this call - don't replace them
         added_this_call: set[IndexerId] = set()
@@ -563,25 +501,11 @@ class IndexerSelector:
     def _find_best_replacement_or_select_best_indexer(
         self, replacing_indexer: Optional[IndexerId] = None
     ) -> Optional[IndexerId]:
-        """
-        Find the best indexer to add to or replace in the current group.
-
-        Used for both:
-        - Adding an indexer when group is below target_size (replacing_indexer=None)
-        - Finding a replacement for a specific indexer (replacing_indexer=<indexer_id>)
-
-        Will not select an indexer if:
-        1. Already in the current group
-        2. On the denylist
-        3. Has pending agreements not yet accepted
-        4. Previously declined an agreement for this subgraph
-
-        Args:
-            replacing_indexer: If provided, the indexer being considered for replacement.
-                              This affects the decentralization check (simulates the swap).
-
-        Returns:
-            The best indexer ID, or None if no suitable candidate exists.
+        """Pick the highest-scoring eligible indexer to add or to replace one.
+        Skips indexers already in the group, on the denylist, with pending
+        (unaccepted) agreements, or that previously declined this subgraph.
+        replacing_indexer, when set, simulates the swap for the decentralisation
+        check. Returns the best indexer ID, or None if none qualify.
         """
 
         def flatten_list_of_lists(list_of_lists):
@@ -619,15 +543,9 @@ class IndexerSelector:
             len(unpickable_indexers),
         )
 
-        # Two-pool selection: when sync status is available, prefer
-        # candidates already synced for this deployment so queries can
-        # be served immediately after on-chain acceptance.
-        #
-        # The first synced indexer is always preferred (regardless of
-        # score) to guarantee at least one indexer can serve queries
-        # immediately. Subsequent synced candidates must score above
-        # MIN_SYNCED_THRESHOLD to be preferred — below that, they
-        # compete on merit in the unsynced pool.
+        # Prefer already-synced candidates so queries serve right after
+        # acceptance: the first synced indexer gets in at any score, later ones
+        # must beat MIN_SYNCED_THRESHOLD or fall back to competing on merit.
         if self.synced_indexers:
             group_lower = {i.lower() for i in self.current_group}
             group_has_synced = bool(group_lower & self.synced_indexers)
@@ -698,19 +616,11 @@ def _normalize_metrics(
     merged: pd.DataFrame,
     price_ceiling: Optional[float] = None,
 ) -> pd.DataFrame:
-    """
-    Normalize metrics to create comparable scores across dimensions.
+    """Normalise each metric to [0, 1] where 1 is best (lower-is-better inverted).
 
-    Each metric is normalized to [0, 1] where 1 = better performance.
-    Metrics where lower is better (latency, price) are inverted.
-
-    Args:
-        merged: DataFrame containing indexer metrics.
-        price_ceiling: Maximum GRT/30d the payer will accept. When
-            provided, used as the normalisation ceiling for pricing
-            scores instead of the observed max price. This prevents
-            a single outlier price from compressing legitimate price
-            differentiation among other indexers.
+    price_ceiling, when given, caps pricing normalisation instead of using the
+    observed max, so one outlier price can't compress the rest. Missing metrics
+    normalise to NaN, then to 0.
     """
     if merged.empty:
         new_columns = [
@@ -809,17 +719,10 @@ def _normalize_metrics(
 
 
 def _normalize_generic(series: pd.Series) -> pd.Series:
-    """
-    Perform a generic min-max normalization on a pandas Series.
+    """Min-max normalise a Series to [0, 1].
 
-    This function normalizes the input series to a range between 0 and 1 using min-max scaling.
-    It handles edge cases such as constant series or series with NaN values.
-
-    Note:
-    - If the input series is empty or contains only one unique value, it returns a series of 0.5.
-
-    :param series: The input series to be normalized.
-    :return: A new series with normalized values between 0 and 1.
+    NaN and division-by-zero (a constant series, where max == min) both fill
+    to 0.
     """
     min_val = series.min()
     max_val = series.max()
@@ -834,17 +737,11 @@ def _normalize_generic(series: pd.Series) -> pd.Series:
 
 
 def _normalize_uptime_and_success_rate(series: pd.Series) -> pd.Series:
-    """
-    Normalize either uptime or success rate data using a piecewise linear scaling method.
+    """Piecewise-scale uptime/success rate, rewarding only the top band.
 
-    This function applies a custom normalization to uptime / success rate data, emphasizing
-    high performance. Uptime between 0% and 97% of the best indexers uptime results in a
-    score of 0, while uptime between 97% and 100% of the best indexers uptime results in a
-    linear score scaling from 0 to 1. So for example 98.5% of the best indexers uptime would
-    result in a normalized score of 0.5. The same calculation applies to success rate.
-
-    :param series: The input series containing uptime or success rate data.
-    :returns: A new series with normalized values between 0 and 1.
+    Values below NON_ZERO_UPTIME_SUCCESS_RATE_SCORE_THRESHOLD of the best
+    indexer's score get 0; from there to the best they scale linearly to 1
+    (e.g. 98.5% of the best maps to ~0.5).
     """
     # Find the best uptime/success rate score in the series first
     best = series.max()
@@ -867,19 +764,11 @@ def _normalize_uptime_and_success_rate(series: pd.Series) -> pd.Series:
 
 
 def _calculate_weighted_score(row: pd.Series, weights: WeightsDict) -> float:
-    """
-    Calculate a weighted score for an indexer based on multiple normalized metrics.
+    """Weighted average of an indexer's norm_* metrics by `weights`.
 
-    This function computes a single score by combining multiple performance metrics,
-    each weighted according to predefined weights. NaN values and missing metrics
-    are treated as 0, but all weights contribute to the total score.
-
-    :param row: A series containing normalized metric values for an indexer.
-                Expected to have columns prefixed with 'norm_'.
-    :param weights: A dictionary mapping metric names to their respective weights.
-                    Keys should match the suffix of the 'norm_' columns in the row.
-    :return: The calculated weighted score.
-    :raises ValueError: If the total weight is 0.
+    Columns absent or NaN are skipped (their weight drops out of the
+    denominator, so the score is renormalised over the present metrics).
+    Raises ValueError if no weighted column is present.
     """
     weighted_sum: float = 0
     weight_total: float = 0
