@@ -1214,6 +1214,61 @@ class TestGetScoreEndpoint:
         )
         assert response.status_code == 200
 
+    def test_get_score_matches_scores_weighted_for_same_indexer(self):
+        """/get-score and /scores/weighted agree, both normalising the full table.
+
+        Regression test: /get-score used to normalise one indexer's row alone.
+        Min-max normalisation of a single row is degenerate, so every indexer
+        scored the same and disagreed with the bulk endpoint.
+        """
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+        from iisa.score_loader import ScoresSnapshot
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+
+        # Raw metric columns (not pre-normalised), so _normalize_metrics scales
+        # each relative to the set — the case single-row normalisation got wrong.
+        data = pd.DataFrame(
+            {
+                "indexer": ["0xaaa", "0xbbb", "0xccc"],
+                "url": ["https://a.example/", "https://b.example/", "https://c.example/"],
+                "Latency Coefficient + Error Confidence Interval": [0.2, 0.5, 0.9],
+                "% up_x": [99.5, 98.0, 96.0],
+                "average_status": [0.99, 0.95, 0.90],
+                "stake_to_fees": [3.0, 2.0, 1.0],
+                "base_price_per_epoch": [100.0, 300.0, 500.0],
+                "price_per_entity": [0.1, 0.3, 0.5],
+            }
+        )
+
+        mock_dm = MagicMock()
+        mock_dm.snapshot = ScoresSnapshot(
+            data=data, computed_at=datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc)
+        )
+        iisa_http_endpoints._state.data_manager = mock_dm
+        iisa_http_endpoints._state._history = data
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        bulk = client.get("/scores/weighted")
+        assert bulk.status_code == 200
+        bulk_by_id = {e["indexer"]: e for e in bulk.json()["scores"]}
+
+        single_scores = {}
+        for indexer_id in ("0xaaa", "0xbbb", "0xccc"):
+            single = client.post("/get-score", json={"indexer_id": indexer_id})
+            assert single.status_code == 200
+            body = single.json()
+            assert body["weighted_score"] == pytest.approx(bulk_by_id[indexer_id]["weighted_score"])
+            assert body["components"] == pytest.approx(bulk_by_id[indexer_id]["components"])
+            single_scores[indexer_id] = body["weighted_score"]
+
+        # Scores differ across indexers — not the degenerate constant the
+        # single-row normalisation produced for every indexer.
+        assert len(set(single_scores.values())) == 3
+
 
 class TestSelectIndexersEndpoint:
     """Tests for POST /select-indexers endpoint."""

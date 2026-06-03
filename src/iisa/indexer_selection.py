@@ -763,44 +763,8 @@ def _normalize_uptime_and_success_rate(series: pd.Series) -> pd.Series:
     return cast(pd.Series, normalized)
 
 
-def _calculate_weighted_score(row: pd.Series, weights: WeightsDict) -> float:
-    """Weighted average of an indexer's norm_* metrics by `weights`.
-
-    Columns absent or NaN are skipped (their weight drops out of the
-    denominator, so the score is renormalised over the present metrics).
-    Raises ValueError if no weighted column is present.
-    """
-    weighted_sum: float = 0
-    weight_total: float = 0
-    missing_columns = []
-
-    for metric, weight in cast(dict[str, float], weights).items():
-        column_name = f"norm_{metric}"
-
-        # Append any missing columns to the list
-        if column_name not in row.index:
-            missing_columns.append(column_name)
-            continue
-
-        value = row.get(column_name, np.nan)  # Uses np.nan if column is missing
-
-        # So long as the column has a value that isn't nan, then:
-        if not pd.isna(value):
-            weighted_sum += value * weight
-            weight_total += weight
-
-    if missing_columns:
-        logger.warning(f"Missing columns in input data: {', '.join(missing_columns)}")
-
-    if weight_total == 0:
-        logger.error("Total sum of weights is 0. Sum of weights should be non-zero, ideally 1.")
-        raise ValueError("Total weight cannot be 0.")
-
-    return weighted_sum / weight_total
-
-
 def _calculate_weighted_scores(df: pd.DataFrame, weights: WeightsDict) -> pd.Series:
-    """Vectorised _calculate_weighted_score across every row of `df`.
+    """Weighted average of each row's present norm_* metrics by `weights`.
     One matrix multiply over the present norm_* columns: NaN cells drop out of
     both the numerator and the per-row weight total, so each row renormalises
     over the metrics it has. Raises ValueError if any row has no usable column.

@@ -781,20 +781,23 @@ async def get_score(
     if not _state.is_ready or _state.history is None:
         raise HTTPException(status_code=503, detail="IISA data not loaded")
 
-    # Normalize to lowercase for case-insensitive matching
+    from .indexer_selection import (
+        DEFAULT_WEIGHTS,
+        _calculate_weighted_scores,
+        _normalize_metrics,
+    )
+
+    # Normalisation is relative (min-max across all indexers), so scoring one
+    # row alone is degenerate. Normalise the whole table like /scores/weighted,
+    # then pull this indexer's row, so the two endpoints agree.
     indexer_id = request.indexer_id.lower()
-    indexer_data = _state.history[_state.history["indexer"] == indexer_id]
+    normalized = _normalize_metrics(_state.history.copy())
+    match = normalized[normalized["indexer"] == indexer_id]
 
-    if indexer_data.empty:
-        return ScoreResponse(
-            indexer_id=request.indexer_id,
-            found=False,
-        )
+    if match.empty:
+        return ScoreResponse(indexer_id=request.indexer_id, found=False)
 
-    row = indexer_data.iloc[0]
-
-    # Extract component scores (norm_ prefixed columns)
-    components = {}
+    row = match.iloc[0]
     component_keys = [
         ("norm_lat_lin_reg_coefficient", "latency"),
         ("norm_uptime_score", "uptime"),
@@ -803,19 +806,20 @@ async def get_score(
         ("norm_base_price_per_epoch", "base_price"),
         ("norm_price_per_entity", "price_per_entity"),
     ]
+    components = {
+        name: float(row[col])
+        for col, name in component_keys
+        if col in row.index and pd.notna(row[col])
+    }
 
-    for col, name in component_keys:
-        if col in row.index and pd.notna(row[col]):
-            components[name] = float(row[col])
-
-    # Calculate weighted score using IndexerSelector logic
-    from .indexer_selection import DEFAULT_WEIGHTS, _calculate_weighted_score, _normalize_metrics
-
-    # Normalize and calculate score for this single indexer
-    normalized = _normalize_metrics(indexer_data.copy())
-    if not normalized.empty:
-        weighted_score = float(_calculate_weighted_score(normalized.iloc[0], DEFAULT_WEIGHTS))
-    else:
+    # _normalize_metrics fills every norm_ column, so a zero weight total can't
+    # arise here; degrade to unscored rather than 500 if it somehow does.
+    try:
+        weighted_score: Optional[float] = float(
+            _calculate_weighted_scores(match, DEFAULT_WEIGHTS).iloc[0]
+        )
+    except ValueError as e:
+        logger.warning("weighted scoring failed for %s: %s", indexer_id, e)
         weighted_score = None
 
     return ScoreResponse(
