@@ -413,6 +413,106 @@ class TestHealthEndpoint:
         assert data["status"] == "healthy"
         assert data["data_loaded"] is False
 
+    def test_health_reports_computed_at_and_age(self):
+        """Loaded scores expose computed_at and age; fresh scores stay healthy."""
+        # Arrange
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import MagicMock
+
+        import pandas as pd
+
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+        from iisa.score_loader import DataManager, ScoresSnapshot
+
+        state = iisa_http_endpoints._state
+        orig_dm, orig_hist = state.data_manager, state._history
+        try:
+            dm = DataManager(MagicMock())
+            ts = datetime.now(timezone.utc) - timedelta(hours=3)
+            dm._snapshot = ScoresSnapshot(data=pd.DataFrame({"indexer": ["0xABC"]}), computed_at=ts)
+            state.data_manager = dm
+            state._history = pd.DataFrame({"indexer": ["0xABC"]})
+            client = TestClient(app, raise_server_exceptions=False)
+
+            # Act
+            response = client.get("/health")
+
+            # Assert
+            assert response.status_code == 200
+            data = response.json()
+            assert data["status"] == "healthy"
+            assert data["computed_at"] is not None
+            assert 2.5 <= data["scores_age_hours"] <= 3.5
+        finally:
+            state.data_manager, state._history = orig_dm, orig_hist
+
+    def test_health_degraded_when_scores_critically_stale(self):
+        """Scores older than the critical threshold flip status to degraded."""
+        # Arrange
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import MagicMock
+
+        import pandas as pd
+
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+        from iisa.score_loader import (
+            STALE_SCORES_CRITICAL_HOURS,
+            DataManager,
+            ScoresSnapshot,
+        )
+
+        state = iisa_http_endpoints._state
+        orig_dm, orig_hist = state.data_manager, state._history
+        try:
+            dm = DataManager(MagicMock())
+            ts = datetime.now(timezone.utc) - timedelta(hours=STALE_SCORES_CRITICAL_HOURS + 1)
+            dm._snapshot = ScoresSnapshot(data=pd.DataFrame({"indexer": ["0xABC"]}), computed_at=ts)
+            state.data_manager = dm
+            state._history = pd.DataFrame({"indexer": ["0xABC"]})
+            client = TestClient(app, raise_server_exceptions=False)
+
+            # Act
+            response = client.get("/health")
+
+            # Assert
+            assert response.status_code == 200
+            data = response.json()
+            assert data["status"] == "degraded"
+            assert data["scores_age_hours"] > STALE_SCORES_CRITICAL_HOURS
+        finally:
+            state.data_manager, state._history = orig_dm, orig_hist
+
+    def test_health_no_computed_at_when_scores_absent(self):
+        """With no loaded snapshot, computed_at and age are null and status healthy."""
+        # Arrange
+        from unittest.mock import MagicMock
+
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+        from iisa.score_loader import DataManager
+
+        state = iisa_http_endpoints._state
+        orig_dm, orig_hist = state.data_manager, state._history
+        try:
+            dm = DataManager(MagicMock())  # snapshot defaults to (None, None)
+            state.data_manager = dm
+            state._history = None
+            client = TestClient(app, raise_server_exceptions=False)
+
+            # Act
+            response = client.get("/health")
+
+            # Assert
+            assert response.status_code == 200
+            data = response.json()
+            assert data["status"] == "healthy"
+            assert data["computed_at"] is None
+            assert data["scores_age_hours"] is None
+        finally:
+            state.data_manager, state._history = orig_dm, orig_hist
+
 
 class TestPushScoresEndpoint:
     """Tests for POST /scores endpoint (cronjob → iisa push)."""
