@@ -683,7 +683,7 @@ def scores_weighted(
 
     from .indexer_selection import (
         DEFAULT_WEIGHTS,
-        _calculate_weighted_score,
+        _calculate_weighted_scores,
         _normalize_metrics,
     )
 
@@ -698,19 +698,24 @@ def scores_weighted(
         ("norm_price_per_entity", "price_per_entity"),
     ]
 
+    # Score every indexer in one vectorised pass. _normalize_metrics fills all
+    # norm_ columns, so the zero-weight case can't arise here; degrade to
+    # unscored rather than 500 if it somehow does.
+    try:
+        weighted_scores = _calculate_weighted_scores(normalized, DEFAULT_WEIGHTS).to_numpy()
+    except ValueError as e:
+        logger.warning("bulk weighted scoring failed: %s", e)
+        weighted_scores = pd.Series(float("nan"), index=normalized.index).to_numpy()
+
     entries: list[WeightedScoreEntry] = []
-    for _, row in normalized.iterrows():
+    for position, (_, row) in enumerate(normalized.iterrows()):
         indexer_id = row.get("indexer")
         if indexer_id is None or (isinstance(indexer_id, float) and pd.isna(indexer_id)):
             logger.debug("skipping row with missing indexer field")
             continue
 
-        weighted: Optional[float]
-        try:
-            weighted = float(_calculate_weighted_score(row, DEFAULT_WEIGHTS))
-        except ValueError as e:
-            logger.warning("weighted score failed for %s: %s", indexer_id, e)
-            weighted = None
+        score = weighted_scores[position]
+        weighted = float(score) if pd.notna(score) else None
 
         components = {
             name: float(row[col])

@@ -257,8 +257,8 @@ class IndexerSelector:
             normalized_data = self.data
 
         try:
-            normalized_data["weighted_score"] = normalized_data.apply(
-                lambda row: _calculate_weighted_score(row, self.weights), axis=1
+            normalized_data["weighted_score"] = _calculate_weighted_scores(
+                normalized_data, self.weights
             )
         except Exception as e:
             logger.error(f"Unexpected error when trying calculate_weighted_score: {e}")
@@ -797,3 +797,36 @@ def _calculate_weighted_score(row: pd.Series, weights: WeightsDict) -> float:
         raise ValueError("Total weight cannot be 0.")
 
     return weighted_sum / weight_total
+
+
+def _calculate_weighted_scores(df: pd.DataFrame, weights: WeightsDict) -> pd.Series:
+    """Vectorised _calculate_weighted_score across every row of `df`.
+    One matrix multiply over the present norm_* columns: NaN cells drop out of
+    both the numerator and the per-row weight total, so each row renormalises
+    over the metrics it has. Raises ValueError if any row has no usable column.
+    """
+    columns = []
+    column_weights = []
+    missing_columns = []
+    for metric, weight in cast(dict[str, float], weights).items():
+        column_name = f"norm_{metric}"
+        if column_name in df.columns:
+            columns.append(column_name)
+            column_weights.append(weight)
+        else:
+            missing_columns.append(column_name)
+
+    if missing_columns:
+        logger.warning(f"Missing columns in input data: {', '.join(missing_columns)}")
+
+    weight_vector = np.array(column_weights, dtype=float)
+    matrix = df[columns].to_numpy(dtype=float)
+    present = ~np.isnan(matrix)
+    weighted_sum = np.nansum(matrix * weight_vector, axis=1)
+    weight_total = present @ weight_vector  # weights of the columns each row has
+
+    if (weight_total == 0).any():
+        logger.error("Total sum of weights is 0. Sum of weights should be non-zero, ideally 1.")
+        raise ValueError("Total weight cannot be 0.")
+
+    return pd.Series(weighted_sum / weight_total, index=df.index)

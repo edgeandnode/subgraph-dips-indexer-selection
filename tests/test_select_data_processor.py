@@ -5,10 +5,12 @@ import pandas as pd
 import pytest
 
 from iisa.indexer_selection import (
+    DEFAULT_WEIGHTS,
     DeploymentId,
     IndexerId,
     IndexerSelector,
     _calculate_weighted_score,
+    _calculate_weighted_scores,
     _normalize_generic,
     _normalize_metrics,
     _normalize_uptime_and_success_rate,
@@ -175,14 +177,7 @@ class TestIndexerSelector:
         )
 
     def test_get_indexer_selections_empty_groups(self, sample_data, mock__provider):
-        """
-        Test get_indexer_selections method when both initial_group and current_group are empty.
-
-        This test verifies that the method handles the scenario where both the initial_group
-        and current_group are empty (represented as an empty list and an empty set respectively).
-        It ensures that the method returns empty lists for both added and cancelled indexers
-        when there are no indexers in either group.
-        """
+        """get_indexer_selections returns empty added/cancelled when both groups are empty."""
         with patch("iisa.indexer_selection.IndexerSelector._process_data"):
             processor = IndexerSelector(
                 history=sample_data,
@@ -250,27 +245,15 @@ class TestIndexerSelector:
         assert result == []
 
     @patch("iisa.indexer_selection._normalize_metrics")
-    @patch("iisa.indexer_selection._calculate_weighted_score")
+    @patch("iisa.indexer_selection._calculate_weighted_scores")
     def test_normalize_and_score(
-        self, mock_calculate_score, mock_normalize, sample_data, mock__provider
+        self, mock_calculate_scores, mock_normalize, sample_data, mock__provider
     ):
-        """
-        Test the _normalize_and_score method.
+        """_normalize_and_score normalises, then scores every indexer in one call.
 
-        This test verifies that:
-        1. The method calls normalize_metrics with the correct input.
-        2. It applies calculate_weighted_score to each row of the normalized data.
-        3. The resulting DataFrame contains a 'weighted_score' column with expected values.
-        4. The method handles the data flow correctly, passing results between functions.
-        5. The weights used in calculate_weighted_score match the expected structure.
-            - They are passed as a dictionary
-            - They contain all expected metric keys
-            - The sum of weights is approximately 1.0
-        6. The number and type of arguments passed to calculate_weighted_score are correct.
-        7. The method produces the expected output structure and values.
-
-        Note: This test does not verify specific weight values or exception handling for
-        normalization and score calculation, as these are implementation details that may change.
+        Checks normalize_metrics gets the raw data, the vectorised scorer is
+        called once with the full weights dict, and the result carries a
+        weighted_score column.
         """
         # Create a IndexerSelector instance
         with patch("iisa.indexer_selection.IndexerSelector._process_data"):
@@ -291,36 +274,33 @@ class TestIndexerSelector:
         ]:
             normalized_data[f"norm_{metric}"] = normalized_data.get(metric, 0.5)
         mock_normalize.return_value = normalized_data
-        mock_calculate_score.return_value = 0.8
+        mock_calculate_scores.return_value = pd.Series(0.8, index=normalized_data.index)
 
-        # Call the _normalize_and_score method
+        # Act
         result = processor._normalize_and_score()
 
-        # Verify normalize_metrics was called with correct input
+        # normalize_metrics was called with the raw data
         mock_normalize.assert_called_once()
         pd.testing.assert_frame_equal(mock_normalize.call_args[0][0], sample_data)
 
-        # Verify calculate_weighted_score was called for each row
-        assert mock_calculate_score.call_count == len(sample_data)
+        # The vectorised scorer is called once, with (normalized_frame, weights)
+        mock_calculate_scores.assert_called_once()
+        args, _ = mock_calculate_scores.call_args
+        assert len(args) == 2
+        weights = args[1]
+        assert isinstance(weights, dict)
+        expected_metrics = [
+            "stake_to_fees",
+            "base_price_per_epoch",
+            "lat_lin_reg_coefficient",
+            "uptime_score",
+            "success_rate",
+            "price_per_entity",
+        ]
+        assert all(metric in weights for metric in expected_metrics)
+        assert pytest.approx(sum(weights.values())) == 1.0
 
-        # Check weights structure
-        for call_args in mock_calculate_score.call_args_list:
-            args, kwargs = call_args
-            assert len(args) == 2
-            assert isinstance(args[1], dict)
-            weights = args[1]
-            expected_metrics = [
-                "stake_to_fees",
-                "base_price_per_epoch",
-                "lat_lin_reg_coefficient",
-                "uptime_score",
-                "success_rate",
-                "price_per_entity",
-            ]
-            assert all(metric in weights for metric in expected_metrics)
-            assert pytest.approx(sum(weights.values())) == 1.0
-
-        # Verify 'weighted_score' column exists and contains expected values
+        # weighted_score column exists with the scorer's values
         assert "weighted_score" in result.columns
         expected_scores = pd.Series(
             [0.8] * len(sample_data), name="weighted_score", index=result.index
@@ -360,13 +340,10 @@ class TestIndexerSelector:
         expected_final_group,
         mock__provider,
     ):
-        """
-        Test the _add_indexers_to_group method of IndexerSelector.
+        """_add_indexers_to_group fills the group to target_size.
 
-        This test verifies:
-        1. The method adds indexers to the group until there are 3 indexers in the group.
-        2. The method stops adding indexers if no suitable candidates are found.
-        3. The method behaves correctly with different initial group sizes.
+        Adds until 3 indexers, stops when no suitable candidate remains, and
+        handles different initial group sizes.
         """
         processor = IndexerSelector(
             history=sample_data,
@@ -398,16 +375,10 @@ class TestIndexerSelector:
             assert processor.current_group == ["A"]
 
     def test_meets_decentralization_requirements(self, mock__provider):
-        """
-        Test the _meets_decentralization_requirements method of IndexerSelector.
+        """_meets_decentralization_requirements enforces the 2-orgs/2-locations floor.
 
-        This test verifies:
-        1. Resulting group with < 2 indexers always passes (no check needed).
-        2. Resulting group with 2+ indexers needs 2+ unique locations AND 2+ unique orgs.
-        3. The replacing_indexer parameter correctly simulates swap scenarios.
-
-        Note:
-        _meets_decentralization_requirements accepts new_indexer and optional replacing_indexer.
+        Groups under 2 indexers always pass; 2+ need 2+ unique locations and orgs;
+        replacing_indexer simulates a swap.
         """
         processor = IndexerSelector(
             history=pd.DataFrame(
@@ -654,13 +625,10 @@ class TestIndexerSelector:
         assert len(processor.current_group) == 3
 
     def test_find_best_replacement_or_select_best_indexer(self, mock__provider):
-        """
-        Test the _find_best_replacement_or_select_best_indexer method of IndexerSelector.
+        """_find_best_replacement_or_select_best_indexer picks the best eligible candidate.
 
-        This test verifies:
-        1. The method returns the best replacement that meets decentralization requirements.
-        2. The method returns None when no suitable replacement is found.
-        3. The method skips indexers already on the denylist.
+        Returns the best replacement meeting decentralisation, None when none fit,
+        and skips denylisted indexers.
         """
         processor = IndexerSelector(
             history=pd.DataFrame(
@@ -691,13 +659,10 @@ class TestIndexerSelector:
             assert mock_decentralization.call_count == 1
 
     def test_update_indexer_denylist_cancel_indexing_agreements(self, sample_data, mock__provider):
-        """
-        Test the update_indexer_denylist_cancel_indexing_agreements method of IndexerSelector.
+        """update_indexer_denylist_cancel_indexing_agreements cancels denied agreements.
 
-        This test verifies:
-        1. Correctly identifies agreements to cancel based on the denylist.
-        2. The method returns the correct dictionary of cancelled agreements.
-        3. The method updates the internal indexer_denylist of the IndexerSelector.
+        Identifies agreements to cancel from the denylist, returns them, and
+        updates the internal denylist.
         """
         # Initialize IndexerSelector
         processor = IndexerSelector(
@@ -1272,10 +1237,9 @@ class TestSyncedIndexerPreference:
 
     def test_second_synced_below_threshold_not_preferred(self, five_indexers):
         """After first synced pick, threshold applies to subsequent ones."""
-        # Need 3 slots. C (0.72) and E (0.20) are synced.
-        # C gets first synced slot. E is below 0.6, so threshold
-        # kicks in for the second synced slot — E competes on merit
-        # in the unsynced pool and loses to A and B.
+        # Need 3 slots. C (0.72) and E (0.20) are synced. C takes the first
+        # synced slot; E is below 0.6 so the threshold applies and E competes
+        # on merit in the unsynced pool, losing to A and B.
         processor = IndexerSelector(
             history=five_indexers,
             deployment_id="hash1",
@@ -1400,3 +1364,66 @@ class TestCalculateWeightedScore:
         row = pd.Series(row_data)
         result = _calculate_weighted_score(row, weights)
         assert np.isclose(result, expected)
+
+
+class TestCalculateWeightedScoresVectorized:
+    """Vectorised _calculate_weighted_scores matches the row-wise scalar version."""
+
+    @staticmethod
+    def _row_wise(df, weights):
+        return pd.Series(
+            [_calculate_weighted_score(df.iloc[i], weights) for i in range(len(df))],
+            index=df.index,
+        )
+
+    def test_matches_scalar_on_full_clean_frame(self):
+        """All norm_* columns present and finite: identical to the scalar version."""
+        # Arrange
+        df = pd.DataFrame(
+            {
+                "norm_stake_to_fees": [0.1, 0.9, 0.5],
+                "norm_base_price_per_epoch": [0.8, 0.2, 0.4],
+                "norm_lat_lin_reg_coefficient": [0.3, 0.7, 0.6],
+                "norm_uptime_score": [0.95, 0.6, 0.99],
+                "norm_success_rate": [0.9, 0.5, 0.85],
+                "norm_price_per_entity": [0.2, 0.4, 0.7],
+            }
+        )
+
+        # Act
+        vectorised = _calculate_weighted_scores(df, DEFAULT_WEIGHTS)
+
+        # Assert
+        pd.testing.assert_series_equal(vectorised, self._row_wise(df, DEFAULT_WEIGHTS))
+
+    def test_nan_cells_drop_from_denominator_like_scalar(self):
+        """A NaN metric per row renormalises over the rest, matching the scalar."""
+        df = pd.DataFrame(
+            {
+                "norm_a": [0.4, np.nan, 1.0],
+                "norm_b": [np.nan, 0.5, 0.0],
+                "norm_c": [0.8, 0.2, np.nan],
+            }
+        )
+        weights = {"a": 0.5, "b": 0.3, "c": 0.2}
+
+        vectorised = _calculate_weighted_scores(df, weights)
+
+        pd.testing.assert_series_equal(vectorised, self._row_wise(df, weights))
+
+    def test_missing_column_dropped_like_scalar(self):
+        """A weight whose norm_ column is absent is skipped on both paths."""
+        df = pd.DataFrame({"norm_a": [0.6, 0.2], "norm_b": [0.4, 0.8]})
+        weights = {"a": 0.5, "b": 0.3, "c": 0.2}  # norm_c is absent
+
+        vectorised = _calculate_weighted_scores(df, weights)
+
+        pd.testing.assert_series_equal(vectorised, self._row_wise(df, weights))
+
+    def test_row_with_no_usable_column_raises(self):
+        """A row whose every weighted column is NaN raises ValueError like the scalar."""
+        df = pd.DataFrame({"norm_a": [0.5, np.nan], "norm_b": [0.5, np.nan]})
+        weights = {"a": 0.5, "b": 0.5}
+
+        with pytest.raises(ValueError, match="Total weight cannot be 0"):
+            _calculate_weighted_scores(df, weights)
