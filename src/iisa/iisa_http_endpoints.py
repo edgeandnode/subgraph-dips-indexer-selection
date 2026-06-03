@@ -30,7 +30,12 @@ from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
-from .score_loader import DataManager, FileScoreLoader
+from .score_loader import (
+    STALE_SCORES_CRITICAL_HOURS,
+    DataManager,
+    FileScoreLoader,
+    ScoresPayloadError,
+)
 from .sync_status_loader import SyncStatusData
 
 __all__ = ["app", "Settings", "get_settings"]
@@ -133,6 +138,11 @@ class HealthResponse(BaseModel):
     status: str
     data_loaded: bool
     sync_status_loaded: bool = False
+    # When the currently loaded scores were computed, and how old they are.
+    # status flips to "degraded" once the age crosses the critical threshold,
+    # which usually means the daily score push has stopped arriving.
+    computed_at: Optional[str] = None
+    scores_age_hours: Optional[float] = None
 
 
 class ScoreRequest(BaseModel):
@@ -507,15 +517,33 @@ app = FastAPI(
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
-    """
-    Health check endpoint.
+    """Report data-loaded state and how old the loaded scores are.
 
-    Returns the service status and whether data has been loaded.
+    status flips to "degraded" past the critical staleness threshold. Always
+    200 (all three k8s probes hit this path; a restart reloads the same stale
+    file, so a non-200 would crashloop without fixing anything).
     """
+    status = "healthy"
+    computed_at_iso: Optional[str] = None
+    age_hours: Optional[float] = None
+
+    data_manager = _state.data_manager
+    if data_manager is not None:
+        computed_at = data_manager.snapshot.computed_at
+        # isinstance guards against a leaked mock in tests and a None snapshot.
+        if isinstance(computed_at, datetime):
+            ts = computed_at if computed_at.tzinfo else computed_at.replace(tzinfo=timezone.utc)
+            computed_at_iso = ts.isoformat()
+            age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+            if age_hours > STALE_SCORES_CRITICAL_HOURS:
+                status = "degraded"
+
     return HealthResponse(
-        status="healthy",
+        status=status,
         data_loaded=_state.is_ready,
         sync_status_loaded=_state.sync_status is not None,
+        computed_at=computed_at_iso,
+        scores_age_hours=round(age_hours, 1) if age_hours is not None else None,
     )
 
 
@@ -546,6 +574,10 @@ def push_scores(
 
     try:
         rows = _state.load_scores_from_records(payload)
+    except ScoresPayloadError as e:
+        # Wrong-shape body: the caller's problem, so 422 not 500.
+        logger.warning("Rejected pushed scores: %s", e)
+        raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception:
         logger.exception("Failed to accept pushed scores")
         raise HTTPException(status_code=500, detail="Failed to accept scores")
