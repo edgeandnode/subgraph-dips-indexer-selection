@@ -14,6 +14,8 @@ from typing import Optional, Tuple
 
 import pandas as pd
 
+from . import score_columns as cols
+
 __all__ = [
     "FileScoreLoader",
     "DataManager",
@@ -62,12 +64,12 @@ class ScoresPayloadError(ValueError):
 # missing any of these still parses, but the served scores quietly collapse to
 # zeros, so the boundary rejects it instead.
 REQUIRED_SCORE_COLUMNS: tuple[str, ...] = (
-    "indexer",
-    "computed_at",
-    "lat_normalized_score",
-    "uptime_score",
-    "success_rate",
-    "stake_to_fees",
+    cols.INDEXER,
+    cols.COMPUTED_AT,
+    cols.LAT_NORMALIZED_SCORE,
+    cols.UPTIME_SCORE,
+    cols.SUCCESS_RATE,
+    cols.STAKE_TO_FEES,
 )
 
 
@@ -246,21 +248,16 @@ class DataManager:
         """
         df = scores_df.copy()
 
-        # TODO: Refactor IndexerSelector to use CronJob column names directly
-        df = df.rename(
-            columns={
-                "lat_coefficient_upper_bound": "Latency Coefficient + Error Confidence Interval",
-                "success_rate": "average_status",
-                "lat_normalized_score": "norm_lat_lin_reg_coefficient",
-            }
-        )
+        df = df.rename(columns=cols.CRONJOB_TO_SELECTOR_RENAME)
 
-        if "uptime_score" in df.columns:
-            df["% up_x"] = df["uptime_score"] * 100
+        if cols.UPTIME_SCORE in df.columns:
+            df[cols.SEL_UPTIME_PERCENT] = df[cols.UPTIME_SCORE] * 100
 
-        if "dst_lat" in df.columns and "dst_lon" in df.columns:
-            df["destination_loc"] = (
-                df["dst_lat"].fillna(0).astype(str) + "," + df["dst_lon"].fillna(0).astype(str)
+        if cols.DST_LAT in df.columns and cols.DST_LON in df.columns:
+            df[cols.SEL_DESTINATION_LOC] = (
+                df[cols.DST_LAT].fillna(0).astype(str)
+                + ","
+                + df[cols.DST_LON].fillna(0).astype(str)
             )
 
         return df
