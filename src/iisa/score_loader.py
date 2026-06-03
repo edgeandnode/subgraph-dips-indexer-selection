@@ -14,25 +14,26 @@ from typing import Optional, Tuple
 
 import pandas as pd
 
-__all__ = ["FileScoreLoader", "DataManager", "ScoresSnapshot"]
+__all__ = [
+    "FileScoreLoader",
+    "DataManager",
+    "ScoresSnapshot",
+    "ScoresPayloadError",
+    "REQUIRED_SCORE_COLUMNS",
+    "missing_required_columns",
+]
 
 
 @dataclass(frozen=True, eq=False)
 class ScoresSnapshot:
     """Immutable pair of (scores DataFrame, computed_at) swapped atomically.
 
-    Why bundle: a reader that wants a consistent view of "what scores are
-    loaded and when were they computed" must see both fields from the same
-    push. Two separate attribute writes during a push open a window where a
-    reader can land on (new computed_at, old data) or vice-versa. A single
-    reference swap (`self._snapshot = ScoresSnapshot(...)`) is atomic in
-    CPython, so readers always observe both fields from the same generation.
-
-    eq=False because structural equality would call DataFrame.__eq__, which
-    returns an element-wise boolean DataFrame instead of a bool and raises
-    on truth-testing. Identity comparison is the right primitive for a
-    snapshot-generation container; callers that want field comparison
-    should check `.data is x` and `.computed_at == y` explicitly.
+    Bundled so a reader sees both fields from the same push: two separate
+    attribute writes open a window where a reader lands on (new computed_at,
+    old data). A single reference swap is atomic in CPython, so readers always
+    observe one generation.
+    eq=False because DataFrame.__eq__ returns an element-wise frame, not a
+    bool, and raises on truth-testing; identity is the right primitive here.
     """
 
     data: Optional[pd.DataFrame]
@@ -49,6 +50,32 @@ logger = logging.getLogger(__name__)
 SCORES_FILE_PATH = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_scores.json")
 
 
+class ScoresPayloadError(ValueError):
+    """A pushed scores payload was missing required columns.
+
+    Separate type so the push endpoint can answer 422 (bad body) rather than
+    500 (service broke).
+    """
+
+
+# Identity plus the quality/economic metrics the selector scores on. A push
+# missing any of these still parses, but the served scores quietly collapse to
+# zeros, so the boundary rejects it instead.
+REQUIRED_SCORE_COLUMNS: tuple[str, ...] = (
+    "indexer",
+    "computed_at",
+    "lat_normalized_score",
+    "uptime_score",
+    "success_rate",
+    "stake_to_fees",
+)
+
+
+def missing_required_columns(df: pd.DataFrame) -> list[str]:
+    """Return the required columns absent from a pushed scores frame."""
+    return [c for c in REQUIRED_SCORE_COLUMNS if c not in df.columns]
+
+
 class FileScoreLoader:
     """
     Reads pre-computed indexer scores from a JSON file on a shared PVC.
@@ -58,10 +85,9 @@ class FileScoreLoader:
     """
 
     def __init__(self, scores_file_path: Optional[str] = None) -> None:
-        # Read the module-level default at call time (not definition time) so
-        # tests can monkeypatch `score_loader.SCORES_FILE_PATH` and have new
-        # instances pick it up. Default capture at def-time would lock in
-        # whatever value was present at module import.
+        # Read the module-level default at call time so tests can monkeypatch
+        # score_loader.SCORES_FILE_PATH and have new instances pick it up; a
+        # def-time default would lock in whatever value was present at import.
         self._path = scores_file_path if scores_file_path is not None else SCORES_FILE_PATH
 
     @property
@@ -127,13 +153,11 @@ class DataManager:
 
     @property
     def scores_file_path(self) -> Optional[str]:
-        """
-        The on-disk path of the underlying file-backed provider, if any.
+        """The on-disk path of the file-backed provider, or None.
 
-        Returns None if the provider has no .path attribute — e.g. a future
-        non-FileScoreLoader provider that doesn't persist to a single file.
-        Callers in the push path must guard for None before attempting to
-        write to disk.
+        None when the provider has no .path attribute (a future provider that
+        doesn't persist to a single file); push-path callers must guard for it
+        before writing to disk.
         """
         return getattr(self._provider, "path", None)
 
@@ -162,20 +186,19 @@ class DataManager:
         return True
 
     def transform_scores_df(self, scores_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Pure transform: run the same column mapping as load_scores() and
-        return the result without touching self._snapshot.
+        """Pure column-mapping transform, returned without touching state.
 
-        Used by the push path (POST /scores) to dry-run the transform
-        before committing anything to disk or in-memory state. A transform
-        failure raised here surfaces as an HTTP error with no side effects,
-        so a malformed payload can never poison the cache.
-
-        :raises ValueError: if the input DataFrame is empty.
-        :raises Exception: if the transform fails (e.g. missing columns).
+        The push path dry-runs this before writing, so an empty payload (raises
+        ValueError) or one missing required columns (raises ScoresPayloadError)
+        fails here with no side effects and can never poison the cache.
         """
         if scores_df.empty:
             raise ValueError("transform_scores_df called with empty DataFrame")
+        missing = missing_required_columns(scores_df)
+        if missing:
+            raise ScoresPayloadError(
+                f"pushed scores payload missing required columns: {', '.join(missing)}"
+            )
         return self._transform_scores_to_perf_history(scores_df)
 
     def commit_scores(
@@ -183,14 +206,11 @@ class DataManager:
         transformed_df: pd.DataFrame,
         computed_at: Optional[datetime],
     ) -> None:
-        """
-        Commit an already-transformed scores DataFrame to in-memory state.
+        """Commit an already-transformed scores frame to in-memory state.
 
-        Callers must have run transform_scores_df() on the raw input first;
-        this method performs the atomic snapshot swap and logs staleness.
-        Split out from load_scores_from_df so the push handler can
-        validate-then-write-disk-then-commit in three distinct steps
-        instead of two coupled ones.
+        Callers must have run transform_scores_df() first; this does the atomic
+        snapshot swap and logs staleness. Split from load_scores_from_df so the
+        push handler can validate, write disk, then commit as separate steps.
         """
         self._check_scores_staleness(computed_at)
         # Atomic swap — see ScoresSnapshot docstring.
@@ -202,16 +222,11 @@ class DataManager:
         scores_df: pd.DataFrame,
         computed_at: Optional[datetime],
     ) -> bool:
-        """
-        Load scores from an already-parsed DataFrame in one step.
+        """Transform and commit an already-parsed frame in one step.
 
-        Facade over transform_scores_df + commit_scores. Kept for the
-        non-push path and for backwards compatibility with existing
-        callers that want the transform-and-commit semantics without
-        the intermediate dry-run. The push handler uses the split
-        methods directly.
-
-        :return: True if scores were accepted, False if the DataFrame was empty.
+        Facade over transform_scores_df + commit_scores for the non-push path
+        (the push handler uses the split methods directly). Returns False and
+        clears the snapshot if the frame is empty, else True.
         """
         if scores_df.empty:
             logger.warning("load_scores_from_df called with empty DataFrame")
@@ -223,15 +238,11 @@ class DataManager:
         return True
 
     def _transform_scores_to_perf_history(self, scores_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Transform indexer_scores table format to IndexerSelector-compatible format.
+        """Rename CronJob score columns to the names IndexerSelector expects.
 
-        Column mapping:
-        - lat_coefficient_upper_bound -> "Latency Coefficient + Error Confidence Interval"
-        - uptime_score (0-1) -> "% up_x" (0-100)
-        - success_rate -> "average_status"
-        - dst_lat, dst_lon -> "destination_loc"
-        - norm_stake_to_fees -> "norm_stake_to_fees"
+        Maps lat_coefficient_upper_bound -> latency-CI column, success_rate ->
+        average_status, lat_normalized_score -> norm_lat_lin_reg_coefficient,
+        uptime_score (x100) -> "% up_x", and dst_lat/dst_lon -> destination_loc.
         """
         df = scores_df.copy()
 

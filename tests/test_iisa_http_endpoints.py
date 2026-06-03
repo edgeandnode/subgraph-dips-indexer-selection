@@ -526,6 +526,7 @@ class TestPushScoresEndpoint:
                 "lat_normalized_score": 0.8,
                 "uptime_score": 0.95,
                 "success_rate": 0.99,
+                "stake_to_fees": 1000.0,
             }
         ]
 
@@ -754,6 +755,72 @@ class TestPushScoresEndpoint:
         status_response = client.get("/scores/status")
         assert status_response.status_code == 200
         assert status_response.json()["computed_at"] is None
+
+    def test_push_scores_missing_required_column_rejected(self, tmp_path, monkeypatch):
+        """A payload missing a required column is rejected 422 without touching disk."""
+        # Arrange — real DataManager so the boundary validation actually runs.
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        bad = self._sample_payload()
+        del bad[0]["uptime_score"]
+
+        # Act
+        response = client.post("/scores", json=bad)
+
+        # Assert
+        assert response.status_code == 422
+        assert "uptime_score" in response.json()["detail"]
+        assert not scores_path.exists()
+
+    def test_push_scores_missing_indexer_rejected(self, tmp_path, monkeypatch):
+        """A payload without the indexer identity column is rejected 422."""
+        # Arrange
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        bad = self._sample_payload()
+        del bad[0]["indexer"]
+
+        # Act
+        response = client.post("/scores", json=bad)
+
+        # Assert
+        assert response.status_code == 422
+        assert "indexer" in response.json()["detail"]
+        assert not scores_path.exists()
+
+    def test_push_scores_full_payload_accepted_end_to_end(self, tmp_path, monkeypatch):
+        """A complete payload passes validation, writes disk, and returns the row count."""
+        # Arrange — real DataManager, real transform, no mocks.
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Act
+        response = client.post("/scores", json=self._sample_payload())
+
+        # Assert
+        assert response.status_code == 200
+        assert response.json()["rows"] == 1
+        assert scores_path.exists()
 
 
 class TestScoresStatusEndpoint:
