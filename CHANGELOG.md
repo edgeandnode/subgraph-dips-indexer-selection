@@ -1,5 +1,38 @@
 # Changelog
 
+## [2.7.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.6.1...v2.7.0) (2026-06-03)
+
+
+### Added
+
+* add bulk endpoint for all indexer weighted scores ([#182](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/182)) ([c729359](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/c72935907c0ef31a2fef1752ac3ca1b6b8dd469a))
+* **health:** expose score age and degrade status when scores go stale ([#186](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/186)) ([10627ba](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/10627babc313b950ad91a4e75b27149c9015d6ac))
+* **scores:** reject score pushes missing required columns ([#187](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/187)) ([95e6097](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/95e60978c9c236bb5609e9cb12cfb58ef452f8d3))
+
+
+### Fixed
+
+* **iisa:** make /get-score and /scores/weighted return the same score ([#192](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/192)) ([9c62a36](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/9c62a36c0a959f2f24e1993ed55a5b60d1cd5238))
+* **scoring:** log the actual mode in the summary, not the input flag ([#179](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/179)) ([a923c89](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/a923c896cd7d3a4f79e5e966d78835a3c7355605))
+
+
+### Changed
+
+* **deps:** bump the actions group with 2 updates ([#191](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/191)) ([4b4e78b](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/4b4e78bd4717c5ce85e99f4302febd067204b94b))
+* **k8s:** update cronjob image to sha-4b4e78b ([#193](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/193)) ([fbb7568](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/fbb7568a83ac3592287369fb9ea3e0519b4bc9e4))
+* put score column names in one shared place ([#188](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/188)) ([0f86810](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/0f86810de166a2b8f9bdbb8093e4742928044f49))
+
+
+### Performance
+
+* compute indexer scores in one pass, not row by row ([#190](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/190)) ([4c3898b](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/4c3898bb4e8f8670ce697af502d1613a3f67c355))
+
+
+### Documentation
+
+* **selection:** trim over-long docstrings and fix two inaccurate ones ([#189](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/189)) ([f8c0612](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/f8c0612aa17e82060993fbba33d0d0ccf7a72f83))
+* shorten long comments and docstrings in IISA HTTP API ([#183](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/183)) ([075c246](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/075c2463b5cf0182529806be621576f88f3e96e4))
+
 ## [2.6.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.6.0...v2.6.1) (2026-05-28)
 
 
