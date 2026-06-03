@@ -1062,10 +1062,10 @@ class TestScoresWeightedEndpoint:
 
         from iisa import indexer_selection
 
-        def raises(row, weights):
+        def raises(df, weights):
             raise ValueError("forced failure")
 
-        monkeypatch.setattr(indexer_selection, "_calculate_weighted_score", raises)
+        monkeypatch.setattr(indexer_selection, "_calculate_weighted_scores", raises)
 
         client = TestClient(app, raise_server_exceptions=False)
         response = client.get("/scores/weighted")

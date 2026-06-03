@@ -801,32 +801,32 @@ def _calculate_weighted_score(row: pd.Series, weights: WeightsDict) -> float:
 
 def _calculate_weighted_scores(df: pd.DataFrame, weights: WeightsDict) -> pd.Series:
     """Vectorised _calculate_weighted_score across every row of `df`.
-    Same result row-for-row: absent or NaN norm_* columns drop out of that
-    row's denominator and the score is renormalised over the rest. Raises
-    ValueError if any row has no usable column.
+    One matrix multiply over the present norm_* columns: NaN cells drop out of
+    both the numerator and the per-row weight total, so each row renormalises
+    over the metrics it has. Raises ValueError if any row has no usable column.
     """
-    present: dict[str, float] = {}
+    columns = []
+    column_weights = []
     missing_columns = []
     for metric, weight in cast(dict[str, float], weights).items():
         column_name = f"norm_{metric}"
         if column_name in df.columns:
-            present[column_name] = weight
+            columns.append(column_name)
+            column_weights.append(weight)
         else:
             missing_columns.append(column_name)
 
     if missing_columns:
         logger.warning(f"Missing columns in input data: {', '.join(missing_columns)}")
 
-    weighted_sum = pd.Series(0.0, index=df.index)
-    weight_total = pd.Series(0.0, index=df.index)
-    for column_name, weight in present.items():
-        values = df[column_name]
-        contributes = values.notna()
-        weighted_sum = weighted_sum.add((values * weight).where(contributes, 0.0))
-        weight_total = weight_total.add(pd.Series(weight, index=df.index).where(contributes, 0.0))
+    weight_vector = np.array(column_weights, dtype=float)
+    matrix = df[columns].to_numpy(dtype=float)
+    present = ~np.isnan(matrix)
+    weighted_sum = np.nansum(matrix * weight_vector, axis=1)
+    weight_total = present @ weight_vector  # weights of the columns each row has
 
     if (weight_total == 0).any():
         logger.error("Total sum of weights is 0. Sum of weights should be non-zero, ideally 1.")
         raise ValueError("Total weight cannot be 0.")
 
-    return weighted_sum / weight_total
+    return pd.Series(weighted_sum / weight_total, index=df.index)
