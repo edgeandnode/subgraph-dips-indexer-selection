@@ -9,12 +9,33 @@ from iisa.indexer_selection import (
     DeploymentId,
     IndexerId,
     IndexerSelector,
-    _calculate_weighted_score,
     _calculate_weighted_scores,
     _normalize_generic,
     _normalize_metrics,
     _normalize_uptime_and_success_rate,
 )
+
+
+def _row_wise_weighted_score(row: pd.Series, weights: dict) -> float:
+    """Reference oracle: the obvious row-at-a-time weighted average.
+
+    _calculate_weighted_scores does the same sum as one matrix multiply; the
+    equivalence tests below check the vectorised version against this simple,
+    correct-by-inspection version. Absent/NaN columns drop from the denominator.
+    """
+    weighted_sum = 0.0
+    weight_total = 0.0
+    for metric, weight in weights.items():
+        column_name = f"norm_{metric}"
+        if column_name not in row.index:
+            continue
+        value = row.get(column_name, np.nan)
+        if not pd.isna(value):
+            weighted_sum += value * weight
+            weight_total += weight
+    if weight_total == 0:
+        raise ValueError("Total weight cannot be 0.")
+    return weighted_sum / weight_total
 
 
 @pytest.fixture
@@ -1284,7 +1305,9 @@ class TestDecentralizationBestEffort:
         assert len(processor.current_group) == 3
 
 
-class TestCalculateWeightedScore:
+class TestRowWiseWeightedScoreReference:
+    """Pins the reference oracle's semantics, the spec the vectorised version meets."""
+
     @pytest.fixture
     def sample_weights(self):
         return {"metric1": 0.5, "metric2": 0.3, "metric3": 0.2}
@@ -1292,14 +1315,14 @@ class TestCalculateWeightedScore:
     def test_basic_calculation(self, sample_weights):
         # Test the function with all metrics present
         row = pd.Series({"norm_metric1": 0.8, "norm_metric2": 0.6, "norm_metric3": 0.4})
-        result = _calculate_weighted_score(row, sample_weights)
+        result = _row_wise_weighted_score(row, sample_weights)
         expected = (0.8 * 0.5 + 0.6 * 0.3 + 0.4 * 0.2) / 1.0
         assert np.isclose(result, expected)
 
     def test_missing_metric(self, sample_weights):
         # Test the function when one metric is missing (NaN)
         row = pd.Series({"norm_metric1": 0.8, "norm_metric2": np.nan, "norm_metric3": 0.4})
-        result = _calculate_weighted_score(row, sample_weights)
+        result = _row_wise_weighted_score(row, sample_weights)
         expected = ((0.8 * 0.5) + (0 * 0.3) + (0.4 * 0.2)) / (0.5 + 0.2)
         assert np.isclose(result, expected)
 
@@ -1307,20 +1330,20 @@ class TestCalculateWeightedScore:
         # Test the function when all metrics are missing (NaN)
         row = pd.Series({"norm_metric1": np.nan, "norm_metric2": np.nan, "norm_metric3": np.nan})
         with pytest.raises(ValueError, match="Total weight cannot be 0."):
-            _calculate_weighted_score(row, sample_weights)
+            _row_wise_weighted_score(row, sample_weights)
 
     def test_zero_weights(self):
         # Test the function when all weights are zero
         weights = {"metric1": 0, "metric2": 0, "metric3": 0}
         row = pd.Series({"norm_metric1": 0.8, "norm_metric2": 0.6, "norm_metric3": 0.4})
         with pytest.raises(ValueError, match="Total weight cannot be 0."):
-            _calculate_weighted_score(row, weights)
+            _row_wise_weighted_score(row, weights)
 
     def test_partial_weights(self):
         # Test the function when some weights are zero
         weights = {"metric1": 0.5, "metric2": 0, "metric3": 0.5}
         row = pd.Series({"norm_metric1": 0.8, "norm_metric2": 0.6, "norm_metric3": 0.4})
-        result = _calculate_weighted_score(row, weights)
+        result = _row_wise_weighted_score(row, weights)
         expected = (0.8 * 0.5 + 0.4 * 0.5) / 1.0
         assert np.isclose(result, expected)
 
@@ -1335,7 +1358,7 @@ class TestCalculateWeightedScore:
                 "other_column": "value",
             }
         )
-        result = _calculate_weighted_score(row, sample_weights)
+        result = _row_wise_weighted_score(row, sample_weights)
         expected = (0.8 * 0.5 + 0.6 * 0.3 + 0.4 * 0.2) / 1.0
         assert np.isclose(result, expected)
 
@@ -1362,7 +1385,7 @@ class TestCalculateWeightedScore:
     def test_edge_cases(self, row_data, weights, expected):
         # Test various edge cases
         row = pd.Series(row_data)
-        result = _calculate_weighted_score(row, weights)
+        result = _row_wise_weighted_score(row, weights)
         assert np.isclose(result, expected)
 
 
@@ -1372,7 +1395,7 @@ class TestCalculateWeightedScoresVectorized:
     @staticmethod
     def _row_wise(df, weights):
         return pd.Series(
-            [_calculate_weighted_score(df.iloc[i], weights) for i in range(len(df))],
+            [_row_wise_weighted_score(df.iloc[i], weights) for i in range(len(df))],
             index=df.index,
         )
 
