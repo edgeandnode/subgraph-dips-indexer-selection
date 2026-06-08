@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.7.0...v2.7.1) (2026-06-08)
+
+
+### Changed
+
+* **release:** remind to deploy the service after a release lands ([#194](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/194)) ([3946178](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/3946178873d5b303aea4864f04bc9cd267ee82c1))
+
 ## [2.7.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.6.1...v2.7.0) (2026-06-03)
 
 
