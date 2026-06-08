@@ -12,6 +12,7 @@
   },
   "release-search-depth": 100,
   "pull-request-header": "**Merge order:** If a `chore(k8s): update cronjob image` PR is open, land it first. After that PR lands, wait 1-2 minutes for release-please to force-push this one with the new SHA bump — otherwise you'll need to land a third PR.",
+  "pull-request-footer": "**Deploy after merge:** Merging this PR tags the release and triggers the `Build Release Image` workflow to publish the versioned service image. Wait for that workflow to finish, then roll it out from an up-to-date `main`: `kubectl apply -f k8s/deployment.yaml`. Applying before the build completes leaves the rollout stuck in `ImagePullBackOff`.",
   "changelog-sections": [
     {
       "type": "feat",
