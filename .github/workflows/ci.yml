@@ -1,14 +1,18 @@
-# Runs ruff linting, mypy type checking, and the pytest suite on every PR
-# and push to main. confluent-kafka, base58, and protobuf are installed
-# alongside the dev extras because the cronjob tests import them but they
-# aren't declared in pyproject.toml dev dependencies (they live in the
-# cronjob Dockerfile).
+# confluent-kafka, base58, and protobuf are installed alongside the dev extras
+# because the cronjob tests import them but they aren't declared as dev deps in
+# pyproject.toml (they live in the cronjob Dockerfile).
 name: CI
 
 on:
   pull_request:
   push:
     branches: [main]
+
+# Least privilege: this workflow only reads the repo to lint, type-check, and
+# test. Pinning the token to read-only matters once the repo is public, when
+# anyone can open a pull request that triggers it.
+permissions:
+  contents: read
 
 jobs:
   lint-and-test:
