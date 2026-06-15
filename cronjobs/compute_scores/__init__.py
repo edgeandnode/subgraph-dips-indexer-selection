@@ -8,5 +8,6 @@ This job runs daily and computes:
 - Stake-to-fees ratios
 - Pre-normalized versions of all static metrics
 
-Results are written to a JSON file on the shared PVC.
+Results are POSTed to the IISA HTTP service, which persists them to its own cache
+file (no shared filesystem).
 """

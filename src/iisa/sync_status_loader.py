@@ -1,10 +1,11 @@
 """
-Loads indexer sync status from a JSON file on the shared PVC.
+Loads indexer sync status from the IISA service's own cache file.
 
-A background fetcher polls each indexer's /status endpoint and writes
-sync_status.json with the set of synced+healthy deployments per indexer.
-This module loads that file and builds a reverse index so the IISA can
-answer "which indexers are already synced for deployment X?" in O(1).
+A fetcher in the CronJob polls each indexer's /status endpoint and POSTs a
+snapshot of the synced+healthy deployments per indexer to the IISA service;
+the push handler persists it to sync_status.json (no shared filesystem). This
+module reads that cache file and builds a reverse index so the IISA can answer
+"which indexers are already synced for deployment X?" in O(1).
 """
 
 import json

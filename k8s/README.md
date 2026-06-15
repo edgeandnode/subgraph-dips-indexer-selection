@@ -1,71 +1,70 @@
 # Kubernetes Deployment
 
-Kubernetes manifests for deploying the IISA (Indexing Indexer Selection Algorithm) service.
+Kubernetes manifests for the IISA (Indexing Indexer Selection Algorithm) service
+and its daily score-computation job.
 
 ## Files
 
-- `deployment.yaml` - IISA deployment with health probes and resource limits
-- `service.yaml` - Internal ClusterIP service on port 8080
-- `networkpolicy.yaml` - Restricts ingress to dipper pods only
-- `configmap-example.yaml` - Example ConfigMap for non-sensitive config
+- `score-computation-cronjob.yaml` - the namespace plus the daily CronJob that computes indexer scores
+- `deployment.yaml` - the IISA HTTP service, with health probes and resource limits
+- `service.yaml` - internal ClusterIP service on port 8080
+- `iisa-scores-cache-pvc.yaml` - the service's own cache volume for pushed scores and sync status
+- `networkpolicy.yaml` - restricts ingress to dipper and the score-computation job
+- `kustomization.yaml` - bundles the manifests above for `kubectl apply -k`
 
-## Resource Requirements
+## How it fits together
 
-IISA has two operational modes with different resource needs:
+The CronJob runs once a day. It replays gateway query data from Redpanda and reads
+indexer stake from the Graph Network subgraph, computes each indexer's scores, and
+POSTs them to the IISA service. It pushes an indexer sync-status snapshot the same
+way. Nothing is shared on disk between the two.
 
-| Mode | CPU | Memory | Frequency |
-|------|-----|--------|-----------|
-| Inference | Low | ~1GB | Per-request |
-| Training | High | 32GB+ | Daily |
+The IISA service answers indexer-selection requests. On startup it loads the last
+scores and sync status from its own cache volume, so a restart serves the most
+recent data straight away. Each push atomically rewrites that cache and swaps the
+in-memory snapshot the service selects from.
 
-The deployment is configured with limits to accommodate the daily training job:
-- Memory limit: 40Gi
-- CPU limit: 4 cores
+## Resource requirements
 
-## Startup Behavior
+The score computation replays up to four weeks of query data, so the CronJob asks
+for a lot of memory; the always-on service is comparatively small.
 
-IISA loads data from BigQuery on startup, which can take several minutes. The probes are configured to account for this:
+| Workload | CPU (request / limit) | Memory (request / limit) |
+|----------|-----------------------|--------------------------|
+| IISA service (deployment) | 500m / 4 | 1Gi / 2Gi |
+| Score-computation job | 2 / 8 | 50Gi / 50Gi |
 
-- Startup probe: 30s initial delay, up to 5 minutes total (30 retries x 10s)
+## Startup behaviour
+
+The service reads its cache file on startup, which is quick, but the probes leave
+generous headroom:
+
+- Startup probe: 30s initial delay, up to 5 minutes total
 - Readiness probe: 90s initial delay
 - Liveness probe: 120s initial delay
 
 ## Prerequisites
 
-Before deploying IISA:
+These secrets are created out of band and are never committed:
 
-1. Create GCP service account credentials secret:
-   ```bash
-   kubectl create secret generic iisa-gcp-credentials \
-     --from-file=service-account.json=path/to/credentials.json
-   ```
+- `iisa-redpanda-credentials` - Redpanda bootstrap servers, SASL username and
+  password, and the Graph Network subgraph URL (the URL embeds an API key).
+- `iisa-push-token` - the bearer token the CronJob uses to authenticate its pushes;
+  the service rejects pushes without it.
+- `github-registry-secret` - image pull secret for the GitHub container registry.
 
-2. Create ConfigMap with GCP project info:
-   ```bash
-   kubectl create configmap iisa-config \
-     --from-literal=gcp_project=your-project-id \
-     --from-literal=gcp_location=US
-   ```
+Geo-location data uses MaxMind GeoLite2, downloaded into the CronJob image at build
+time, so no geo API key is needed at runtime.
 
-3. Create secret for IPinfo API key:
-   ```bash
-   kubectl create secret generic iisa-secrets \
-     --from-literal=ipinfo_api_key=your-api-key
-   ```
+## Network policy
 
-## Network Policy
+Only pods labelled `app: dipper` (the consumer) or `app: iisa-score-computation`
+(the daily job) may reach the service on port 8080; all other ingress is denied.
 
-The NetworkPolicy restricts ingress traffic to IISA:
-- Only pods with label `app: dipper` can access IISA
-- All other ingress is denied
+## Service discovery
 
-Ensure dipper is deployed with the label `app: dipper` for service discovery to work.
+dipper reaches the service through Kubernetes DNS at:
 
-## Service Discovery
-
-Dipper should configure IISA endpoint as:
 ```
 http://iisa:8080
 ```
-
-This uses Kubernetes DNS to resolve the service within the same namespace.
