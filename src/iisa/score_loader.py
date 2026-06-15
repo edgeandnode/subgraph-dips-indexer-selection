@@ -1,8 +1,9 @@
 """
-Loads pre-computed indexer scores from a JSON file on a shared PVC.
+Loads pre-computed indexer scores from the IISA service's own cache file.
 
-Scores are computed daily by a CronJob (cronjobs/compute_scores/) and written
-to a JSON file. IISA reads these scores on startup using DataManager.load_scores().
+Scores are computed daily by a CronJob (cronjobs/compute_scores/) and POSTed to
+the IISA service; the push handler persists them to a JSON file (no shared
+filesystem). IISA reads that cache file on startup using DataManager.load_scores().
 """
 
 import json
@@ -80,10 +81,10 @@ def missing_required_columns(df: pd.DataFrame) -> list[str]:
 
 class FileScoreLoader:
     """
-    Reads pre-computed indexer scores from a JSON file on a shared PVC.
+    Reads pre-computed indexer scores from the IISA service's own cache file.
 
-    The CronJob writes scores via RedpandaProvider.write_scores(); this class
-    reads them back.
+    The CronJob POSTs scores to the service via RedpandaProvider.write_scores();
+    the push handler persists them to the cache file, and this class reads them back.
     """
 
     def __init__(self, scores_file_path: Optional[str] = None) -> None:
