@@ -1,5 +1,28 @@
 # Changelog
 
+## [2.7.2](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.7.1...v2.7.2) (2026-06-15)
+
+
+### Fixed
+
+* **deps:** update aiohttp to 3.14 to clear two known advisories ([#200](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/200)) ([d606f5b](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/d606f5bcf9fe0fcd047295f2128cf7dfe02a1a0c))
+
+
+### Changed
+
+* **k8s:** update cronjob image to sha-117fa5a ([#204](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/204)) ([81b8d7e](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/81b8d7ec6d72540b69c2308fa57e266d6e5c838a))
+* **license:** add MIT license and declare it in package metadata ([#198](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/198)) ([70cbfbb](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/70cbfbb1cb73a7fd9a73f870f37dcc87eebd431a))
+
+
+### Documentation
+
+* **iisa:** describe the push-based scores flow, not the old shared PVC ([#199](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/199)) ([117fa5a](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/117fa5aa6435e4c3d360b9cb77e43083135592e6))
+
+
+### CI/CD
+
+* **permissions:** restrict the CI workflow token to read-only ([#203](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/203)) ([14eae18](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/14eae1883cdb56477e412c2a6412b63733de5cce))
+
 ## [2.7.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.7.0...v2.7.1) (2026-06-08)
 
 
