@@ -1,10 +1,10 @@
 # Subgraph DIPs Indexer Selection
 
-The Indexing Indexer Selection Algorithm (IISA) for The Graph's Direct Indexer Payments service. It decides which indexers should be selected to index and serve a given subgraph deployment, ranking every candidate by a weighted blend of quality and economic signals drawn from real query traffic and on-chain stake.
+The Indexing Indexer Selection Algorithm (IISA) for The Graph's Direct Indexing Payments service. It decides which indexers should be selected to index and serve a given subgraph deployment, ranking every candidate by a weighted blend of quality and economic signals drawn from real query traffic and on-chain stake.
 
 ## Background
 
-The Graph is a decentralised network where independent operators, called *indexers*, organise blockchain data into *subgraphs* and answer queries against them. Most of an indexer's income comes from protocol indexing rewards, which are spread across the whole network. Direct Indexer Payments (DIPs) sit alongside that: a consumer pays a chosen indexer directly — a recurring fee, quoted in GRT per 30 days — to commit to indexing and serving one specific subgraph deployment.
+The Graph is a decentralised network where independent operators, called *indexers*, organise blockchain data into *subgraphs* and answer queries against them. Most of an indexer's income comes from protocol indexing rewards, which are spread across the whole network. Direct Indexing Payments (DIPs) sit alongside that: indexers are paid a recurring fee — quoted in GRT per 30 days — to commit to indexing and serving a specific subgraph deployment. At first these agreements are funded by the protocol itself.
 
 That arrangement only works if someone decides which indexers should receive those paid agreements, keeps the best-performing ones in place, and replaces the ones that fall behind. Making that decision well is the job of this project.
 
