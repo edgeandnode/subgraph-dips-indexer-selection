@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.7.3](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.7.2...v2.7.3) (2026-06-16)
+
+
+### Fixed
+
+* **deps:** update starlette to 1.3.1 to clear two known advisories ([#206](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/206)) ([cf59056](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/cf59056b3defca887f36d01495ec0011134cedfb))
+
+
+### Documentation
+
+* add a README introducing the indexer selection service ([#205](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/205)) ([a36c317](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/a36c317e1bebd367ee54397fd8c27fdc79235571))
+* **readme:** correct DIPs name and who funds the agreements ([#208](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/208)) ([1dc5462](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/1dc5462889a8f7781805e7da400b83224329e20c))
+
 ## [2.7.2](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.7.1...v2.7.2) (2026-06-15)
 
 
