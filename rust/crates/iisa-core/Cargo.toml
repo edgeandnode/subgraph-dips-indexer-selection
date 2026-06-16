@@ -1,0 +1,13 @@
+[package]
+name = "iisa-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Corrected indexer selection algorithm (IISA) for The Graph DIPs — Rust port that fixes the findings in IISA-AUDIT-FINDINGS.md."
+
+# Zero runtime dependencies on purpose: the selection core is pure logic, so it
+# compiles and tests anywhere without a network fetch. Serde/HTTP/Kafka live in
+# the (separate) service and scoring-job crates, not here.
+[dependencies]
+
+[dev-dependencies]
