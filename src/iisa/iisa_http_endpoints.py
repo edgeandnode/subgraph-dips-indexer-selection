@@ -1126,6 +1126,8 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     # Log selection reasoning for auditability
     if processor.data is not None and not processor.data.empty and processor.current_group:
         scored = processor.data[processor.data["indexer"].isin(processor.current_group)]
+        # The weight key for each metric is its normalised column name without the
+        # "norm_" prefix, which matches the keys in processor.weights / DEFAULT_WEIGHTS.
         component_cols = [
             ("norm_stake_to_fees", "stake_to_fees"),
             ("norm_base_price_per_epoch", "base_price"),
@@ -1135,10 +1137,25 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
             ("norm_price_per_entity", "price_per_entity"),
         ]
         for _, row in scored.iterrows():
-            components = {
-                label: round(float(row[col]), 3)
+            # Each present metric, paired with its normalised value and its active
+            # weight. The weight key is the column name without the "norm_" prefix.
+            present = [
+                (label, float(row[col]), float(processor.weights[col[len("norm_") :]]))
                 for col, label in component_cols
-                if col in row.index and pd.notna(row[col])
+                if col in row.index
+                and pd.notna(row[col])
+                and col[len("norm_") :] in processor.weights
+            ]
+            components = {label: round(value, 3) for label, value, _ in present}
+            weights = {label: round(weight, 3) for label, _, weight in present}
+            # Each metric's weighted contribution to the score: value * weight
+            # renormalised over the weights of the metrics this indexer has, so the
+            # contributions sum to the logged score (mirrors _calculate_weighted_scores).
+            weight_total = sum(weight for _, _, weight in present)
+            contributions = {
+                label: round(value * weight / weight_total, 4)
+                for label, value, weight in present
+                if weight_total > 0
             }
             weighted = (
                 round(float(row["weighted_score"]), 4)
@@ -1146,10 +1163,13 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
                 else None
             )
             logger.info(
-                "selected indexer=%s score=%.4f components=%s deployment=%s",
+                "selected indexer=%s score=%.4f components=%s weights=%s contributions=%s "
+                "deployment=%s",
                 row["indexer"],
                 weighted if weighted is not None else 0.0,
                 components,
+                weights,
+                contributions,
                 request.deployment_id,
             )
 
