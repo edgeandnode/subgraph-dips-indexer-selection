@@ -1140,7 +1140,7 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
             # Each present metric, paired with its normalised value and its active
             # weight. The weight key is the column name without the "norm_" prefix.
             present = [
-                (label, float(row[col]), float(processor.weights[col[len("norm_") :]]))
+                (label, float(row[col]), float(cast(float, processor.weights[col[len("norm_") :]])))
                 for col, label in component_cols
                 if col in row.index
                 and pd.notna(row[col])
