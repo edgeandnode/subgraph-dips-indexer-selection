@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.8.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.7.3...v2.8.0) (2026-06-23)
+
+
+### Added
+
+* log scoring weights so indexer scores are auditable ([#211](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/211)) ([9633f31](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/9633f31aa03d691750afa93985ac012aa280ed15))
+
+
+### Changed
+
+* **deps:** bump pydantic-settings to 2.14.2 to fix advisory ([#212](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/212)) ([6166d80](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/6166d80f9783dbc6617963f273d5431f600c9a07))
+* **k8s:** update cronjob image to sha-c8c33d4 ([#210](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/210)) ([961e92a](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/961e92a1072bd04d209b0c20e4f59e314ff59405))
+
 ## [2.7.3](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.7.2...v2.7.3) (2026-06-16)
 
 
