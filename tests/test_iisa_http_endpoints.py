@@ -1115,8 +1115,8 @@ class TestDipsIndexersEndpoint:
     def _seed_snapshot(monkeypatch):
         """Snapshot covering each DIPs eligibility case: 0xaaa/0xbbb answered their
         probe and priced their chains; 0xccc (empty) and 0xddd (None) do not accept
-        DIPs; 0xeee advertises arbitrum-one but priced nothing, so it accepts DIPs
-        overall yet is not eligible for any specific chain.
+        DIPs; 0xeee lists arbitrum-one in its supported networks but never priced it,
+        so it is not eligible for any chain.
         """
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import Settings
@@ -1158,20 +1158,13 @@ class TestDipsIndexersEndpoint:
         )
         iisa_http_endpoints._state.data_manager = mock_dm
 
-    def test_returns_only_dips_accepting_indexers(self, monkeypatch):
+    def test_missing_chain_is_rejected(self, monkeypatch):
+        """``chain`` is required: omitting it is a 422, not an all-chains dump."""
         from iisa.iisa_http_endpoints import app
 
         self._seed_snapshot(monkeypatch)
         client = TestClient(app, raise_server_exceptions=False)
-        response = client.get("/dips-indexers")
-
-        assert response.status_code == 200
-        body = response.json()
-        assert "2026-06-02" in body["computed_at"]
-        # Unfiltered: every indexer advertising any DIPs support (a non-empty list),
-        # including 0xeee, which advertises a chain but has not priced it.
-        assert body["count"] == 3
-        assert set(body["indexers"]) == {"0xaaa", "0xbbb", "0xeee"}
+        assert client.get("/dips-indexers").status_code == 422
 
     def test_chain_filter_narrows_to_supporting_indexers(self, monkeypatch):
         from iisa.iisa_http_endpoints import app
@@ -1207,11 +1200,11 @@ class TestDipsIndexersEndpoint:
         self._seed_snapshot(monkeypatch)
         client = TestClient(app, raise_server_exceptions=False)
 
-        # 0xeee advertises arbitrum-one, so it appears in the unfiltered set...
-        assert "0xeee" in client.get("/dips-indexers").json()["indexers"]
-        # ...but with no price for arbitrum-one it is not eligible for that chain.
+        # 0xeee lists arbitrum-one in its supported networks but never priced it, so
+        # (like the selection path) it is not eligible for that chain.
         arb = client.get("/dips-indexers", params={"chain": "arbitrum-one"}).json()
         assert "0xeee" not in arb["indexers"]
+        assert arb["indexers"] == ["0xaaa"]
 
     def test_returns_empty_when_no_scores_loaded(self):
         from iisa import iisa_http_endpoints
@@ -1220,7 +1213,7 @@ class TestDipsIndexersEndpoint:
         iisa_http_endpoints._state.initialize(Settings())
         client = TestClient(app, raise_server_exceptions=False)
 
-        response = client.get("/dips-indexers")
+        response = client.get("/dips-indexers", params={"chain": "arbitrum-one"})
         assert response.status_code == 200
         body = response.json()
         assert body["computed_at"] is None
@@ -1244,7 +1237,7 @@ class TestDipsIndexersEndpoint:
         iisa_http_endpoints._state.data_manager = mock_dm
 
         client = TestClient(app, raise_server_exceptions=False)
-        response = client.get("/dips-indexers")
+        response = client.get("/dips-indexers", params={"chain": "arbitrum-one"})
         assert response.status_code == 200
         body = response.json()
         assert "2026-06-02" in body["computed_at"]
@@ -1260,13 +1253,21 @@ class TestDipsIndexersEndpoint:
         iisa_http_endpoints._state.initialize(Settings())
         client = TestClient(app, raise_server_exceptions=False)
 
-        assert client.get("/dips-indexers").status_code == 401
+        assert client.get("/dips-indexers", params={"chain": "arbitrum-one"}).status_code == 401
         assert (
-            client.get("/dips-indexers", headers={"Authorization": "Bearer wrong"}).status_code
+            client.get(
+                "/dips-indexers",
+                params={"chain": "arbitrum-one"},
+                headers={"Authorization": "Bearer wrong"},
+            ).status_code
             == 401
         )
         assert (
-            client.get("/dips-indexers", headers={"Authorization": "Bearer secret"}).status_code
+            client.get(
+                "/dips-indexers",
+                params={"chain": "arbitrum-one"},
+                headers={"Authorization": "Bearer secret"},
+            ).status_code
             == 200
         )
 

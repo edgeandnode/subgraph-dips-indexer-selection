@@ -9,7 +9,7 @@ Endpoints:
 - GET /scores - Return the current scores snapshot (bearer-auth)
 - GET /scores/status - Return last computed_at; lets the cronjob skip a redundant run (bearer-auth)
 - GET /scores/weighted - Bulk weighted scores for every loaded indexer (bearer-auth)
-- GET /dips-indexers - The set of indexers that currently accept DIPs (bearer-auth)
+- GET /dips-indexers - Indexers selection would pick for a required ?chain (bearer-auth)
 - POST /sync-status - Push sync-status snapshot from the fetcher (bearer-auth)
 - POST /get-score - Return weighted score and components for one indexer (bearer-auth)
 - POST /select-indexers - Select optimal indexers for a deployment
@@ -220,9 +220,9 @@ class WeightedScoresResponse(BaseModel):
 
 
 class DipsIndexersResponse(BaseModel):
-    """Response for GET /dips-indexers. Unfiltered, ``indexers`` is everyone advertising
-    DIPs support; with ``?chain`` it is only those selection would pick for it. The field
-    ``computed_at`` mirrors the push so callers can reject a stale snapshot. Example::
+    """Response for GET /dips-indexers: the indexers selection would pick for the
+    requested chain — answered their probe, support it, priced it. ``computed_at``
+    mirrors the push so callers can reject a stale snapshot. Example::
 
         {"computed_at": "2026-06-23T09:00:00+00:00", "count": 2, "indexers": ["0xaa", "0xbb"]}
     """
@@ -772,14 +772,14 @@ def scores_weighted(
 
 @app.get("/dips-indexers", response_model=DipsIndexersResponse)
 def dips_indexers(
-    chain: Optional[str] = None,
+    chain: str,
     authorization: Optional[str] = Header(None),
 ) -> DipsIndexersResponse:
-    """Indexers that currently accept DIPs. Without ``chain``: any advertising DIPs
-    support. With ``?chain=<id>``: only those selection would pick for it. Example::
+    """Indexers selection would pick for ``chain`` — those that answered their DIPs
+    probe, support the chain, and priced it. ``chain`` is required; omitting it is a
+    422. Example::
 
-        GET /dips-indexers             -> count 2, indexers ["0xaaaa...aaaa", "0xbbbb...bbbb"]
-        GET /dips-indexers?chain=matic -> count 1, indexers ["0xaaaa...aaaa"]
+        GET /dips-indexers?chain=arbitrum-one -> count 2, indexers ["0xaaaa...", "0xbbbb..."]
     """
     _require_push_token(authorization)
 
@@ -793,16 +793,10 @@ def dips_indexers(
     if snap.data is None or snap.data.empty or "dips_supported_networks" not in snap.data.columns:
         return DipsIndexersResponse(computed_at=computed_at, count=0, indexers=[])
 
-    if chain is not None:
-        # Reuse the selection path's test so this endpoint and _filter_by_price can't
-        # disagree: an indexer accepts DIPs for a chain only if it answered its probe,
-        # supports the chain, and priced it. Passing no budget skips only the ceiling.
-        matched, _ = _filter_by_price(snap.data, chain, None)
-    else:
-        mask = snap.data["dips_supported_networks"].apply(
-            lambda v: len(_parse_supported_networks(v)) > 0
-        )
-        matched = snap.data[mask]
+    # Reuse the selection path's test so this endpoint and _filter_by_price can't
+    # disagree: an indexer accepts DIPs for a chain only if it answered its probe,
+    # supports the chain, and priced it. Passing no budget skips only the ceiling.
+    matched, _ = _filter_by_price(snap.data, chain, None)
 
     indexers: list[str] = []
     for value in matched.get("indexer", pd.Series(dtype=object)):
