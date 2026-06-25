@@ -222,10 +222,12 @@ class WeightedScoresResponse(BaseModel):
 class DipsIndexersResponse(BaseModel):
     """Response for GET /dips-indexers: the set of indexers that accept DIPs.
 
-    An indexer counts as accepting DIPs when its scores row carries a
-    non-empty list of supported networks — populated only when the indexer
-    answered its DIPs-info endpoint during scoring. `computed_at` mirrors the
-    underlying push so callers can reject a stale snapshot.
+    An indexer accepts DIPs when its scores row carries a non-empty supported-networks
+    list (set only after it answers its DIPs-info probe). ``computed_at`` mirrors the
+    push so callers can reject a stale snapshot. Example::
+
+        {"computed_at": "2026-06-23T09:00:00+00:00", "count": 2,
+         "indexers": ["0xaaaa...aaaa", "0xbbbb...bbbb"]}
     """
 
     computed_at: Optional[str] = None
@@ -429,11 +431,11 @@ def _extract_computed_at(scores_df: pd.DataFrame) -> Optional[datetime]:
 
 
 def _parse_supported_networks(networks_json: Any) -> list[str]:
-    """Parse one ``dips_supported_networks`` cell into a list of chain ids.
+    """Parse a ``dips_supported_networks`` cell into a list of chain ids; empty,
+    missing, or malformed values yield ``[]``. Examples::
 
-    The column holds a JSON list string like ``'["arbitrum-one"]'``. Indexers that
-    never answered their DIPs-info endpoint leave it empty (``"[]"``, ``""``, ``None``,
-    NaN); those and any malformed value parse to an empty list.
+        '["arbitrum-one","mainnet"]'   -> ["arbitrum-one", "mainnet"]
+        "[]" / "" / None / NaN / "x{"  -> []
     """
     try:
         networks = json.loads(networks_json) if isinstance(networks_json, str) else []
@@ -443,7 +445,12 @@ def _parse_supported_networks(networks_json: Any) -> list[str]:
 
 
 def _supports_chain(networks_json: Any, chain_id: str) -> bool:
-    """True when the indexer's supported-networks list includes ``chain_id``."""
+    """True when ``chain_id`` is in the indexer's supported-networks list.
+    Examples::
+
+        _supports_chain('["arbitrum-one"]', "arbitrum-one") -> True
+        _supports_chain(None, "arbitrum-one")               -> False
+    """
     return chain_id in _parse_supported_networks(networks_json)
 
 
@@ -775,11 +782,11 @@ def dips_indexers(
     chain: Optional[str] = None,
     authorization: Optional[str] = Header(None),
 ) -> DipsIndexersResponse:
-    """Return the indexers that currently accept DIPs.
+    """Return the indexers that currently accept DIPs; ``?chain=<id>`` keeps only those
+    supporting that chain (omit for all accepting). Example::
 
-    An indexer accepts DIPs when its scores row lists a non-empty set of supported
-    networks. Pass ``?chain=<id>`` to keep only indexers supporting that chain (the
-    membership test selection already uses); omit it for every accepting indexer.
+        GET /dips-indexers             -> count 2, indexers ["0xaaaa...aaaa", "0xbbbb...bbbb"]
+        GET /dips-indexers?chain=matic -> count 1, indexers ["0xaaaa...aaaa"]
     """
     _require_push_token(authorization)
 
