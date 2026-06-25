@@ -220,14 +220,11 @@ class WeightedScoresResponse(BaseModel):
 
 
 class DipsIndexersResponse(BaseModel):
-    """Response for GET /dips-indexers: the set of indexers that accept DIPs.
+    """Response for GET /dips-indexers. Unfiltered, ``indexers`` is everyone advertising
+    DIPs support; with ``?chain`` it is only those selection would pick for it. The field
+    ``computed_at`` mirrors the push so callers can reject a stale snapshot. Example::
 
-    An indexer accepts DIPs when its scores row carries a non-empty supported-networks
-    list (set only after it answers its DIPs-info probe). ``computed_at`` mirrors the
-    push so callers can reject a stale snapshot. Example::
-
-        {"computed_at": "2026-06-23T09:00:00+00:00", "count": 2,
-         "indexers": ["0xaaaa...aaaa", "0xbbbb...bbbb"]}
+        {"computed_at": "2026-06-23T09:00:00+00:00", "count": 2, "indexers": ["0xaa", "0xbb"]}
     """
 
     computed_at: Optional[str] = None
@@ -778,8 +775,8 @@ def dips_indexers(
     chain: Optional[str] = None,
     authorization: Optional[str] = Header(None),
 ) -> DipsIndexersResponse:
-    """Return the indexers that currently accept DIPs; ``?chain=<id>`` keeps only those
-    supporting that chain (omit for all accepting). Example::
+    """Indexers that currently accept DIPs. Without ``chain``: any advertising DIPs
+    support. With ``?chain=<id>``: only those selection would pick for it. Example::
 
         GET /dips-indexers             -> count 2, indexers ["0xaaaa...aaaa", "0xbbbb...bbbb"]
         GET /dips-indexers?chain=matic -> count 1, indexers ["0xaaaa...aaaa"]
@@ -796,13 +793,16 @@ def dips_indexers(
     if snap.data is None or snap.data.empty or "dips_supported_networks" not in snap.data.columns:
         return DipsIndexersResponse(computed_at=computed_at, count=0, indexers=[])
 
-    networks = snap.data["dips_supported_networks"]
     if chain is not None:
-        mask = networks.apply(lambda v: _supports_chain(v, chain))
+        # Reuse the selection path's test so this endpoint and _filter_by_price can't
+        # disagree: an indexer accepts DIPs for a chain only if it answered its probe,
+        # supports the chain, and priced it. Passing no budget skips only the ceiling.
+        matched, _ = _filter_by_price(snap.data, chain, None)
     else:
-        mask = networks.apply(lambda v: len(_parse_supported_networks(v)) > 0)
-
-    matched = snap.data[mask]
+        mask = snap.data["dips_supported_networks"].apply(
+            lambda v: len(_parse_supported_networks(v)) > 0
+        )
+        matched = snap.data[mask]
 
     indexers: list[str] = []
     for value in matched.get("indexer", pd.Series(dtype=object)):

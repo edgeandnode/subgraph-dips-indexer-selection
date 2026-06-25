@@ -1113,11 +1113,10 @@ class TestDipsIndexersEndpoint:
 
     @staticmethod
     def _seed_snapshot(monkeypatch):
-        """Load a snapshot where two indexers accept DIPs and two do not.
-
-        0xaaa supports arbitrum-one and mainnet; 0xbbb supports only mainnet.
-        0xccc has an explicit empty list and 0xddd never answered (None), so
-        both are treated as not accepting DIPs.
+        """Snapshot covering each DIPs eligibility case: 0xaaa/0xbbb answered their
+        probe and priced their chains; 0xccc (empty) and 0xddd (None) do not accept
+        DIPs; 0xeee advertises arbitrum-one but priced nothing, so it accepts DIPs
+        overall yet is not eligible for any specific chain.
         """
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import Settings
@@ -1130,18 +1129,28 @@ class TestDipsIndexersEndpoint:
         mock_dm.snapshot = ScoresSnapshot(
             data=pd.DataFrame(
                 {
-                    "indexer": ["0xaaa", "0xbbb", "0xccc", "0xddd"],
+                    "indexer": ["0xaaa", "0xbbb", "0xccc", "0xddd", "0xeee"],
                     "url": [
                         "https://a.example/",
                         "https://b.example/",
                         "https://c.example/",
                         "https://d.example/",
+                        "https://e.example/",
                     ],
+                    "dips_info_available": [True, True, False, False, True],
                     "dips_supported_networks": [
                         '["arbitrum-one", "mainnet"]',
                         '["mainnet"]',
                         "[]",
                         None,
+                        '["arbitrum-one"]',
+                    ],
+                    "dips_min_grt_per_30_days": [
+                        '{"arbitrum-one": "100", "mainnet": "200"}',
+                        '{"mainnet": "150"}',
+                        "{}",
+                        None,
+                        "{}",
                     ],
                 }
             ),
@@ -1159,9 +1168,10 @@ class TestDipsIndexersEndpoint:
         assert response.status_code == 200
         body = response.json()
         assert "2026-06-02" in body["computed_at"]
-        # Only the two indexers with a non-empty supported-networks list.
-        assert body["count"] == 2
-        assert set(body["indexers"]) == {"0xaaa", "0xbbb"}
+        # Unfiltered: every indexer advertising any DIPs support (a non-empty list),
+        # including 0xeee, which advertises a chain but has not priced it.
+        assert body["count"] == 3
+        assert set(body["indexers"]) == {"0xaaa", "0xbbb", "0xeee"}
 
     def test_chain_filter_narrows_to_supporting_indexers(self, monkeypatch):
         from iisa.iisa_http_endpoints import app
@@ -1169,13 +1179,14 @@ class TestDipsIndexersEndpoint:
         self._seed_snapshot(monkeypatch)
         client = TestClient(app, raise_server_exceptions=False)
 
-        # arbitrum-one is supported only by 0xaaa.
+        # arbitrum-one: 0xaaa supports and priced it; 0xeee supports but priced
+        # nothing, so selection would drop it and so does this endpoint.
         arb = client.get("/dips-indexers", params={"chain": "arbitrum-one"})
         assert arb.status_code == 200
         assert arb.json()["count"] == 1
         assert arb.json()["indexers"] == ["0xaaa"]
 
-        # mainnet is supported by both 0xaaa and 0xbbb.
+        # mainnet is supported and priced by both 0xaaa and 0xbbb.
         mainnet = client.get("/dips-indexers", params={"chain": "mainnet"})
         assert mainnet.status_code == 200
         assert mainnet.json()["count"] == 2
@@ -1186,6 +1197,21 @@ class TestDipsIndexersEndpoint:
         assert none.status_code == 200
         assert none.json()["count"] == 0
         assert none.json()["indexers"] == []
+
+    def test_chain_filter_excludes_advertised_but_unpriced_indexer(self, monkeypatch):
+        """An indexer that lists a chain but never priced it is excluded for that
+        chain, matching what the selection path would actually pick.
+        """
+        from iisa.iisa_http_endpoints import app
+
+        self._seed_snapshot(monkeypatch)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # 0xeee advertises arbitrum-one, so it appears in the unfiltered set...
+        assert "0xeee" in client.get("/dips-indexers").json()["indexers"]
+        # ...but with no price for arbitrum-one it is not eligible for that chain.
+        arb = client.get("/dips-indexers", params={"chain": "arbitrum-one"}).json()
+        assert "0xeee" not in arb["indexers"]
 
     def test_returns_empty_when_no_scores_loaded(self):
         from iisa import iisa_http_endpoints
