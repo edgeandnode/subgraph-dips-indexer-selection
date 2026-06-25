@@ -430,6 +430,17 @@ def _extract_computed_at(scores_df: pd.DataFrame) -> Optional[datetime]:
     return first.to_pydatetime()
 
 
+def _format_computed_at(computed_at: Optional[datetime]) -> Optional[str]:
+    """Serialize a snapshot's ``computed_at`` as a UTC-aware ISO-8601 string, or
+    ``None``. A naive datetime is assumed to be UTC. Shared by every endpoint that
+    reports snapshot freshness so their timestamp format cannot drift apart.
+    """
+    if computed_at is None:
+        return None
+    ts = computed_at if computed_at.tzinfo else computed_at.replace(tzinfo=timezone.utc)
+    return ts.isoformat()
+
+
 def _parse_supported_networks(networks_json: Any) -> list[str]:
     """Parse a ``dips_supported_networks`` cell into a list of chain ids; empty,
     missing, or malformed values yield ``[]``. Examples::
@@ -642,12 +653,7 @@ def scores_status(
         return ScoresStatusResponse(computed_at=None, rows=0)
 
     snap = _state.data_manager.snapshot
-    computed_at: Optional[str] = None
-    if snap.computed_at is not None:
-        ts = snap.computed_at
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        computed_at = ts.isoformat()
+    computed_at = _format_computed_at(snap.computed_at)
 
     rows = len(snap.data) if snap.data is not None else 0
     return ScoresStatusResponse(computed_at=computed_at, rows=rows)
@@ -670,12 +676,7 @@ def scores_snapshot(
 
     snap = _state.data_manager.snapshot
 
-    computed_at: Optional[str] = None
-    if snap.computed_at is not None:
-        ts = snap.computed_at
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        computed_at = ts.isoformat()
+    computed_at = _format_computed_at(snap.computed_at)
 
     if snap.data is None:
         return ScoresSnapshotResponse(computed_at=computed_at, count=0, scores=[])
@@ -711,12 +712,7 @@ def scores_weighted(
 
     snap = _state.data_manager.snapshot
 
-    computed_at: Optional[str] = None
-    if snap.computed_at is not None:
-        ts = snap.computed_at
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        computed_at = ts.isoformat()
+    computed_at = _format_computed_at(snap.computed_at)
 
     if snap.data is None or snap.data.empty:
         return WeightedScoresResponse(computed_at=computed_at, count=0, scores=[])
@@ -795,12 +791,7 @@ def dips_indexers(
 
     snap = _state.data_manager.snapshot
 
-    computed_at: Optional[str] = None
-    if snap.computed_at is not None:
-        ts = snap.computed_at
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        computed_at = ts.isoformat()
+    computed_at = _format_computed_at(snap.computed_at)
 
     if snap.data is None or snap.data.empty or "dips_supported_networks" not in snap.data.columns:
         return DipsIndexersResponse(computed_at=computed_at, count=0, indexers=[])
