@@ -773,13 +773,14 @@ def scores_weighted(
 @app.get("/dips-indexers", response_model=DipsIndexersResponse)
 def dips_indexers(
     chain: str,
+    max_grt_per_30_days: Optional[float] = None,
     authorization: Optional[str] = Header(None),
 ) -> DipsIndexersResponse:
-    """Indexers selection would pick for ``chain`` — those that answered their DIPs
-    probe, support the chain, and priced it. ``chain`` is required; omitting it is a
-    422. Example::
+    """Indexers selection would pick for ``chain``: answered their DIPs probe, support
+    the chain, and priced it within the optional ``max_grt_per_30_days`` ceiling (omit
+    to ignore price). ``chain`` is required; omitting it is a 422. Example::
 
-        GET /dips-indexers?chain=arbitrum-one -> count 2, indexers ["0xaaaa...", "0xbbbb..."]
+        GET /dips-indexers?chain=arbitrum-one&max_grt_per_30_days=4500 -> count 2
     """
     _require_push_token(authorization)
 
@@ -793,10 +794,10 @@ def dips_indexers(
     if snap.data is None or snap.data.empty or "dips_supported_networks" not in snap.data.columns:
         return DipsIndexersResponse(computed_at=computed_at, count=0, indexers=[])
 
-    # Reuse the selection path's test so this endpoint and _filter_by_price can't
-    # disagree: an indexer accepts DIPs for a chain only if it answered its probe,
-    # supports the chain, and priced it. Passing no budget skips only the ceiling.
-    matched, _ = _filter_by_price(snap.data, chain, None)
+    # Reuse the selection path's test so this endpoint and selection can't disagree:
+    # an indexer accepts DIPs for a chain only if it answered its probe, supports the
+    # chain, and priced it within the optional ceiling (None skips the ceiling).
+    matched, _ = _filter_by_price(snap.data, chain, max_grt_per_30_days)
 
     indexers: list[str] = []
     for value in matched.get("indexer", pd.Series(dtype=object)):

@@ -1191,6 +1191,30 @@ class TestDipsIndexersEndpoint:
         assert none.json()["count"] == 0
         assert none.json()["indexers"] == []
 
+    def test_price_ceiling_drops_over_ceiling_indexers(self, monkeypatch):
+        """``max_grt_per_30_days`` drops indexers priced above the ceiling, so the
+        endpoint returns the pool selection would offer at that budget.
+        """
+        from iisa.iisa_http_endpoints import app
+
+        self._seed_snapshot(monkeypatch)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Without a ceiling, mainnet has 0xaaa (priced 200) and 0xbbb (priced 150).
+        no_ceiling = client.get("/dips-indexers", params={"chain": "mainnet"})
+        assert no_ceiling.json()["count"] == 2
+
+        # A 175 ceiling drops 0xaaa (200) and keeps 0xbbb (150).
+        capped = client.get(
+            "/dips-indexers", params={"chain": "mainnet", "max_grt_per_30_days": 175}
+        )
+        assert capped.status_code == 200
+        assert capped.json()["indexers"] == ["0xbbb"]
+
+        # A ceiling above both prices keeps both.
+        high = client.get("/dips-indexers", params={"chain": "mainnet", "max_grt_per_30_days": 250})
+        assert set(high.json()["indexers"]) == {"0xaaa", "0xbbb"}
+
     def test_chain_filter_excludes_advertised_but_unpriced_indexer(self, monkeypatch):
         """An indexer that lists a chain but never priced it is excluded for that
         chain, matching what the selection path would actually pick.
