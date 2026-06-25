@@ -1,8 +1,7 @@
 """
 IISA HTTP API - FastAPI endpoints for the Indexing Indexer Selection Algorithm.
 
-This module exposes HTTP endpoints for indexer selection that match the API
-contract expected by the Rust HTTP client in dipper-iisa.
+This module exposes the indexer-selection HTTP endpoints the dipper-iisa Rust client calls.
 
 Endpoints:
 - GET /health - Health check, reports if data is loaded
@@ -10,6 +9,7 @@ Endpoints:
 - GET /scores - Return the current scores snapshot (bearer-auth)
 - GET /scores/status - Return last computed_at; lets the cronjob skip a redundant run (bearer-auth)
 - GET /scores/weighted - Bulk weighted scores for every loaded indexer (bearer-auth)
+- GET /dips-indexers - Indexers selection would pick for a required ?chain (bearer-auth)
 - POST /sync-status - Push sync-status snapshot from the fetcher (bearer-auth)
 - POST /get-score - Return weighted score and components for one indexer (bearer-auth)
 - POST /select-indexers - Select optimal indexers for a deployment
@@ -219,6 +219,19 @@ class WeightedScoresResponse(BaseModel):
     scores: list[WeightedScoreEntry] = []
 
 
+class DipsIndexersResponse(BaseModel):
+    """Response for GET /dips-indexers: the indexers selection would pick for the
+    requested chain — answered their probe, support it, priced it. ``computed_at``
+    mirrors the push so callers can reject a stale snapshot. Example::
+
+        {"computed_at": "2026-06-23T09:00:00+00:00", "count": 2, "indexers": ["0xaa", "0xbb"]}
+    """
+
+    computed_at: Optional[str] = None
+    count: int = 0
+    indexers: list[str] = []
+
+
 class SyncStatusAcceptedResponse(BaseModel):
     """Response returned by POST /sync-status on success."""
 
@@ -414,6 +427,41 @@ def _extract_computed_at(scores_df: pd.DataFrame) -> Optional[datetime]:
     return first.to_pydatetime()
 
 
+def _format_computed_at(computed_at: Optional[datetime]) -> Optional[str]:
+    """Serialize a snapshot's ``computed_at`` as a UTC-aware ISO-8601 string, or
+    ``None``. A naive datetime is assumed to be UTC. Shared by every endpoint that
+    reports snapshot freshness so their timestamp format cannot drift apart.
+    """
+    if computed_at is None:
+        return None
+    ts = computed_at if computed_at.tzinfo else computed_at.replace(tzinfo=timezone.utc)
+    return ts.isoformat()
+
+
+def _parse_supported_networks(networks_json: Any) -> list[str]:
+    """Parse a ``dips_supported_networks`` cell into a list of chain ids; empty,
+    missing, or malformed values yield ``[]``. Examples::
+
+        '["arbitrum-one","mainnet"]'   -> ["arbitrum-one", "mainnet"]
+        "[]" / "" / None / NaN / "x{"  -> []
+    """
+    try:
+        networks = json.loads(networks_json) if isinstance(networks_json, str) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return networks if isinstance(networks, list) else []
+
+
+def _supports_chain(networks_json: Any, chain_id: str) -> bool:
+    """True when ``chain_id`` is in the indexer's supported-networks list.
+    Examples::
+
+        _supports_chain('["arbitrum-one"]', "arbitrum-one") -> True
+        _supports_chain(None, "arbitrum-one")               -> False
+    """
+    return chain_id in _parse_supported_networks(networks_json)
+
+
 def _require_push_token(authorization: Optional[str]) -> None:
     """Validate the bearer token against IISA_PUSH_TOKEN.
 
@@ -602,12 +650,7 @@ def scores_status(
         return ScoresStatusResponse(computed_at=None, rows=0)
 
     snap = _state.data_manager.snapshot
-    computed_at: Optional[str] = None
-    if snap.computed_at is not None:
-        ts = snap.computed_at
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        computed_at = ts.isoformat()
+    computed_at = _format_computed_at(snap.computed_at)
 
     rows = len(snap.data) if snap.data is not None else 0
     return ScoresStatusResponse(computed_at=computed_at, rows=rows)
@@ -630,12 +673,7 @@ def scores_snapshot(
 
     snap = _state.data_manager.snapshot
 
-    computed_at: Optional[str] = None
-    if snap.computed_at is not None:
-        ts = snap.computed_at
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        computed_at = ts.isoformat()
+    computed_at = _format_computed_at(snap.computed_at)
 
     if snap.data is None:
         return ScoresSnapshotResponse(computed_at=computed_at, count=0, scores=[])
@@ -671,12 +709,7 @@ def scores_weighted(
 
     snap = _state.data_manager.snapshot
 
-    computed_at: Optional[str] = None
-    if snap.computed_at is not None:
-        ts = snap.computed_at
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        computed_at = ts.isoformat()
+    computed_at = _format_computed_at(snap.computed_at)
 
     if snap.data is None or snap.data.empty:
         return WeightedScoresResponse(computed_at=computed_at, count=0, scores=[])
@@ -734,6 +767,49 @@ def scores_weighted(
         computed_at=computed_at,
         count=len(entries),
         scores=entries,
+    )
+
+
+@app.get("/dips-indexers", response_model=DipsIndexersResponse)
+def dips_indexers(
+    chain: str,
+    max_grt_per_30_days: Optional[float] = None,
+    authorization: Optional[str] = Header(None),
+) -> DipsIndexersResponse:
+    """Indexers selection would pick for ``chain``: answered their DIPs probe, support
+    the chain, and priced it within the optional ``max_grt_per_30_days`` ceiling (omit
+    to ignore price). ``chain`` is required; omitting it is a 422. Example::
+
+        GET /dips-indexers?chain=arbitrum-one&max_grt_per_30_days=4500 -> count 2
+    """
+    _require_push_token(authorization)
+
+    if _state.data_manager is None:
+        return DipsIndexersResponse(computed_at=None, count=0, indexers=[])
+
+    snap = _state.data_manager.snapshot
+
+    computed_at = _format_computed_at(snap.computed_at)
+
+    if snap.data is None or snap.data.empty or "dips_supported_networks" not in snap.data.columns:
+        return DipsIndexersResponse(computed_at=computed_at, count=0, indexers=[])
+
+    # Reuse the selection path's test so this endpoint and selection can't disagree:
+    # an indexer accepts DIPs for a chain only if it answered its probe, supports the
+    # chain, and priced it within the optional ceiling (None skips the ceiling).
+    matched, _ = _filter_by_price(snap.data, chain, max_grt_per_30_days)
+
+    indexers: list[str] = []
+    for value in matched.get("indexer", pd.Series(dtype=object)):
+        # Skip rows missing an indexer id; mirrors the guard in /scores/weighted.
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            continue
+        indexers.append(str(value))
+
+    return DipsIndexersResponse(
+        computed_at=computed_at,
+        count=len(indexers),
+        indexers=indexers,
     )
 
 
@@ -910,16 +986,8 @@ def _filter_by_price(
 
     # Exclude indexers that don't support the chain
     if "dips_supported_networks" in df.columns:
-
-        def supports_chain(networks_json):
-            try:
-                networks = json.loads(networks_json) if isinstance(networks_json, str) else []
-                return chain_id in networks
-            except (json.JSONDecodeError, TypeError):
-                return False
-
         pre_filter = len(df)
-        df = df[df["dips_supported_networks"].apply(supports_chain)]
+        df = df[df["dips_supported_networks"].apply(lambda v: _supports_chain(v, chain_id))]
         logger.debug(
             "price filter: %d/%d indexers support chain '%s'", len(df), pre_filter, chain_id
         )

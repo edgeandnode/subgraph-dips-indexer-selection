@@ -1108,6 +1108,194 @@ class TestScoresWeightedEndpoint:
         assert response.status_code == 200
 
 
+class TestDipsIndexersEndpoint:
+    """Tests for GET /dips-indexers (the set of DIPs-accepting indexers)."""
+
+    @staticmethod
+    def _seed_snapshot(monkeypatch):
+        """Snapshot covering each DIPs eligibility case: 0xaaa/0xbbb answered their
+        probe and priced their chains; 0xccc (empty) and 0xddd (None) do not accept
+        DIPs; 0xeee lists arbitrum-one in its supported networks but never priced it,
+        so it is not eligible for any chain.
+        """
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings
+        from iisa.score_loader import ScoresSnapshot
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+
+        mock_dm = MagicMock()
+        mock_dm.snapshot = ScoresSnapshot(
+            data=pd.DataFrame(
+                {
+                    "indexer": ["0xaaa", "0xbbb", "0xccc", "0xddd", "0xeee"],
+                    "url": [
+                        "https://a.example/",
+                        "https://b.example/",
+                        "https://c.example/",
+                        "https://d.example/",
+                        "https://e.example/",
+                    ],
+                    "dips_info_available": [True, True, False, False, True],
+                    "dips_supported_networks": [
+                        '["arbitrum-one", "mainnet"]',
+                        '["mainnet"]',
+                        "[]",
+                        None,
+                        '["arbitrum-one"]',
+                    ],
+                    "dips_min_grt_per_30_days": [
+                        '{"arbitrum-one": "100", "mainnet": "200"}',
+                        '{"mainnet": "150"}',
+                        "{}",
+                        None,
+                        "{}",
+                    ],
+                }
+            ),
+            computed_at=datetime(2026, 6, 2, 8, 30, tzinfo=timezone.utc),
+        )
+        iisa_http_endpoints._state.data_manager = mock_dm
+
+    def test_missing_chain_is_rejected(self, monkeypatch):
+        """``chain`` is required: omitting it is a 422, not an all-chains dump."""
+        from iisa.iisa_http_endpoints import app
+
+        self._seed_snapshot(monkeypatch)
+        client = TestClient(app, raise_server_exceptions=False)
+        assert client.get("/dips-indexers").status_code == 422
+
+    def test_chain_filter_narrows_to_supporting_indexers(self, monkeypatch):
+        from iisa.iisa_http_endpoints import app
+
+        self._seed_snapshot(monkeypatch)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # arbitrum-one: 0xaaa supports and priced it; 0xeee supports but priced
+        # nothing, so selection would drop it and so does this endpoint.
+        arb = client.get("/dips-indexers", params={"chain": "arbitrum-one"})
+        assert arb.status_code == 200
+        assert arb.json()["count"] == 1
+        assert arb.json()["indexers"] == ["0xaaa"]
+
+        # mainnet is supported and priced by both 0xaaa and 0xbbb.
+        mainnet = client.get("/dips-indexers", params={"chain": "mainnet"})
+        assert mainnet.status_code == 200
+        assert mainnet.json()["count"] == 2
+        assert set(mainnet.json()["indexers"]) == {"0xaaa", "0xbbb"}
+
+        # A chain no indexer supports yields an empty set, not an error.
+        none = client.get("/dips-indexers", params={"chain": "optimism"})
+        assert none.status_code == 200
+        assert none.json()["count"] == 0
+        assert none.json()["indexers"] == []
+
+    def test_price_ceiling_drops_over_ceiling_indexers(self, monkeypatch):
+        """``max_grt_per_30_days`` drops indexers priced above the ceiling, so the
+        endpoint returns the pool selection would offer at that budget.
+        """
+        from iisa.iisa_http_endpoints import app
+
+        self._seed_snapshot(monkeypatch)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Without a ceiling, mainnet has 0xaaa (priced 200) and 0xbbb (priced 150).
+        no_ceiling = client.get("/dips-indexers", params={"chain": "mainnet"})
+        assert no_ceiling.json()["count"] == 2
+
+        # A 175 ceiling drops 0xaaa (200) and keeps 0xbbb (150).
+        capped = client.get(
+            "/dips-indexers", params={"chain": "mainnet", "max_grt_per_30_days": 175}
+        )
+        assert capped.status_code == 200
+        assert capped.json()["indexers"] == ["0xbbb"]
+
+        # A ceiling above both prices keeps both.
+        high = client.get("/dips-indexers", params={"chain": "mainnet", "max_grt_per_30_days": 250})
+        assert set(high.json()["indexers"]) == {"0xaaa", "0xbbb"}
+
+    def test_chain_filter_excludes_advertised_but_unpriced_indexer(self, monkeypatch):
+        """An indexer that lists a chain but never priced it is excluded for that
+        chain, matching what the selection path would actually pick.
+        """
+        from iisa.iisa_http_endpoints import app
+
+        self._seed_snapshot(monkeypatch)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # 0xeee lists arbitrum-one in its supported networks but never priced it, so
+        # (like the selection path) it is not eligible for that chain.
+        arb = client.get("/dips-indexers", params={"chain": "arbitrum-one"}).json()
+        assert "0xeee" not in arb["indexers"]
+        assert arb["indexers"] == ["0xaaa"]
+
+    def test_returns_empty_when_no_scores_loaded(self):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.get("/dips-indexers", params={"chain": "arbitrum-one"})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["computed_at"] is None
+        assert body["count"] == 0
+        assert body["indexers"] == []
+
+    def test_returns_empty_when_column_absent(self, monkeypatch):
+        """A snapshot without the supported-networks column yields no indexers."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+        from iisa.score_loader import ScoresSnapshot
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+
+        mock_dm = MagicMock()
+        mock_dm.snapshot = ScoresSnapshot(
+            data=pd.DataFrame({"indexer": ["0xaaa"]}),
+            computed_at=datetime(2026, 6, 2, 8, 30, tzinfo=timezone.utc),
+        )
+        iisa_http_endpoints._state.data_manager = mock_dm
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get("/dips-indexers", params={"chain": "arbitrum-one"})
+        assert response.status_code == 200
+        body = response.json()
+        assert "2026-06-02" in body["computed_at"]
+        assert body["count"] == 0
+        assert body["indexers"] == []
+
+    def test_requires_bearer_when_push_token_set(self, monkeypatch):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        assert client.get("/dips-indexers", params={"chain": "arbitrum-one"}).status_code == 401
+        assert (
+            client.get(
+                "/dips-indexers",
+                params={"chain": "arbitrum-one"},
+                headers={"Authorization": "Bearer wrong"},
+            ).status_code
+            == 401
+        )
+        assert (
+            client.get(
+                "/dips-indexers",
+                params={"chain": "arbitrum-one"},
+                headers={"Authorization": "Bearer secret"},
+            ).status_code
+            == 200
+        )
+
+
 class TestGetScoreEndpoint:
     """Tests for POST /get-score endpoint."""
 
