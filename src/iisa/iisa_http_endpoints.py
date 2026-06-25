@@ -1,8 +1,7 @@
 """
 IISA HTTP API - FastAPI endpoints for the Indexing Indexer Selection Algorithm.
 
-This module exposes HTTP endpoints for indexer selection that match the API
-contract expected by the Rust HTTP client in dipper-iisa.
+This module exposes the indexer-selection HTTP endpoints the dipper-iisa Rust client calls.
 
 Endpoints:
 - GET /health - Health check, reports if data is loaded
@@ -10,6 +9,7 @@ Endpoints:
 - GET /scores - Return the current scores snapshot (bearer-auth)
 - GET /scores/status - Return last computed_at; lets the cronjob skip a redundant run (bearer-auth)
 - GET /scores/weighted - Bulk weighted scores for every loaded indexer (bearer-auth)
+- GET /dips-indexers - The set of indexers that currently accept DIPs (bearer-auth)
 - POST /sync-status - Push sync-status snapshot from the fetcher (bearer-auth)
 - POST /get-score - Return weighted score and components for one indexer (bearer-auth)
 - POST /select-indexers - Select optimal indexers for a deployment
@@ -219,6 +219,20 @@ class WeightedScoresResponse(BaseModel):
     scores: list[WeightedScoreEntry] = []
 
 
+class DipsIndexersResponse(BaseModel):
+    """Response for GET /dips-indexers: the set of indexers that accept DIPs.
+
+    An indexer counts as accepting DIPs when its scores row carries a
+    non-empty list of supported networks — populated only when the indexer
+    answered its DIPs-info endpoint during scoring. `computed_at` mirrors the
+    underlying push so callers can reject a stale snapshot.
+    """
+
+    computed_at: Optional[str] = None
+    count: int = 0
+    indexers: list[str] = []
+
+
 class SyncStatusAcceptedResponse(BaseModel):
     """Response returned by POST /sync-status on success."""
 
@@ -412,6 +426,25 @@ def _extract_computed_at(scores_df: pd.DataFrame) -> Optional[datetime]:
     if pd.isna(first):
         return None
     return first.to_pydatetime()
+
+
+def _parse_supported_networks(networks_json: Any) -> list[str]:
+    """Parse one ``dips_supported_networks`` cell into a list of chain ids.
+
+    The column holds a JSON list string like ``'["arbitrum-one"]'``. Indexers that
+    never answered their DIPs-info endpoint leave it empty (``"[]"``, ``""``, ``None``,
+    NaN); those and any malformed value parse to an empty list.
+    """
+    try:
+        networks = json.loads(networks_json) if isinstance(networks_json, str) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return networks if isinstance(networks, list) else []
+
+
+def _supports_chain(networks_json: Any, chain_id: str) -> bool:
+    """True when the indexer's supported-networks list includes ``chain_id``."""
+    return chain_id in _parse_supported_networks(networks_json)
 
 
 def _require_push_token(authorization: Optional[str]) -> None:
@@ -737,6 +770,56 @@ def scores_weighted(
     )
 
 
+@app.get("/dips-indexers", response_model=DipsIndexersResponse)
+def dips_indexers(
+    chain: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+) -> DipsIndexersResponse:
+    """Return the indexers that currently accept DIPs.
+
+    An indexer accepts DIPs when its scores row lists a non-empty set of supported
+    networks. Pass ``?chain=<id>`` to keep only indexers supporting that chain (the
+    membership test selection already uses); omit it for every accepting indexer.
+    """
+    _require_push_token(authorization)
+
+    if _state.data_manager is None:
+        return DipsIndexersResponse(computed_at=None, count=0, indexers=[])
+
+    snap = _state.data_manager.snapshot
+
+    computed_at: Optional[str] = None
+    if snap.computed_at is not None:
+        ts = snap.computed_at
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        computed_at = ts.isoformat()
+
+    if snap.data is None or snap.data.empty or "dips_supported_networks" not in snap.data.columns:
+        return DipsIndexersResponse(computed_at=computed_at, count=0, indexers=[])
+
+    networks = snap.data["dips_supported_networks"]
+    if chain is not None:
+        mask = networks.apply(lambda v: _supports_chain(v, chain))
+    else:
+        mask = networks.apply(lambda v: len(_parse_supported_networks(v)) > 0)
+
+    matched = snap.data[mask]
+
+    indexers: list[str] = []
+    for value in matched.get("indexer", pd.Series(dtype=object)):
+        # Skip rows missing an indexer id; mirrors the guard in /scores/weighted.
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            continue
+        indexers.append(str(value))
+
+    return DipsIndexersResponse(
+        computed_at=computed_at,
+        count=len(indexers),
+        indexers=indexers,
+    )
+
+
 @app.post("/sync-status", response_model=SyncStatusAcceptedResponse)
 def push_sync_status(
     payload: dict[str, Any],
@@ -910,16 +993,8 @@ def _filter_by_price(
 
     # Exclude indexers that don't support the chain
     if "dips_supported_networks" in df.columns:
-
-        def supports_chain(networks_json):
-            try:
-                networks = json.loads(networks_json) if isinstance(networks_json, str) else []
-                return chain_id in networks
-            except (json.JSONDecodeError, TypeError):
-                return False
-
         pre_filter = len(df)
-        df = df[df["dips_supported_networks"].apply(supports_chain)]
+        df = df[df["dips_supported_networks"].apply(lambda v: _supports_chain(v, chain_id))]
         logger.debug(
             "price filter: %d/%d indexers support chain '%s'", len(df), pre_filter, chain_id
         )
