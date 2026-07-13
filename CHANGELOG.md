@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.9.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.8.0...v2.9.0) (2026-07-13)
+
+
+### Added
+
+* expose which indexers accept direct payments ([#214](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/214)) ([01766e7](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/01766e7680ec4e66d4395182d73eb4cae3f58cf5))
+
+
+### Fixed
+
+* **deps:** upgrade click to 8.4.2 to clear a high-severity advisory ([#219](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/219)) ([2688102](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/26881022ef4bcda68f7cb0da50495b0a8c985afd))
+
+
+### Changed
+
+* **deps:** bump actions/checkout from 6 to 7 in the actions group ([#217](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/217)) ([57ac3b9](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/57ac3b955f79a69cd058fa37a60a06138512674a))
+* **k8s:** update cronjob image to sha-57ac3b9 ([#218](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/218)) ([47eac10](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/47eac10c3296b0df76d9d1708890853dc8377590))
+
 ## [2.8.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.7.3...v2.8.0) (2026-06-23)
 
 
