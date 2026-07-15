@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.9.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.9.0...v2.9.1) (2026-07-15)
+
+
+### Fixed
+
+* **audit:** upgrade the runner's setuptools before running pip-audit ([#221](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/221)) ([ae1c7c5](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/ae1c7c515a5248ef0f9cb5e2ac78ee53e5130b8e))
+* **k8s:** let dipper reach IISA from its own namespace ([#220](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/220)) ([8b7591f](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/8b7591f816f09f60715679ba2dd7be3aab28e69a))
+
 ## [2.9.0](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.8.0...v2.9.0) (2026-07-13)
 
 
