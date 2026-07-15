@@ -12,7 +12,12 @@ spec:
     - Ingress
   ingress:
     - from:
-        - podSelector:
+        # namespaceSelector + podSelector in one entry: dipper pods in the dipper
+        # namespace. A bare podSelector would only match within this namespace.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: dipper
+          podSelector:
             matchLabels:
               app: dipper
         - podSelector:
