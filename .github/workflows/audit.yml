@@ -21,7 +21,11 @@ jobs:
           python-version: "3.11"
 
       - name: Install project dependencies
-        run: pip install -e ".[dev]"
+        # pip-audit checks the whole environment, including the runner's preinstalled
+        # setuptools, so upgrade it or an old bundled copy fails the audit.
+        run: |
+          pip install --upgrade setuptools
+          pip install -e ".[dev]"
 
       - name: pip-audit
         uses: pypa/gh-action-pip-audit@v1.1.0
