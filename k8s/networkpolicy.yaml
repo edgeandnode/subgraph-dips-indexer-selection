@@ -2,6 +2,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: iisa-allow-dipper-and-score-computation
+  namespace: subgraph-dips-indexer-selection-iisa-daily-cronjob-samuel
   labels:
     app: iisa
 spec:
