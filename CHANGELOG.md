@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.9.2](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.9.1...v2.9.2) (2026-07-15)
+
+
+### Fixed
+
+* **k8s:** pin the service and network policy to the iisa namespace ([#223](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/223)) ([d38e13a](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/d38e13a2db187a8bca4ef7ee977dc811bd1f3a14))
+
 ## [2.9.1](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.9.0...v2.9.1) (2026-07-15)
 
 
