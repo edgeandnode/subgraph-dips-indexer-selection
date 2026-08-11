@@ -1,6 +1,34 @@
+<div align="center">
+
+<img src="./assets/banner.svg" alt="" width="840">
+
 # Subgraph DIPs Indexer Selection
 
+**Choosing which indexers earn paid indexing agreements on The Graph**
+
+[![CI](https://github.com/edgeandnode/subgraph-dips-indexer-selection/actions/workflows/ci.yml/badge.svg)](https://github.com/edgeandnode/subgraph-dips-indexer-selection/actions/workflows/ci.yml) [![Latest release](https://img.shields.io/github/v/release/edgeandnode/subgraph-dips-indexer-selection)](https://github.com/edgeandnode/subgraph-dips-indexer-selection/releases)
+
+[At a glance](#at-a-glance) | [Background](#background) | [What it produces](#what-it-produces) | [How it works](#how-it-works) | [Measuring](#measuring-indexers) | [Choosing](#choosing-indexers) | [Repository layout](#repository-layout)
+
+</div>
+
+---
+
 The Indexing Indexer Selection Algorithm (IISA) for The Graph's Direct Indexing Payments service. It decides which indexers should be selected to index and serve a given subgraph deployment, ranking every candidate by a weighted blend of quality and economic signals drawn from real query traffic and on-chain stake.
+
+---
+
+## At a glance
+
+| Question | Answer |
+|---|---|
+| **What this service decides** | Which indexers should hold the paid agreements for each subgraph deployment |
+| **Who asks it** | The DIPs gateway service, [dipper](https://github.com/edgeandnode/dipper), over HTTP |
+| **When scores refresh** | Once a day, when the measurement job replays recent gateway query traffic |
+| **What is measured** | Economic security, price, latency, uptime, success rate |
+| **How an indexer scores well** | Serve queries reliably and quickly, price competitively, keep `graph-node` current |
+
+---
 
 ## Background
 
