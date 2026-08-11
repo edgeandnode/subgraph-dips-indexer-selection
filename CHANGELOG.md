@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.9.3](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.9.2...v2.9.3) (2026-08-11)
+
+
+### Fixed
+
+* **deps:** upgrade aiohttp past its 3 known vulnerabilities ([#229](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/229)) ([0b4110b](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/0b4110b22bac022b27c7ef78cabdca97148364cb))
+
+
+### Changed
+
+* **deps:** bump actions/setup-python from 6 to 7 in the actions group ([#226](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/226)) ([07f4ff4](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/07f4ff4fb839da48b60d0c4f11be0729b59d7534))
+* **k8s:** update cronjob image to sha-0b4110b ([#230](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/230)) ([76dfef5](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/76dfef593690eb6fccb18f1e40667bb6f7922da3))
+
+
+### Documentation
+
+* **readme:** add a visual header and at-a-glance table ([#227](https://github.com/edgeandnode/subgraph-dips-indexer-selection/issues/227)) ([48e2a0a](https://github.com/edgeandnode/subgraph-dips-indexer-selection/commit/48e2a0a5db9947224b9bf21d8ddbb82c0184d3ca))
+
 ## [2.9.2](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.9.1...v2.9.2) (2026-07-15)
 
 
